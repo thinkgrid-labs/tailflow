@@ -21,6 +21,9 @@ bollard = "0.18"
 notify = "7"
 notify-debouncer-mini = "0.4"
 
+# Config file parsing
+toml = "0.8"
+
 # Async trait support
 async-trait = "0.1"
 futures-util = "0.3"

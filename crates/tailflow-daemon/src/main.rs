@@ -1,34 +1,42 @@
-mod app;
-mod ui;
+mod routes;
+mod state;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 use tailflow_core::{
     config::Config,
     ingestion::{docker::DockerSource, file::FileSource, stdin::StdinSource, Source},
     new_bus,
 };
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "tailflow", about = "Zero-config local log aggregator")]
+#[command(
+    name = "tailflow-daemon",
+    about = "TailFlow SSE daemon — stream logs over HTTP"
+)]
 struct Cli {
-    /// Path to tailflow.toml (auto-discovered if omitted)
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    /// Port to listen on
+    #[arg(long, default_value = "7878")]
+    port: u16,
 
     /// Tail all running Docker containers
     #[arg(long)]
     docker: bool,
 
-    /// Tail one or more log files
+    /// Tail log files
     #[arg(long = "file", value_name = "PATH")]
     files: Vec<PathBuf>,
 
-    /// Label for stdin input (used when piping: cmd | tailflow)
+    /// Label for piped stdin
     #[arg(long, value_name = "LABEL")]
     stdin: Option<String>,
+
+    /// Path to tailflow.toml (auto-discovered if omitted)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,32 +51,29 @@ async fn main() -> Result<()> {
     let (tx, rx) = new_bus();
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
 
-    // Load config (file flag → auto-discover → none)
-    let config = if let Some(path) = cli.config.as_deref() {
+    // Config file takes priority; CLI flags are additive
+    let cfg_path = cli.config.as_deref();
+
+    let config = if let Some(path) = cfg_path {
         Some(Config::load(path)?)
     } else {
         Config::find_and_load(&std::env::current_dir()?)?
     };
 
     if let Some(cfg) = config {
+        info!("loaded tailflow.toml");
         sources.extend(cfg.into_sources().await?);
     }
 
-    // CLI flags are additive on top of config
+    // CLI overrides / additions
     if cli.docker {
-        let containers = DockerSource::discover().await?;
-        if containers.is_empty() {
-            eprintln!("tailflow: no running Docker containers found");
-        }
-        for src in containers {
-            sources.push(Box::new(src));
+        for c in DockerSource::discover().await? {
+            sources.push(Box::new(c));
         }
     }
-
     for path in cli.files {
         sources.push(Box::new(FileSource::new(path)));
     }
-
     if let Some(label) = cli.stdin {
         sources.push(Box::new(StdinSource::new(label)));
     } else if atty::isnt(atty::Stream::Stdin) {
@@ -76,9 +81,7 @@ async fn main() -> Result<()> {
     }
 
     if sources.is_empty() {
-        eprintln!("tailflow: no sources. Add a tailflow.toml or use --docker / --file.");
-        eprintln!("  Example: tailflow --docker");
-        eprintln!("           npm run dev | tailflow");
+        eprintln!("tailflow-daemon: no sources. Add a tailflow.toml or use --docker / --file.");
         std::process::exit(1);
     }
 
@@ -92,8 +95,16 @@ async fn main() -> Result<()> {
     }
     drop(tx);
 
-    let mut app = app::App::new(rx);
-    app.run().await?;
+    let shared = state::AppState::new(rx);
+    let app = routes::router(shared);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
+    info!(%addr, "tailflow-daemon listening");
+    eprintln!("tailflow-daemon: SSE stream at http://{addr}/events");
+    eprintln!("                 Recent logs at http://{addr}/api/records");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

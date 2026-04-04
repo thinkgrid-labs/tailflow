@@ -2,6 +2,7 @@
 members = [
     "crates/tailflow-core",
     "crates/tailflow-tui",
+    "crates/tailflow-daemon",
 ]
 resolver = "2"
 
@@ -21,3 +22,6 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors"] }

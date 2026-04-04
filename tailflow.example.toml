@@ -1,0 +1,33 @@
+# tailflow.toml — place at your monorepo root
+# Run `tailflow` or `tailflow-daemon` and all sources below start automatically.
+
+[sources]
+# Tail all running Docker containers
+docker = false
+
+# Treat piped stdin as a named source (only used when piping into tailflow)
+# stdin = "pipe"
+
+# ── File sources ─────────────────────────────────────────────────────────────
+# [[sources.file]]
+# path = "logs/app.log"
+# label = "app"          # optional; defaults to filename
+
+# [[sources.file]]
+# path = "/var/log/nginx/access.log"
+
+# ── Process sources ───────────────────────────────────────────────────────────
+# Tailflow spawns these processes and captures their stdout + stderr.
+# Perfect for a monorepo: define your whole stack here.
+
+# [[sources.process]]
+# label = "frontend"
+# cmd   = "npm run dev --prefix packages/web"
+
+# [[sources.process]]
+# label = "api"
+# cmd   = "go run ./cmd/api"
+
+# [[sources.process]]
+# label = "worker"
+# cmd   = "cargo run -p my-worker"
