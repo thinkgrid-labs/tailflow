@@ -1,6 +1,6 @@
 # TailFlow — Local Log Aggregator for Full-Stack Developers
 
-[![CI](https://github.com/your-org/tailflow/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/tailflow/actions/workflows/ci.yml)
+[![CI](https://github.com/thinkgrid-labs/tailflow/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkgrid-labs/tailflow/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/tailflow?color=cb3837)](https://www.npmjs.com/package/tailflow)
 [![Crates.io](https://img.shields.io/crates/v/tailflow-core?color=f74c00)](https://crates.io/crates/tailflow-core)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
