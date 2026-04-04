@@ -1,0 +1,13 @@
+{
+  "name": "@tailflow/darwin-arm64",
+  "version": "0.1.0",
+  "description": "TailFlow compiled binary for macOS ARM64 (Apple Silicon)",
+  "license": "MIT",
+  "os":  ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/tailflow"
+  }
+}

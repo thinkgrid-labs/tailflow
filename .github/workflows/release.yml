@@ -1,0 +1,211 @@
+name: Release
+
+# Triggers on version tags: git tag v0.2.0 && git push --tags
+on:
+  push:
+    tags: ['v[0-9]*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Step 1: build the web UI once, share as artifact ──────────────────────
+  build-web:
+    name: Build web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install and build
+        run: cd web && npm ci && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  # ── Step 2: compile Rust binaries for each platform ───────────────────────
+  build-binaries:
+    name: Build (${{ matrix.platform }})
+    needs: build-web
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-14           # GitHub's ARM macOS runner
+            target: aarch64-apple-darwin
+            cross: false
+
+          - platform: darwin-x64
+            os: macos-13           # Intel macOS runner
+            target: x86_64-apple-darwin
+            cross: false
+
+          - platform: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+
+          - platform: linux-arm64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            cross: true            # use `cross` for ARM cross-compile
+
+          - platform: win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restore the built web UI so rust-embed can embed it
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux ARM only)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p tailflow-tui
+          -p tailflow-daemon
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: >
+          cross build --release
+          --target ${{ matrix.target }}
+          -p tailflow-tui
+          -p tailflow-daemon
+
+      # Stage into npm/platforms/<platform>/bin/ so the publish job can find them
+      - name: Stage binaries (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p npm/platforms/${{ matrix.platform }}/bin
+          cp target/${{ matrix.target }}/release/tailflow \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow
+          cp target/${{ matrix.target }}/release/tailflow-daemon \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-daemon
+          chmod +x npm/platforms/${{ matrix.platform }}/bin/*
+
+      - name: Stage binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p npm/platforms/${{ matrix.platform }}/bin
+          cp target/${{ matrix.target }}/release/tailflow.exe \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow.exe
+          cp target/${{ matrix.target }}/release/tailflow-daemon.exe \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-daemon.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platform-${{ matrix.platform }}
+          path: npm/platforms/${{ matrix.platform }}/bin/
+          retention-days: 1
+
+  # ── Step 3: publish all npm packages ──────────────────────────────────────
+  publish-npm:
+    name: Publish to npm
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create a GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: https://registry.npmjs.org
+
+      # Download each platform's binaries into the right directory
+      - uses: actions/download-artifact@v4
+        with:
+          name: platform-darwin-arm64
+          path: npm/platforms/darwin-arm64/bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: platform-darwin-x64
+          path: npm/platforms/darwin-x64/bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: platform-linux-x64
+          path: npm/platforms/linux-x64/bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: platform-linux-arm64
+          path: npm/platforms/linux-arm64/bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: platform-win32-x64
+          path: npm/platforms/win32-x64/bin/
+
+      # Restore execute bits lost during artifact upload
+      - name: Restore execute permissions
+        run: |
+          find npm/platforms -name 'tailflow' -o -name 'tailflow-daemon' \
+            | xargs -r chmod +x
+
+      # Sync version from git tag → all package.json files
+      - name: Bump version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/bump-version.js "$VERSION"
+
+      # Publish platform packages first (main package depends on them)
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            echo "Publishing @tailflow/$platform …"
+            cd npm/platforms/$platform
+            npm publish --access public
+            cd ../../..
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd npm/tailflow && npm publish --access public
+
+      # Create a GitHub Release with the tag as the title
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            npm/platforms/*/bin/tailflow
+            npm/platforms/*/bin/tailflow-daemon
+            npm/platforms/win32-x64/bin/tailflow.exe
+            npm/platforms/win32-x64/bin/tailflow-daemon.exe

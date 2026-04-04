@@ -1,0 +1,24 @@
+{
+  "name": "tailflow",
+  "version": "0.1.0",
+  "description": "Zero-configuration, high-speed local log aggregator for modern full-stack development",
+  "license": "MIT",
+  "keywords": ["log", "tail", "docker", "developer-tools", "cli", "tui"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/tailflow"
+  },
+  "bin": {
+    "tailflow":        "bin/tailflow.js",
+    "tailflow-daemon": "bin/tailflow-daemon.js"
+  },
+  "files": ["bin/"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "@tailflow/darwin-arm64": "0.1.0",
+    "@tailflow/darwin-x64":   "0.1.0",
+    "@tailflow/linux-arm64":  "0.1.0",
+    "@tailflow/linux-x64":    "0.1.0",
+    "@tailflow/win32-x64":    "0.1.0"
+  }
+}

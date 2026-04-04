@@ -34,3 +34,12 @@ web/dist/assets/
 web/dist/*.html
 web/dist/*.js
 web/dist/*.css
+
+# Compiled binaries staged for npm publishing (added by scripts/pack-local.sh
+# and the release CI — never committed)
+npm/platforms/*/bin/tailflow
+npm/platforms/*/bin/tailflow-daemon
+npm/platforms/*/bin/tailflow.exe
+npm/platforms/*/bin/tailflow-daemon.exe
+npm/platforms/*/*.tgz
+npm/tailflow/*.tgz

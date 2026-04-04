@@ -98,6 +98,21 @@ None of them unify all three source types (containers + spawned processes + log 
 
 ## Installation
 
+### npm / npx (no Rust required)
+
+```bash
+# Run once without installing
+npx tailflow --docker
+npx tailflow-daemon --docker
+
+# Install globally
+npm install -g tailflow
+tailflow --docker
+tailflow-daemon --port 7878
+```
+
+npm automatically downloads only the binary for your OS and CPU — no Rust toolchain needed. Supported platforms: macOS ARM64, macOS x64, Linux x64, Linux ARM64, Windows x64.
+
 ### From source (requires Rust 1.75+)
 
 ```bash
@@ -353,6 +368,24 @@ tailflow/
     │           └── stdin.rs       # async stdin reader
     ├── tailflow-tui/              # `tailflow` binary — ratatui TUI
     └── tailflow-daemon/           # `tailflow-daemon` binary — axum + embedded web UI
+npm/
+├── tailflow/                      # published as `tailflow` on npm
+│   ├── package.json               # optionalDependencies → platform packages
+│   └── bin/
+│       ├── run.js                 # shared launcher (platform detection + spawnSync)
+│       ├── tailflow.js            # `npx tailflow`
+│       └── tailflow-daemon.js     # `npx tailflow-daemon`
+└── platforms/                     # published as `@tailflow/<platform>`
+    ├── darwin-arm64/package.json
+    ├── darwin-x64/package.json
+    ├── linux-x64/package.json
+    ├── linux-arm64/package.json
+    └── win32-x64/package.json     # bin/ directories are gitignored; added by CI
+scripts/
+├── bump-version.js                # sync version across all package.json + Cargo.toml
+└── pack-local.sh                  # build + pack for the current platform (local testing)
+.github/workflows/
+└── release.yml                    # tag → build all platforms → publish to npm
 ```
 
 ---
@@ -362,7 +395,7 @@ tailflow/
 - [x] **Phase 1:** Rust core, ratatui TUI, Docker/file/stdin ingestion
 - [x] **Phase 2:** Process spawning, `tailflow.toml` config, axum SSE daemon
 - [x] **Phase 3:** Preact web dashboard embedded in the daemon binary
-- [ ] **npm / npx distribution** — ship the binary via napi-rs so `npx tailflow` works without Rust installed
+- [x] **npm / npx distribution** — platform-specific optional deps; `npx tailflow` works with no Rust installed
 - [ ] **Homebrew formula** — macOS/Linux native install
 - [ ] **`--grep` / `--source` daemon flags** — server-side filtering before SSE emission
 - [ ] **Process restart policy** — automatically restart a crashed `[[sources.process]]` entry
