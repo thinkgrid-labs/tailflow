@@ -55,3 +55,69 @@ pub type LogReceiver = broadcast::Receiver<LogRecord>;
 pub fn new_bus() -> (LogSender, LogReceiver) {
     broadcast::channel(BUS_CAPACITY)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── LogLevel::detect ─────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_error_keyword() {
+        assert_eq!(
+            LogLevel::detect("ERROR: connection refused"),
+            LogLevel::Error
+        );
+        assert_eq!(LogLevel::detect("error: timeout"), LogLevel::Error);
+        assert_eq!(LogLevel::detect("FATAL: out of memory"), LogLevel::Error);
+        assert_eq!(LogLevel::detect("something err happened"), LogLevel::Error);
+    }
+
+    #[test]
+    fn detect_warn_keyword() {
+        assert_eq!(LogLevel::detect("WARN: high memory"), LogLevel::Warn);
+        assert_eq!(LogLevel::detect("warning: deprecated"), LogLevel::Warn);
+    }
+
+    #[test]
+    fn detect_info_keyword() {
+        assert_eq!(LogLevel::detect("INFO: server started"), LogLevel::Info);
+        assert_eq!(
+            LogLevel::detect("[info] listening on :8080"),
+            LogLevel::Info
+        );
+    }
+
+    #[test]
+    fn detect_debug_keyword() {
+        assert_eq!(LogLevel::detect("DEBUG: cache miss"), LogLevel::Debug);
+        assert_eq!(LogLevel::detect("[debug] processing"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn detect_trace_keyword() {
+        assert_eq!(LogLevel::detect("TRACE: entering fn"), LogLevel::Trace);
+    }
+
+    #[test]
+    fn detect_unknown_for_plain_output() {
+        assert_eq!(
+            LogLevel::detect("server started on port 3000"),
+            LogLevel::Unknown
+        );
+        assert_eq!(LogLevel::detect("compiled successfully"), LogLevel::Unknown);
+    }
+
+    #[test]
+    fn detect_is_case_insensitive() {
+        assert_eq!(LogLevel::detect("Error: bad"), LogLevel::Error);
+        assert_eq!(LogLevel::detect("ERROR: bad"), LogLevel::Error);
+        assert_eq!(LogLevel::detect("error: bad"), LogLevel::Error);
+    }
+
+    #[test]
+    fn detect_error_takes_priority_over_warn() {
+        // "error" beats "warn" when both appear
+        assert_eq!(LogLevel::detect("error/warn mixed"), LogLevel::Error);
+    }
+}

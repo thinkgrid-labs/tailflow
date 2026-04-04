@@ -9,9 +9,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Step 0: quality gate (fmt + clippy + tests) ────────────────────────────
+  # Replicates ci.yml checks so a tag pushed without a green CI still gets
+  # validated before any artifact is published.
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create web/dist placeholder
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci
+      - name: Web type-check
+        run: cd web && npx tsc --noEmit
+
   # ── Step 1: build the web UI once, share as artifact ──────────────────────
   build-web:
     name: Build web UI
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

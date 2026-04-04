@@ -76,18 +76,11 @@ impl Config {
         }
 
         for entry in self.sources.file {
-            let label = entry
-                .label
-                .unwrap_or_else(|| {
-                    entry
-                        .path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("file")
-                        .to_string()
-                });
-            let _ = label; // FileSource uses the filename as name()
-            sources.push(Box::new(FileSource::new(entry.path)));
+            let src = match entry.label {
+                Some(label) => FileSource::with_label(entry.path, label),
+                None => FileSource::new(entry.path),
+            };
+            sources.push(Box::new(src));
         }
 
         for entry in self.sources.process {
@@ -99,5 +92,93 @@ impl Config {
         }
 
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> Config {
+        toml::from_str(toml).expect("valid TOML")
+    }
+
+    #[test]
+    fn empty_config_has_sensible_defaults() {
+        let cfg = parse("");
+        assert!(!cfg.sources.docker);
+        assert!(cfg.sources.stdin.is_none());
+        assert!(cfg.sources.file.is_empty());
+        assert!(cfg.sources.process.is_empty());
+    }
+
+    #[test]
+    fn docker_flag_parsed() {
+        let cfg = parse("[sources]\ndocker = true");
+        assert!(cfg.sources.docker);
+    }
+
+    #[test]
+    fn stdin_label_parsed() {
+        let cfg = parse("[sources]\nstdin = \"pipe\"");
+        assert_eq!(cfg.sources.stdin.as_deref(), Some("pipe"));
+    }
+
+    #[test]
+    fn process_entries_parsed() {
+        let cfg = parse(
+            r#"
+[[sources.process]]
+label = "frontend"
+cmd   = "npm run dev"
+
+[[sources.process]]
+label = "api"
+cmd   = "go run ./cmd/api"
+"#,
+        );
+        assert_eq!(cfg.sources.process.len(), 2);
+        assert_eq!(cfg.sources.process[0].label, "frontend");
+        assert_eq!(cfg.sources.process[0].cmd, "npm run dev");
+        assert_eq!(cfg.sources.process[1].label, "api");
+    }
+
+    #[test]
+    fn file_entry_with_label_parsed() {
+        let cfg = parse(
+            r#"
+[[sources.file]]
+path  = "/var/log/app.log"
+label = "app"
+"#,
+        );
+        assert_eq!(cfg.sources.file.len(), 1);
+        assert_eq!(cfg.sources.file[0].path, PathBuf::from("/var/log/app.log"));
+        assert_eq!(cfg.sources.file[0].label, Some("app".to_string()));
+    }
+
+    #[test]
+    fn file_entry_without_label_parsed() {
+        let cfg = parse("[[sources.file]]\npath = \"/tmp/out.log\"");
+        assert!(cfg.sources.file[0].label.is_none());
+    }
+
+    #[test]
+    fn invalid_toml_returns_error() {
+        let result: Result<Config, _> = toml::from_str("[[[[invalid toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_load_missing_file_returns_error() {
+        let result = Config::load(Path::new("/nonexistent/tailflow.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn find_and_load_returns_none_when_no_file() {
+        // /tmp has no tailflow.toml above it
+        let result = Config::find_and_load(Path::new("/tmp")).unwrap();
+        assert!(result.is_none());
     }
 }

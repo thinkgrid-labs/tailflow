@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Rust: formatting ────────────────────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ── Rust: linting ───────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Clippy on tailflow-daemon requires web/dist to exist (rust-embed)
+      - name: Create web/dist placeholder
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ── Rust: unit + integration tests ─────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create web/dist placeholder
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all
+
+  # ── Web UI: type-check ──────────────────────────────────────────────────────
+  web-typecheck:
+    name: Web type-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+  # ── Gate: all checks must pass ──────────────────────────────────────────────
+  # Other workflows / branch-protection rules can require this single job
+  # instead of listing each check individually.
+  quality:
+    name: Quality gate
+    needs: [fmt, clippy, test, web-typecheck]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All quality checks passed."

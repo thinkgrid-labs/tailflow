@@ -13,17 +13,33 @@ use tracing::{info, warn};
 
 pub struct FileSource {
     path: PathBuf,
+    /// Optional override for the source name shown in the UI.
+    /// Falls back to the filename when `None`.
+    label: Option<String>,
 }
 
 impl FileSource {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            label: None,
+        }
+    }
+
+    pub fn with_label(path: impl Into<PathBuf>, label: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            label: Some(label.into()),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Source for FileSource {
     fn name(&self) -> &str {
+        if let Some(l) = &self.label {
+            return l.as_str();
+        }
         self.path
             .file_name()
             .and_then(|n| n.to_str())
@@ -32,26 +48,21 @@ impl Source for FileSource {
 
     async fn run(self: Box<Self>, tx: LogSender) -> Result<()> {
         let path = self.path.clone();
-        let source_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
+        let source_name = self.name().to_string();
 
-        // Run blocking file I/O on the blocking thread pool.
         task::spawn_blocking(move || -> Result<()> {
             let file = std::fs::File::open(&path)
                 .with_context(|| format!("cannot open {}", path.display()))?;
             let mut reader = BufReader::new(file);
 
-            // Seek to end so we only emit new lines.
+            // Seek to end — only emit newly appended lines.
             reader.seek(SeekFrom::End(0))?;
 
             let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
             let mut watcher = RecommendedWatcher::new(event_tx, notify::Config::default())?;
             watcher.watch(&path, RecursiveMode::NonRecursive)?;
 
-            info!(path = %path.display(), "watching file");
+            info!(path = %path.display(), source = %source_name, "watching file");
 
             for res in event_rx {
                 match res {

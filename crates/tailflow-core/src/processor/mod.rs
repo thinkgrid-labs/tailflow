@@ -1,4 +1,4 @@
-use crate::{LogRecord, LogReceiver};
+use crate::{LogReceiver, LogRecord};
 use regex::Regex;
 use tokio::sync::broadcast;
 
@@ -47,4 +47,56 @@ pub fn filtered_bus(mut rx: LogReceiver, filter: Filter) -> LogReceiver {
     });
 
     new_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LogLevel, LogRecord};
+    use chrono::Utc;
+
+    fn record(source: &str, payload: &str) -> LogRecord {
+        LogRecord {
+            timestamp: Utc::now(),
+            source: source.to_string(),
+            level: LogLevel::Info,
+            payload: payload.to_string(),
+        }
+    }
+
+    // ── Filter::matches ───────────────────────────────────────────────────────
+
+    #[test]
+    fn filter_none_matches_everything() {
+        let f = Filter::none();
+        assert!(f.matches(&record("api", "server started")));
+        assert!(f.matches(&record("worker", "queue depth 100")));
+    }
+
+    #[test]
+    fn filter_regex_matches_payload() {
+        let f = Filter::regex("error|ERROR").unwrap();
+        assert!(f.matches(&record("api", "ERROR: connection refused")));
+        assert!(f.matches(&record("api", "something error here")));
+        assert!(!f.matches(&record("api", "server started")));
+    }
+
+    #[test]
+    fn filter_regex_matches_source_name() {
+        let f = Filter::regex("^api$").unwrap();
+        assert!(f.matches(&record("api", "anything")));
+        assert!(!f.matches(&record("worker", "anything")));
+    }
+
+    #[test]
+    fn filter_regex_is_case_sensitive_by_default() {
+        let f = Filter::regex("ERROR").unwrap();
+        assert!(f.matches(&record("x", "ERROR: bad")));
+        assert!(!f.matches(&record("x", "error: bad")));
+    }
+
+    #[test]
+    fn filter_invalid_regex_returns_err() {
+        assert!(Filter::regex("[[[not a regex").is_err());
+    }
 }

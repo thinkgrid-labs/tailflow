@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
     extract::State,
-    http::{header, Uri, StatusCode},
+    http::{header, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json, Response,
@@ -23,9 +23,9 @@ struct WebAssets;
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         // API routes — matched before the static fallback
-        .route("/events",      get(sse_handler))
+        .route("/events", get(sse_handler))
         .route("/api/records", get(records_handler))
-        .route("/health",      get(health_handler))
+        .route("/health", get(health_handler))
         // Everything else → embedded web UI
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
@@ -76,11 +76,7 @@ async fn static_handler(uri: Uri) -> Response {
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
-            (
-                [(header::CONTENT_TYPE, mime)],
-                content.data.into_owned(),
-            )
-                .into_response()
+            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
         }
         // Unknown path → serve index.html (SPA client-side routing)
         None => match WebAssets::get("index.html") {

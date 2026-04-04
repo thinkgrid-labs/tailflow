@@ -1,10 +1,7 @@
 use super::Source;
 use crate::{LogLevel, LogRecord, LogSender};
 use anyhow::Result;
-use bollard::{
-    container::LogsOptions,
-    Docker,
-};
+use bollard::{container::LogsOptions, Docker};
 use chrono::Utc;
 use futures_util::StreamExt;
 use tracing::{info, warn};

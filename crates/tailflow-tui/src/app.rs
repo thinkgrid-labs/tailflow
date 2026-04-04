@@ -119,8 +119,7 @@ impl App {
                 if let Event::Key(key) = event::read()? {
                     match (self.filter_mode, key.code) {
                         // Quit
-                        (false, KeyCode::Char('q'))
-                        | (false, KeyCode::Char('c'))
+                        (false, KeyCode::Char('q')) | (false, KeyCode::Char('c'))
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             return Ok(())

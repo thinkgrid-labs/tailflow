@@ -104,15 +104,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
             let level_str = format!("{:?}", level).to_uppercase();
             let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", ts),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{} ", ts), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:<20} ", src),
-                    Style::default()
-                        .fg(src_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(src_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:5} ", level_str),
@@ -133,7 +128,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(list, chunks[1]);
 
     // ── Filter bar ─────────────────────────────────────────────────────────
-    let filter_label = if app.filter_mode { "Filter> " } else { "Filter: " };
+    let filter_label = if app.filter_mode {
+        "Filter> "
+    } else {
+        "Filter: "
+    };
     let filter_style = if app.filter_mode {
         Style::default().fg(Color::Yellow)
     } else {

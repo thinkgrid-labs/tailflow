@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use tailflow_core::{LogRecord, LogReceiver, LogSender};
+use tailflow_core::{LogReceiver, LogRecord, LogSender};
 use tokio::sync::broadcast;
 
 const RING_SIZE: usize = 500;
