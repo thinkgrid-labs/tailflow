@@ -1,4 +1,33 @@
+# Build output
 /target
-Cargo.lock
+
+# Cargo.lock should be committed for binaries (tailflow, tailflow-daemon)
+# Remove this line if you want reproducible builds pinned
+# Cargo.lock
+
+# macOS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V7
+.Trashes
+
+# Editor directories and files
+.idea/
+.vscode/
+*.sw?
+*.swp
+*~
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Test log files generated during development
 *.log
+
+# Node (if web UI is added in a future phase)
+node_modules/
+dist/
+.next/
