@@ -27,7 +27,7 @@ Existing tools solve parts of this:
 - **mprocs** — runs multiple processes in a TUI, but isn't log-focused
 - **lnav** — powerful log file navigator, but no process spawning or Docker
 
-None of them unify all three source types (containers + spawned processes + log files) in a single, filterable, color-coded terminal dashboard. That gap is what TailFlow fills.
+None of them unify all three source types (containers + spawned processes + log files) in a single, filterable, color-coded view — in both a TUI and a web UI. That gap is what TailFlow fills.
 
 ---
 
@@ -48,11 +48,11 @@ None of them unify all three source types (containers + spawned processes + log 
 
 - **Three ingestion sources:** Docker containers (via socket), spawned processes (`sh -c`), and tailed log files
 - **Zero-config startup:** Drop a `tailflow.toml` at your repo root and run `tailflow`
-- **Real-time regex filtering:** Press `/` to filter by keyword, source name, or regex pattern
-- **Per-source color coding:** Each service gets a distinct color automatically assigned
+- **Real-time regex filtering:** Filter by keyword, source name, or regex pattern — in both TUI and web UI
+- **Per-source color coding:** Each service gets a distinct color; palette is consistent between TUI and web
 - **Sub-10ms latency:** Tokio async runtime + broadcast channel; no polling
-- **SSE daemon mode:** `tailflow-daemon` exposes an HTTP endpoint for web UI consumption
-- **Dual binaries:** `tailflow` (TUI) and `tailflow-daemon` (headless + HTTP) built from the same core
+- **Dual binaries:** `tailflow` (TUI) and `tailflow-daemon` (headless HTTP + embedded web UI)
+- **Embedded web dashboard:** `tailflow-daemon` serves a full Preact dashboard at `localhost:7878` — no separate install
 
 ---
 
@@ -70,14 +70,26 @@ None of them unify all three source types (containers + spawned processes + log 
                                                        │
               ┌────────────────────┬───────────────────┘
               │                    │
-     ┌────────▼────────┐  ┌────────▼────────────────────┐
-     │  tailflow-tui   │  │      tailflow-daemon         │
-     │                 │  │                              │
-     │  ratatui TUI    │  │  axum HTTP server            │
-     │  color-coded    │  │  GET /events     (SSE)       │
-     │  regex filter   │  │  GET /api/records (JSON)     │
-     │  scroll/search  │  │  GET /health                 │
-     └─────────────────┘  └──────────────────────────────┘
+     ┌────────▼────────┐  ┌────────▼───────────────────────────┐
+     │  tailflow-tui   │  │        tailflow-daemon              │
+     │                 │  │                                     │
+     │  ratatui TUI    │  │  axum HTTP server                   │
+     │  color-coded    │  │  GET /events      (SSE stream)      │
+     │  regex filter   │  │  GET /api/records (last 500 JSON)   │
+     │  scroll/search  │  │  GET /health                        │
+     └─────────────────┘  │  GET /*           (embedded web UI) │
+                          └─────────────────────────────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │     tailflow-web         │
+                          │  (Preact, embedded in    │
+                          │   the daemon binary)     │
+                          │                          │
+                          │  ● source sidebar        │
+                          │  ● level filter pills    │
+                          │  ● regex search bar      │
+                          │  ● auto-scroll + pause   │
+                          └──────────────────────────┘
 ```
 
 `tailflow-core` is intentionally dependency-free of any UI framework. The broadcast channel is the only coupling point, which means adding a new presentation layer (web, desktop, etc.) requires touching only the consumer side.
@@ -183,6 +195,52 @@ req-[a-f0-9]{8}
 
 ---
 
+## Web Dashboard
+
+`tailflow-daemon` embeds a full Preact web dashboard into the binary. Once the daemon is running, open your browser — no separate server or `npm install` needed.
+
+```
+http://localhost:7878
+```
+
+![TailFlow Web UI](docs/screenshot.png)
+
+### Dashboard features
+
+| Feature | Detail |
+|---|---|
+| **Source sidebar** | All active sources listed with color dots and record counts. Click to filter to a single source; click again to deselect. |
+| **Level pills** | `ERR` `WRN` `INF` `DBG` `TRC` pills in the header. Toggle individual levels on/off. |
+| **Filter bar** | Plain text substring or full regex. Matches against both the log payload and the source name. |
+| **Auto-scroll** | Follows new records automatically. Scrolling up pauses; a **↓ latest** button appears to resume. |
+| **Color consistency** | Source colors match the TUI palette exactly — the same source is always the same color. |
+| **60fps rendering** | Incoming records are batched to `requestAnimationFrame` cadence so a high-velocity stream doesn't thrash the browser. |
+
+### Building the web UI
+
+The web UI is built with Vite + Preact and the output is embedded into the daemon binary at compile time via `rust-embed`. You must build it before running `cargo build`:
+
+```bash
+cd web
+npm install
+npm run build    # outputs to web/dist/
+cd ..
+cargo build -p tailflow-daemon --release
+```
+
+For web UI development with hot reload:
+
+```bash
+# Terminal 1 — run the daemon (sources active)
+cargo run -p tailflow-daemon -- --docker
+
+# Terminal 2 — Vite dev server with proxy to daemon
+cd web && npm run dev
+# open http://localhost:5173
+```
+
+---
+
 ## HTTP Daemon
 
 `tailflow-daemon` runs as a background process and exposes your local log stream over HTTP. This is useful when you prefer a browser-based UI or need to share logs with a teammate on the same network.
@@ -272,6 +330,17 @@ Config values and CLI flags are **additive** — you can always add `--docker` o
 tailflow/
 ├── tailflow.example.toml          # annotated config reference
 ├── Cargo.toml                     # workspace
+├── web/                           # Preact web dashboard
+│   ├── package.json
+│   ├── vite.config.ts             # dev proxy → daemon :7878
+│   └── src/
+│       ├── App.tsx                # layout, filter state, auto-scroll
+│       ├── types.ts               # LogRecord, color palette
+│       ├── hooks/
+│       │   └── useLogStream.ts    # EventSource + RAF batching
+│       └── components/
+│           ├── LogRow.tsx         # single log line
+│           └── Sidebar.tsx        # source list with counts
 └── crates/
     ├── tailflow-core/             # ingestion engine (no UI deps)
     │   └── src/
@@ -283,14 +352,16 @@ tailflow/
     │           ├── process.rs     # tokio::process: spawn + capture
     │           └── stdin.rs       # async stdin reader
     ├── tailflow-tui/              # `tailflow` binary — ratatui TUI
-    └── tailflow-daemon/           # `tailflow-daemon` binary — axum SSE server
+    └── tailflow-daemon/           # `tailflow-daemon` binary — axum + embedded web UI
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] **Phase 3:** `tailflow-web` — Preact web dashboard consuming the daemon SSE endpoint
+- [x] **Phase 1:** Rust core, ratatui TUI, Docker/file/stdin ingestion
+- [x] **Phase 2:** Process spawning, `tailflow.toml` config, axum SSE daemon
+- [x] **Phase 3:** Preact web dashboard embedded in the daemon binary
 - [ ] **npm / npx distribution** — ship the binary via napi-rs so `npx tailflow` works without Rust installed
 - [ ] **Homebrew formula** — macOS/Linux native install
 - [ ] **`--grep` / `--source` daemon flags** — server-side filtering before SSE emission

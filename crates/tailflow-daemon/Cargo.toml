@@ -29,3 +29,7 @@ clap = { version = "4", features = ["derive"] }
 
 # stdin detection
 atty = "0.2"
+
+# Embed the built web UI into the binary
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"

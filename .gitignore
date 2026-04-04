@@ -27,7 +27,10 @@
 # Test log files generated during development
 *.log
 
-# Node (if web UI is added in a future phase)
+# Node / web UI
 node_modules/
-dist/
-.next/
+# Keep web/dist/.gitkeep but ignore build artifacts
+web/dist/assets/
+web/dist/*.html
+web/dist/*.js
+web/dist/*.css
