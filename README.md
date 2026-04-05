@@ -423,6 +423,32 @@ tailflow/
 
 ---
 
+## Roadmap
+
+### Near-term
+
+- [ ] **Web dashboard search bar** — live `?grep=` filter input in the UI so users don't need to hand-craft query params
+- [ ] **Log export** — download filtered records as `.ndjson` or `.txt` from the web dashboard
+- [ ] **Graceful shutdown** — SIGTERM drains in-flight records and flushes the ring buffer before exit
+- [ ] **`--follow` flag for files** — tail from the end by default; `--no-follow` reads the whole file and exits (like `tail -f` vs `cat`)
+- [ ] **Docker Compose integration** — auto-discover services from a `docker-compose.yml` in the project root without listing them manually
+
+### High-impact
+
+- [ ] **Log level filter toggles in TUI** — press `e`/`w`/`i`/`d` to show/hide Error, Warn, Info, Debug levels; currently only regex filter exists
+- [ ] **Persistent log buffer to disk** — optional SQLite ring buffer so logs survive daemon restarts and can be queried historically
+- [ ] **`[[sources.http]]` webhook receiver** — accept POST payloads from external services (Vercel, Render, Fly.io log drains) and ingest them as a named source
+- [ ] **Web dashboard dark/light theme toggle** — currently hardcoded dark; one `prefers-color-scheme` CSS variable swap would cover both
+- [ ] **OpenTelemetry / OTLP exporter** — forward collected logs to a collector (Grafana Cloud, Honeycomb, Datadog) for teams who want cloud retention without changing their local workflow
+
+### Speculative / community interest
+
+- [ ] **TUI split-pane view** — side-by-side panes showing two sources simultaneously; useful when debugging a frontend + backend at the same time
+- [ ] **Plugin system for custom sources** — WASM or subprocess-based source plugins so users can add sources (Kafka, Redis pub/sub, AWS CloudWatch) without forking
+- [ ] **AI log summarisation** — `s` key in TUI calls a local LLM (Ollama) or cloud API to summarise the last N error records into a plain-English diagnosis
+
+---
+
 ## Contributing
 
 Contributions are welcome. Please open an issue before submitting a large PR so we can align on the approach.
