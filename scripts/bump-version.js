@@ -1,12 +1,10 @@
 #!/usr/bin/env node
-/**
- * Usage: node scripts/bump-version.js <version>
- *
- * Updates the version field in:
- *   - npm/tailflow/package.json          (main package + optionalDependencies)
- *   - npm/platforms/*/package.json       (each platform package)
- *   - Cargo.toml workspace [package]     (workspace version)
- */
+// Usage: node scripts/bump-version.js <version>
+//
+// Updates the version field in:
+//   - npm/tailflow/package.json        (main package + optionalDependencies)
+//   - npm/platforms/<platform>/package.json  (each platform package)
+//   - Cargo.toml workspace [package]   (workspace version)
 'use strict'
 
 const fs   = require('fs')
