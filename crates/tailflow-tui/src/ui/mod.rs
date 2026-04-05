@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
-use tailflow_core::LogLevel;
+use tailflow_core::{json::flatten_json, LogLevel};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -56,6 +56,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let scroll = app.scroll;
 
     // ── Collect visible records as owned data (drops borrow on app.records) ─
+    let pretty_json = app.pretty_json;
     let visible_data: Vec<(String, String, LogLevel, String)> = app
         .records
         .iter()
@@ -63,11 +64,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .skip(scroll)
         .take(list_height)
         .map(|r| {
+            let payload = if pretty_json {
+                flatten_json(&r.payload).unwrap_or_else(|| r.payload.clone())
+            } else {
+                r.payload.clone()
+            };
             (
                 r.timestamp.format("%H:%M:%S%.3f").to_string(),
                 r.source.clone(),
                 r.level,
-                r.payload.clone(),
+                payload,
             )
         })
         .collect();
@@ -79,9 +85,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .collect();
 
     // ── Header ─────────────────────────────────────────────────────────────
+    let json_label = if app.pretty_json {
+        "p:json-on"
+    } else {
+        "p:json-off"
+    };
     let header_text = format!(
-        " TailFlow  |  {} records  |  Press / to filter  |  q to quit",
-        app.records.len()
+        " TailFlow  |  {} records  |  / filter  |  {}  |  q quit",
+        app.records.len(),
+        json_label,
     );
     let header = Paragraph::new(header_text)
         .style(Style::default().fg(Color::White).bg(Color::DarkGray))

@@ -19,6 +19,8 @@ pub struct App {
     rx: LogReceiver,
     pub scroll: usize,
     pub source_colors: SourceColorMap,
+    /// When true, JSON payloads are shown as flattened key=value pairs.
+    pub pretty_json: bool,
 }
 
 pub struct SourceColorMap {
@@ -68,6 +70,7 @@ impl App {
             rx,
             scroll: 0,
             source_colors: SourceColorMap::new(),
+            pretty_json: false,
         }
     }
 
@@ -139,6 +142,11 @@ impl App {
                         }
                         (false, KeyCode::Char('G')) => {
                             self.scroll = usize::MAX; // snap to bottom on next render
+                        }
+
+                        // Toggle JSON pretty-printing
+                        (false, KeyCode::Char('p')) => {
+                            self.pretty_json = !self.pretty_json;
                         }
 
                         // Filter mode input

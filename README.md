@@ -423,22 +423,6 @@ tailflow/
 
 ---
 
-## Roadmap
-
-- [x] Rust core engine with broadcast bus
-- [x] ratatui TUI — color-coded sources, regex filter, keyboard scroll
-- [x] Docker, process, file, and stdin ingestion sources
-- [x] `tailflow.toml` zero-config discovery
-- [x] axum SSE daemon with ring buffer
-- [x] Preact web dashboard embedded in the daemon binary
-- [x] npm / npx distribution — no Rust toolchain required
-- [x] Homebrew formula for macOS and Linux
-- [x] Server-side `--grep` and `--source` filter flags for the daemon
-- [ ] Process restart policy for crashed `[[sources.process]]` entries
-- [ ] JSON log pretty-printing — detect structured payloads and expand inline
-
----
-
 ## Contributing
 
 Contributions are welcome. Please open an issue before submitting a large PR so we can align on the approach.
