@@ -109,7 +109,8 @@ npm installs only the binary matching your OS and CPU via platform-specific opti
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew install your-org/tap/tailflow
+brew tap thinkgrid-labs/tap
+brew install tailflow
 ```
 
 ### From source — requires Rust 1.75+
@@ -424,17 +425,27 @@ tailflow/
 
 ## Roadmap
 
-- [x] Rust core engine with broadcast bus
-- [x] ratatui TUI — color-coded sources, regex filter, keyboard scroll
-- [x] Docker, process, file, and stdin ingestion sources
-- [x] `tailflow.toml` zero-config discovery
-- [x] axum SSE daemon with ring buffer
-- [x] Preact web dashboard embedded in the daemon binary
-- [x] npm / npx distribution — no Rust toolchain required
-- [ ] Homebrew formula for macOS and Linux
-- [ ] Server-side `--grep` and `--source` filter flags for the daemon
-- [ ] Process restart policy for crashed `[[sources.process]]` entries
-- [ ] JSON log pretty-printing — detect structured payloads and expand inline
+### Near-term
+
+- [ ] **Web dashboard search bar** — live `?grep=` filter input in the UI so users don't need to hand-craft query params
+- [ ] **Log export** — download filtered records as `.ndjson` or `.txt` from the web dashboard
+- [ ] **Graceful shutdown** — SIGTERM drains in-flight records and flushes the ring buffer before exit
+- [ ] **`--follow` flag for files** — tail from the end by default; `--no-follow` reads the whole file and exits (like `tail -f` vs `cat`)
+- [ ] **Docker Compose integration** — auto-discover services from a `docker-compose.yml` in the project root without listing them manually
+
+### High-impact
+
+- [ ] **Log level filter toggles in TUI** — press `e`/`w`/`i`/`d` to show/hide Error, Warn, Info, Debug levels; currently only regex filter exists
+- [ ] **Persistent log buffer to disk** — optional SQLite ring buffer so logs survive daemon restarts and can be queried historically
+- [ ] **`[[sources.http]]` webhook receiver** — accept POST payloads from external services (Vercel, Render, Fly.io log drains) and ingest them as a named source
+- [ ] **Web dashboard dark/light theme toggle** — currently hardcoded dark; one `prefers-color-scheme` CSS variable swap would cover both
+- [ ] **OpenTelemetry / OTLP exporter** — forward collected logs to a collector (Grafana Cloud, Honeycomb, Datadog) for teams who want cloud retention without changing their local workflow
+
+### Speculative / community interest
+
+- [ ] **TUI split-pane view** — side-by-side panes showing two sources simultaneously; useful when debugging a frontend + backend at the same time
+- [ ] **Plugin system for custom sources** — WASM or subprocess-based source plugins so users can add sources (Kafka, Redis pub/sub, AWS CloudWatch) without forking
+- [ ] **AI log summarisation** — `s` key in TUI calls a local LLM (Ollama) or cloud API to summarise the last N error records into a plain-English diagnosis
 
 ---
 

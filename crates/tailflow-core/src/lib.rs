@@ -1,5 +1,6 @@
 pub mod config;
 pub mod ingestion;
+pub mod json;
 pub mod processor;
 
 use chrono::{DateTime, Utc};

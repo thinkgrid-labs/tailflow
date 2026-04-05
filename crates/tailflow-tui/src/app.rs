@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use regex::Regex;
 use std::{io, time::Duration};
 use tailflow_core::{LogReceiver, LogRecord};
 use tokio::sync::broadcast;
@@ -15,10 +16,14 @@ const MAX_RECORDS: usize = 2000;
 pub struct App {
     pub records: Vec<LogRecord>,
     pub filter: String,
+    /// Compiled regex for `filter`; kept in sync whenever `filter` changes.
+    pub filter_re: Option<Regex>,
     pub filter_mode: bool,
     rx: LogReceiver,
     pub scroll: usize,
     pub source_colors: SourceColorMap,
+    /// When true, JSON payloads are shown as flattened key=value pairs.
+    pub pretty_json: bool,
 }
 
 pub struct SourceColorMap {
@@ -64,10 +69,12 @@ impl App {
         Self {
             records: Vec::with_capacity(MAX_RECORDS),
             filter: String::new(),
+            filter_re: None,
             filter_mode: false,
             rx,
             scroll: 0,
             source_colors: SourceColorMap::new(),
+            pretty_json: false,
         }
     }
 
@@ -141,6 +148,11 @@ impl App {
                             self.scroll = usize::MAX; // snap to bottom on next render
                         }
 
+                        // Toggle JSON pretty-printing
+                        (false, KeyCode::Char('p')) => {
+                            self.pretty_json = !self.pretty_json;
+                        }
+
                         // Filter mode input
                         (true, KeyCode::Esc) => {
                             self.filter_mode = false;
@@ -151,9 +163,11 @@ impl App {
                         }
                         (true, KeyCode::Backspace) => {
                             self.filter.pop();
+                            self.filter_re = Regex::new(&self.filter).ok();
                         }
                         (true, KeyCode::Char(c)) => {
                             self.filter.push(c);
+                            self.filter_re = Regex::new(&self.filter).ok();
                         }
 
                         _ => {}
