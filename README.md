@@ -433,7 +433,7 @@ tailflow/
 - [x] Preact web dashboard embedded in the daemon binary
 - [x] npm / npx distribution — no Rust toolchain required
 - [x] Homebrew formula for macOS and Linux
-- [ ] Server-side `--grep` and `--source` filter flags for the daemon
+- [x] Server-side `--grep` and `--source` filter flags for the daemon
 - [ ] Process restart policy for crashed `[[sources.process]]` entries
 - [ ] JSON log pretty-printing — detect structured payloads and expand inline
 

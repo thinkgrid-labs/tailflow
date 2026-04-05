@@ -8,6 +8,7 @@ use tailflow_core::{
     config::Config,
     ingestion::{docker::DockerSource, file::FileSource, stdin::StdinSource, Source},
     new_bus,
+    processor::{filtered_bus, Filter},
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +38,14 @@ struct Cli {
     /// Path to tailflow.toml (auto-discovered if omitted)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Only stream records whose payload matches this regex
+    #[arg(long, value_name = "REGEX")]
+    grep: Option<String>,
+
+    /// Only stream records from sources whose name contains this string
+    #[arg(long, value_name = "NAME")]
+    source: Option<String>,
 }
 
 #[tokio::main]
@@ -94,6 +103,21 @@ async fn main() -> Result<()> {
         });
     }
     drop(tx);
+
+    // Apply global CLI filters before records enter the ring buffer / SSE bus.
+    let rx = {
+        let mut filter = match cli.grep.as_deref() {
+            Some(pat) => Filter::regex(pat).unwrap_or_else(|e| {
+                eprintln!("tailflow-daemon: invalid --grep regex ({e}), filter ignored");
+                Filter::none()
+            }),
+            None => Filter::none(),
+        };
+        if let Some(src) = cli.source {
+            filter = filter.with_source(src);
+        }
+        filtered_bus(rx, filter)
+    };
 
     let shared = state::AppState::new(rx);
     let app = routes::router(shared);

@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -10,7 +10,9 @@ use axum::{
     Router,
 };
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use std::sync::Arc;
+use tailflow_core::processor::Filter;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::CorsLayer;
 
@@ -32,17 +34,52 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+// ── Shared filter params ──────────────────────────────────────────────────────
+
+/// Query parameters accepted by `/events` and `/api/records`.
+///
+/// Examples:
+///   GET /events?grep=error
+///   GET /api/records?source=nginx
+///   GET /events?grep=panic&source=api
+#[derive(Debug, Deserialize, Default)]
+struct FilterParams {
+    /// Regex matched against `record.payload`.
+    grep: Option<String>,
+    /// Substring matched against `record.source`.
+    source: Option<String>,
+}
+
+impl FilterParams {
+    fn into_filter(self) -> Filter {
+        let f = match self.grep.as_deref() {
+            Some(pat) => Filter::regex(pat).unwrap_or_else(|e| {
+                tracing::warn!(pattern = pat, err = %e, "invalid grep regex, ignoring");
+                Filter::none()
+            }),
+            None => Filter::none(),
+        };
+        match self.source {
+            Some(src) => f.with_source(src),
+            None => f,
+        }
+    }
+}
+
 // ── SSE ───────────────────────────────────────────────────────────────────────
 
 async fn sse_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<FilterParams>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, axum::Error>>> {
+    let filter = params.into_filter();
     let rx = state.tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|res| match res {
-        Ok(record) => {
+    let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
+        Ok(record) if filter.matches(&record) => {
             let data = serde_json::to_string(&record).unwrap_or_default();
             Some(Ok(Event::default().data(data)))
         }
+        Ok(_) => None,
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
             tracing::warn!(dropped = n, "SSE client lagged");
             None
@@ -54,8 +91,19 @@ async fn sse_handler(
 
 // ── REST ──────────────────────────────────────────────────────────────────────
 
-async fn records_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let records = state.ring.lock().unwrap().clone();
+async fn records_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FilterParams>,
+) -> impl IntoResponse {
+    let filter = params.into_filter();
+    let records: Vec<_> = state
+        .ring
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| filter.matches(r))
+        .cloned()
+        .collect();
     Json(records)
 }
 

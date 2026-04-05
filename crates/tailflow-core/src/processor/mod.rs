@@ -3,24 +3,41 @@ use regex::Regex;
 use tokio::sync::broadcast;
 
 pub struct Filter {
-    pattern: Option<Regex>,
+    /// Regex matched against `record.payload`.
+    grep: Option<Regex>,
+    /// Substring matched against `record.source`.
+    source: Option<String>,
 }
 
 impl Filter {
     pub fn none() -> Self {
-        Self { pattern: None }
+        Self { grep: None, source: None }
     }
 
+    /// Build a filter that matches records whose payload matches `pattern`.
     pub fn regex(pattern: &str) -> Result<Self, regex::Error> {
         Ok(Self {
-            pattern: Some(Regex::new(pattern)?),
+            grep: Some(Regex::new(pattern)?),
+            source: None,
         })
     }
 
+    /// Add (or replace) a source substring filter.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Returns `true` if the record passes all active filters.
     pub fn matches(&self, record: &LogRecord) -> bool {
-        match &self.pattern {
+        if let Some(src) = &self.source {
+            if !record.source.contains(src.as_str()) {
+                return false;
+            }
+        }
+        match &self.grep {
             None => true,
-            Some(re) => re.is_match(&record.payload) || re.is_match(&record.source),
+            Some(re) => re.is_match(&record.payload),
         }
     }
 }
@@ -82,10 +99,35 @@ mod tests {
     }
 
     #[test]
-    fn filter_regex_matches_source_name() {
-        let f = Filter::regex("^api$").unwrap();
+    fn filter_source_matches_source_name() {
+        let f = Filter::none().with_source("api");
         assert!(f.matches(&record("api", "anything")));
         assert!(!f.matches(&record("worker", "anything")));
+    }
+
+    #[test]
+    fn filter_source_is_substring_match() {
+        let f = Filter::none().with_source("web");
+        assert!(f.matches(&record("web-server", "started")));
+        assert!(f.matches(&record("web-worker", "started")));
+        assert!(!f.matches(&record("api", "started")));
+    }
+
+    #[test]
+    fn filter_grep_only_matches_payload_not_source() {
+        let f = Filter::regex("api").unwrap();
+        // payload matches
+        assert!(f.matches(&record("worker", "calling api endpoint")));
+        // source name alone does not match
+        assert!(!f.matches(&record("api", "server started")));
+    }
+
+    #[test]
+    fn filter_grep_and_source_both_must_match() {
+        let f = Filter::regex("error").unwrap().with_source("web");
+        assert!(f.matches(&record("web-server", "error: timeout")));
+        assert!(!f.matches(&record("api", "error: timeout"))); // source mismatch
+        assert!(!f.matches(&record("web-server", "all good"))); // grep mismatch
     }
 
     #[test]
