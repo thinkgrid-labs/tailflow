@@ -2,7 +2,7 @@
  * Shared launcher for tailflow and tailflow-daemon.
  *
  * Resolves the compiled binary from the correct platform-specific optional
- * dependency (tailflow-<platform>) and exec's it, forwarding all args and
+ * dependency (@tailflow/<platform>) and exec's it, forwarding all args and
  * stdio so that ratatui TUI and TTY interaction work correctly.
  */
 'use strict'
@@ -12,11 +12,11 @@ const { join }      = require('path')
 
 // Maps Node.js { platform, arch } → optional dependency name.
 const PLATFORM_MAP = {
-  'darwin-arm64': 'tailflow-darwin-arm64',
-  'darwin-x64':   'tailflow-darwin-x64',
-  'linux-arm64':  'tailflow-linux-arm64',
-  'linux-x64':    'tailflow-linux-x64',
-  'win32-x64':    'tailflow-win32-x64',
+  'darwin-arm64': '@thinkgrid/tailflow-darwin-arm64',
+  'darwin-x64':   '@thinkgrid/tailflow-darwin-x64',
+  'linux-arm64':  '@thinkgrid/tailflow-linux-arm64',
+  'linux-x64':    '@thinkgrid/tailflow-linux-x64',
+  'win32-x64':    '@thinkgrid/tailflow-win32-x64',
 }
 
 function run(binaryName) {

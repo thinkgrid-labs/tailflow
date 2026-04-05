@@ -1,5 +1,5 @@
 {
-  "name": "tailflow-linux-x64",
+  "name": "@thinkgrid/tailflow-linux-x64",
   "version": "0.1.0",
   "description": "TailFlow compiled binary for Linux x64",
   "license": "MIT",
