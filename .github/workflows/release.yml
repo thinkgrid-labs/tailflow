@@ -165,6 +165,19 @@ jobs:
           path: npm/platforms/${{ matrix.platform }}/bin/
           retention-days: 1
 
+      - name: Create tarball (Unix only — for Homebrew)
+        if: runner.os != 'Windows'
+        run: |
+          cd npm/platforms/${{ matrix.platform }}/bin
+          tar -czf tailflow-${{ matrix.platform }}.tar.gz tailflow tailflow-daemon
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
+        with:
+          name: tarball-${{ matrix.platform }}
+          path: npm/platforms/${{ matrix.platform }}/bin/tailflow-${{ matrix.platform }}.tar.gz
+          retention-days: 1
+
   # ── Step 3: publish all npm packages ──────────────────────────────────────
   publish-npm:
     name: Publish to npm
@@ -235,13 +248,90 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm/tailflow && npm publish
 
+      # Download tarballs so they can be attached to the GitHub Release
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-darwin-arm64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-darwin-x64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-linux-x64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-linux-arm64
+          path: dist/
+
       # Create a GitHub Release with the tag as the title
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            npm/platforms/*/bin/tailflow
-            npm/platforms/*/bin/tailflow-daemon
+            dist/tailflow-darwin-arm64.tar.gz
+            dist/tailflow-darwin-x64.tar.gz
+            dist/tailflow-linux-arm64.tar.gz
+            dist/tailflow-linux-x64.tar.gz
             npm/platforms/win32-x64/bin/tailflow.exe
             npm/platforms/win32-x64/bin/tailflow-daemon.exe
+
+  # ── Step 4: update Homebrew tap ───────────────────────────────────────────
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-darwin-arm64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-darwin-x64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-linux-arm64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-linux-x64
+          path: dist/
+
+      - name: Compute SHA256s and render formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA_DARWIN_ARM64=$(sha256sum dist/tailflow-darwin-arm64.tar.gz | cut -d' ' -f1)
+          SHA_DARWIN_X64=$(sha256sum dist/tailflow-darwin-x64.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_ARM64=$(sha256sum dist/tailflow-linux-arm64.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_X64=$(sha256sum dist/tailflow-linux-x64.tar.gz | cut -d' ' -f1)
+
+          sed \
+            -e "s/{{VERSION}}/$VERSION/g" \
+            -e "s/{{SHA256_DARWIN_ARM64}}/$SHA_DARWIN_ARM64/g" \
+            -e "s/{{SHA256_DARWIN_X64}}/$SHA_DARWIN_X64/g" \
+            -e "s/{{SHA256_LINUX_ARM64}}/$SHA_LINUX_ARM64/g" \
+            -e "s/{{SHA256_LINUX_X64}}/$SHA_LINUX_X64/g" \
+            homebrew/tailflow.rb.tmpl > tailflow.rb
+
+      - name: Push formula to homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone \
+            https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/thinkgrid-labs/homebrew-tap.git \
+            tap
+          mkdir -p tap/Formula
+          cp tailflow.rb tap/Formula/tailflow.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/tailflow.rb
+          git diff --cached --quiet || git commit -m "tailflow: update to ${{ github.ref_name }}"
+          git push

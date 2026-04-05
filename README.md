@@ -109,7 +109,8 @@ npm installs only the binary matching your OS and CPU via platform-specific opti
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew install your-org/tap/tailflow
+brew tap thinkgrid-labs/tap
+brew install tailflow
 ```
 
 ### From source — requires Rust 1.75+
@@ -431,7 +432,7 @@ tailflow/
 - [x] axum SSE daemon with ring buffer
 - [x] Preact web dashboard embedded in the daemon binary
 - [x] npm / npx distribution — no Rust toolchain required
-- [ ] Homebrew formula for macOS and Linux
+- [x] Homebrew formula for macOS and Linux
 - [ ] Server-side `--grep` and `--source` filter flags for the daemon
 - [ ] Process restart policy for crashed `[[sources.process]]` entries
 - [ ] JSON log pretty-printing — detect structured payloads and expand inline
