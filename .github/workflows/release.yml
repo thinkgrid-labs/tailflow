@@ -81,7 +81,7 @@ jobs:
             cross: false
 
           - platform: darwin-x64
-            os: macos-13           # Intel macOS runner
+            os: macos-14           # Cross-compile x64 from ARM runner (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
 
