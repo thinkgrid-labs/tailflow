@@ -81,8 +81,12 @@ impl ProcessSource {
         });
 
         let status = child.wait().await?;
-        stdout_task.await.ok();
-        stderr_task.await.ok();
+        if let Err(e) = stdout_task.await {
+            tracing::warn!(label = %self.label, err = ?e, "stdout reader task panicked");
+        }
+        if let Err(e) = stderr_task.await {
+            tracing::warn!(label = %self.label, err = ?e, "stderr reader task panicked");
+        }
 
         Ok(status)
     }

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 use tailflow_core::{LogReceiver, LogRecord, LogSender};
 use tokio::sync::broadcast;
 
@@ -9,7 +12,7 @@ pub struct AppState {
     /// Subscribe to the live stream by calling `tx.subscribe()`.
     pub tx: LogSender,
     /// Rolling buffer of the last RING_SIZE records (for `/api/records`).
-    pub ring: Mutex<Vec<LogRecord>>,
+    pub ring: Mutex<VecDeque<LogRecord>>,
 }
 
 impl AppState {
@@ -18,7 +21,7 @@ impl AppState {
         let (tx, _) = broadcast::channel(tailflow_core::BUS_CAPACITY);
         let state = Arc::new(AppState {
             tx: tx.clone(),
-            ring: Mutex::new(Vec::with_capacity(RING_SIZE)),
+            ring: Mutex::new(VecDeque::with_capacity(RING_SIZE)),
         });
         let state2 = state.clone();
 
@@ -27,11 +30,11 @@ impl AppState {
                 match source_rx.recv().await {
                     Ok(record) => {
                         {
-                            let mut buf = state2.ring.lock().unwrap();
+                            let mut buf = state2.ring.lock().unwrap_or_else(|p| p.into_inner());
                             if buf.len() >= RING_SIZE {
-                                buf.remove(0);
+                                buf.pop_front(); // O(1) vs Vec::remove(0) O(n)
                             }
-                            buf.push(record.clone());
+                            buf.push_back(record.clone());
                         }
                         let _ = tx.send(record);
                     }

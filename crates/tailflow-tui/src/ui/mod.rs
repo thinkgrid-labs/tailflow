@@ -20,21 +20,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    // Guard against degenerate terminal sizes
+    if chunks.len() < 3 {
+        return;
+    }
     let list_height = chunks[1].height as usize;
 
-    // ── Build filter predicate ─────────────────────────────────────────────
-    let filter_re = if !app.filter.is_empty() {
-        regex::Regex::new(&app.filter).ok()
-    } else {
-        None
-    };
+    // ── Build filter predicate (uses pre-compiled regex from App) ──────────
     let filter_lower = app.filter.to_lowercase();
 
     let matches = |payload: &str, source: &str| -> bool {
         if app.filter.is_empty() {
             return true;
         }
-        if let Some(re) = &filter_re {
+        if let Some(re) = &app.filter_re {
             re.is_match(payload) || re.is_match(source)
         } else {
             payload.to_lowercase().contains(&filter_lower)

@@ -75,10 +75,13 @@ async fn sse_handler(
     let filter = params.into_filter();
     let rx = state.tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
-        Ok(record) if filter.matches(&record) => {
-            let data = serde_json::to_string(&record).unwrap_or_default();
-            Some(Ok(Event::default().data(data)))
-        }
+        Ok(record) if filter.matches(&record) => match serde_json::to_string(&record) {
+            Ok(data) => Some(Ok(Event::default().data(data))),
+            Err(e) => {
+                tracing::error!(err = %e, "failed to serialize log record for SSE");
+                None
+            }
+        },
         Ok(_) => None,
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
             tracing::warn!(dropped = n, "SSE client lagged");
@@ -99,7 +102,7 @@ async fn records_handler(
     let records: Vec<_> = state
         .ring
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner()) // recover from poisoned mutex
         .iter()
         .filter(|r| filter.matches(r))
         .cloned()
