@@ -224,16 +224,16 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
-            echo "Publishing @tailflow/$platform …"
+            echo "Publishing tailflow-$platform …"
             cd npm/platforms/$platform
-            npm publish --access public
+            npm publish
             cd ../../..
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd npm/tailflow && npm publish --access public
+        run: cd npm/tailflow && npm publish
 
       # Create a GitHub Release with the tag as the title
       - name: Create GitHub Release

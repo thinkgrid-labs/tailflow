@@ -15,10 +15,10 @@
   "files": ["bin/"],
   "engines": { "node": ">=18" },
   "optionalDependencies": {
-    "@tailflow/darwin-arm64": "0.1.0",
-    "@tailflow/darwin-x64":   "0.1.0",
-    "@tailflow/linux-arm64":  "0.1.0",
-    "@tailflow/linux-x64":    "0.1.0",
-    "@tailflow/win32-x64":    "0.1.0"
+    "tailflow-darwin-arm64": "0.1.0",
+    "tailflow-darwin-x64":   "0.1.0",
+    "tailflow-linux-arm64":  "0.1.0",
+    "tailflow-linux-x64":    "0.1.0",
+    "tailflow-win32-x64":    "0.1.0"
   }
 }

@@ -20,11 +20,11 @@ const ROOT = path.join(__dirname, '..')
 
 // ── npm packages ────────────────────────────────────────────────────────────
 const PLATFORM_NAMES = [
-  '@tailflow/darwin-arm64',
-  '@tailflow/darwin-x64',
-  '@tailflow/linux-arm64',
-  '@tailflow/linux-x64',
-  '@tailflow/win32-x64',
+  'tailflow-darwin-arm64',
+  'tailflow-darwin-x64',
+  'tailflow-linux-arm64',
+  'tailflow-linux-x64',
+  'tailflow-win32-x64',
 ]
 
 // Platform packages
