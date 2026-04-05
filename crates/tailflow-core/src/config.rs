@@ -36,10 +36,32 @@ pub struct FileEntry {
     pub label: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Never restart — default behaviour.
+    #[default]
+    Never,
+    /// Restart after every exit, zero or non-zero.
+    Always,
+    /// Restart only when the process exits with a non-zero status.
+    OnFailure,
+}
+
+fn default_restart_delay_ms() -> u64 {
+    1_000
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProcessEntry {
     pub cmd: String,
     pub label: String,
+    /// Restart policy on process exit.  Defaults to `never`.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Initial restart delay in milliseconds.  Doubles on each attempt, capped at 30 s.
+    #[serde(default = "default_restart_delay_ms")]
+    pub restart_delay_ms: u64,
 }
 
 impl Config {
@@ -84,7 +106,9 @@ impl Config {
         }
 
         for entry in self.sources.process {
-            sources.push(Box::new(ProcessSource::new(entry.label, entry.cmd)));
+            let src = ProcessSource::new(entry.label, entry.cmd)
+                .with_restart(entry.restart, entry.restart_delay_ms);
+            sources.push(Box::new(src));
         }
 
         if let Some(label) = self.sources.stdin {
@@ -161,6 +185,34 @@ label = "app"
     fn file_entry_without_label_parsed() {
         let cfg = parse("[[sources.file]]\npath = \"/tmp/out.log\"");
         assert!(cfg.sources.file[0].label.is_none());
+    }
+
+    #[test]
+    fn process_restart_defaults_to_never() {
+        let cfg = parse("[[sources.process]]\nlabel = \"api\"\ncmd = \"go run .\"");
+        assert_eq!(cfg.sources.process[0].restart, RestartPolicy::Never);
+        assert_eq!(cfg.sources.process[0].restart_delay_ms, 1_000);
+    }
+
+    #[test]
+    fn process_restart_on_failure_parsed() {
+        let cfg = parse(
+            r#"
+[[sources.process]]
+label = "api"
+cmd   = "go run ."
+restart = "on-failure"
+restart_delay_ms = 2000
+"#,
+        );
+        assert_eq!(cfg.sources.process[0].restart, RestartPolicy::OnFailure);
+        assert_eq!(cfg.sources.process[0].restart_delay_ms, 2_000);
+    }
+
+    #[test]
+    fn process_restart_always_parsed() {
+        let cfg = parse("[[sources.process]]\nlabel = \"w\"\ncmd = \"x\"\nrestart = \"always\"");
+        assert_eq!(cfg.sources.process[0].restart, RestartPolicy::Always);
     }
 
     #[test]

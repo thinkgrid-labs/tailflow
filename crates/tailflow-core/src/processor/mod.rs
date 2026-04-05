@@ -11,7 +11,10 @@ pub struct Filter {
 
 impl Filter {
     pub fn none() -> Self {
-        Self { grep: None, source: None }
+        Self {
+            grep: None,
+            source: None,
+        }
     }
 
     /// Build a filter that matches records whose payload matches `pattern`.

@@ -81,7 +81,7 @@ async fn filter_none_passes_all_records() {
 #[tokio::test]
 async fn filtered_bus_matches_on_source_name() {
     let (tx, rx) = new_bus();
-    let mut out = filtered_bus(rx, Filter::regex("^frontend$").unwrap());
+    let mut out = filtered_bus(rx, Filter::none().with_source("frontend"));
 
     tx.send(record("backend", "request handled")).unwrap();
     tx.send(record("frontend", "compiled in 1.2s")).unwrap();
