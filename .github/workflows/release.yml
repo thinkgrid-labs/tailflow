@@ -129,6 +129,7 @@ jobs:
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
+          -p tailflow-agent
 
       - name: Build (cross)
         if: matrix.cross
@@ -137,6 +138,7 @@ jobs:
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
+          -p tailflow-agent
 
       # Stage into npm/platforms/<platform>/bin/ so the publish job can find them
       - name: Stage binaries (Unix)
@@ -147,6 +149,10 @@ jobs:
              npm/platforms/${{ matrix.platform }}/bin/tailflow
           cp target/${{ matrix.target }}/release/tailflow-daemon \
              npm/platforms/${{ matrix.platform }}/bin/tailflow-daemon
+          cp target/${{ matrix.target }}/release/tailflow-mcp \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-mcp
+          cp target/${{ matrix.target }}/release/tailflow-logs \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-logs
           chmod +x npm/platforms/${{ matrix.platform }}/bin/*
 
       - name: Stage binaries (Windows)
@@ -158,6 +164,10 @@ jobs:
              npm/platforms/${{ matrix.platform }}/bin/tailflow.exe
           cp target/${{ matrix.target }}/release/tailflow-daemon.exe \
              npm/platforms/${{ matrix.platform }}/bin/tailflow-daemon.exe
+          cp target/${{ matrix.target }}/release/tailflow-mcp.exe \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-mcp.exe
+          cp target/${{ matrix.target }}/release/tailflow-logs.exe \
+             npm/platforms/${{ matrix.platform }}/bin/tailflow-logs.exe
 
       - uses: actions/upload-artifact@v4
         with:
@@ -169,7 +179,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd npm/platforms/${{ matrix.platform }}/bin
-          tar -czf tailflow-${{ matrix.platform }}.tar.gz tailflow tailflow-daemon
+          tar -czf tailflow-${{ matrix.platform }}.tar.gz tailflow tailflow-daemon tailflow-mcp tailflow-logs
 
       - uses: actions/upload-artifact@v4
         if: runner.os != 'Windows'
@@ -223,6 +233,7 @@ jobs:
       - name: Restore execute permissions
         run: |
           find npm/platforms -name 'tailflow' -o -name 'tailflow-daemon' \
+            -o -name 'tailflow-mcp' -o -name 'tailflow-logs' \
             | xargs -r chmod +x
 
       # Sync version from git tag → all package.json files
@@ -278,6 +289,8 @@ jobs:
             dist/tailflow-linux-x64.tar.gz
             npm/platforms/win32-x64/bin/tailflow.exe
             npm/platforms/win32-x64/bin/tailflow-daemon.exe
+            npm/platforms/win32-x64/bin/tailflow-mcp.exe
+            npm/platforms/win32-x64/bin/tailflow-logs.exe
 
   # ── Step 4: update Homebrew tap ───────────────────────────────────────────
   publish-homebrew:

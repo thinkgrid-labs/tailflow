@@ -2,6 +2,7 @@ pub mod config;
 pub mod ingestion;
 pub mod json;
 pub mod processor;
+pub mod query;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,48 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    /// Rank used for `>= min_level` comparisons.
+    ///
+    /// `Unknown` ranks *lowest* — plain output like `compiled successfully`
+    /// carries no level marker, so it must not satisfy a `warn`-or-above
+    /// query. Continuation lines of a multi-line stack trace also land here;
+    /// [`crate::query::LogStore::summarize`] recovers those separately as
+    /// trailing context rather than by level.
+    pub fn severity(self) -> u8 {
+        match self {
+            LogLevel::Unknown => 0,
+            LogLevel::Trace => 1,
+            LogLevel::Debug => 2,
+            LogLevel::Info => 3,
+            LogLevel::Warn => 4,
+            LogLevel::Error => 5,
+        }
+    }
+
+    /// Parse a level name. Accepts common aliases and is case-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "trace" | "trc" => Some(LogLevel::Trace),
+            "debug" | "dbg" => Some(LogLevel::Debug),
+            "info" | "inf" => Some(LogLevel::Info),
+            "warn" | "warning" | "wrn" => Some(LogLevel::Warn),
+            "error" | "err" | "fatal" => Some(LogLevel::Error),
+            "unknown" | "any" | "all" => Some(LogLevel::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Unknown => "unknown",
+        }
+    }
+
     /// Attempt to detect level from raw log text.
     pub fn detect(text: &str) -> Self {
         let lower = text.to_lowercase();

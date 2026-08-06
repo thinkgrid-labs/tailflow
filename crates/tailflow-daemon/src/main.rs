@@ -15,8 +15,9 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
+    version,
     name = "tailflow-daemon",
-    about = "TailFlow SSE daemon — stream logs over HTTP"
+    about = "TailFlow daemon — collects your stack's logs and serves them over HTTP"
 )]
 struct Cli {
     /// Port to listen on
@@ -46,6 +47,10 @@ struct Cli {
     /// Only stream records from sources whose name contains this string
     #[arg(long, value_name = "NAME")]
     source: Option<String>,
+
+    /// Records retained for retrospective queries (/api/query, /api/errors)
+    #[arg(long, value_name = "N", default_value_t = tailflow_core::query::DEFAULT_CAPACITY)]
+    buffer: usize,
 }
 
 #[tokio::main]
@@ -119,13 +124,14 @@ async fn main() -> Result<()> {
         filtered_bus(rx, filter)
     };
 
-    let shared = state::AppState::new(rx);
+    let shared = state::AppState::new(rx, cli.buffer.max(1));
     let app = routes::router(shared);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     info!(%addr, "tailflow-daemon listening");
-    eprintln!("tailflow-daemon: SSE stream at http://{addr}/events");
-    eprintln!("                 Recent logs at http://{addr}/api/records");
+    eprintln!("tailflow-daemon: dashboard   http://{addr}");
+    eprintln!("                 SSE stream  http://{addr}/events");
+    eprintln!("                 agent API   http://{addr}/api/errors");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

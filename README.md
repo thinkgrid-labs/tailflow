@@ -1,33 +1,36 @@
-# TailFlow — Local Log Aggregator for Full-Stack Developers
+# TailFlow — Give Your Coding Agent Eyes on Your Running Stack
 
 [![CI](https://github.com/thinkgrid-labs/tailflow/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkgrid-labs/tailflow/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/tailflow?color=cb3837)](https://www.npmjs.com/package/tailflow)
 [![Crates.io](https://img.shields.io/crates/v/tailflow-core?color=f74c00)](https://crates.io/crates/tailflow-core)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Zero-configuration, high-speed log aggregator for local full-stack development — built in Rust.**
-
-TailFlow unifies logs from Docker containers, spawned processes, and log files into a single real-time stream. View them in a color-coded terminal UI or a browser dashboard. No Rust toolchain required — install via `npx`.
+**Your AI agent writes code it cannot see running.** TailFlow aggregates every log
+your local stack produces — Docker containers, dev servers, background workers,
+log files — and serves them to the agent over MCP, deduplicated and bounded.
 
 ```bash
-npx tailflow --docker
+npm install -g tailflow
+tailflow-daemon                       # in your project root
+claude mcp add tailflow -- tailflow-mcp
 ```
+
+Now your agent can answer *"did my change break anything?"* by reading what your
+services actually printed, instead of guessing from source code.
 
 ---
 
 ## Table of Contents
 
 - [The Problem](#the-problem)
-- [What TailFlow Solves](#what-tailflow-solves)
-- [Features](#features)
+- [What the Agent Gets](#what-the-agent-gets)
+- [Setup](#setup)
+- [Shell Access](#shell-access-agents-without-mcp)
+- [For Humans: TUI and Web Dashboard](#for-humans-tui-and-web-dashboard)
 - [Installation](#installation)
-- [Usage](#usage)
-- [TUI Keybindings](#tui-keybindings)
-- [Web Dashboard](#web-dashboard)
-- [HTTP Daemon & SSE API](#http-daemon)
-- [Configuration Reference](#configuration-reference)
+- [Configuration](#configuration)
+- [HTTP API](#http-api)
 - [Architecture](#architecture)
-- [Project Layout](#project-layout)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -36,134 +39,109 @@ npx tailflow --docker
 
 ## The Problem
 
-Modern local development stacks are fragmented. A typical session looks like this:
+A coding agent has excellent access to the *static* half of your project — files,
+types, tests, git history — and almost none to the *running* half. When it changes
+a service, the feedback loop is:
 
 ```
-Tab 1: docker compose up
-Tab 2: npm run dev
-Tab 3: go run ./cmd/api
-Tab 4: tail -f logs/worker.log
+agent edits file → "the change looks correct" → you paste an error back
 ```
 
-When something breaks, you're jumping between four windows trying to correlate a timestamp in one tab with an error in another. The cognitive load compounds with every service you add.
+The agent can run a build. It cannot watch four dev servers, notice which one
+crash-looped, and correlate that with the file it just touched. So the loop runs
+through you.
 
-Existing tools solve parts of this:
+Everything needed to close that loop is already on your machine, scattered across
+terminal tabs. The blocker is that log output is the wrong shape for an agent:
 
-| Tool | Gap |
+| Problem | Consequence |
 |---|---|
-| `docker compose logs -f` | Docker containers only — no processes or files |
-| Dozzle | Docker-only web UI — can't ingest spawned processes |
-| Logdy | One stdin stream at a time — no Docker or multi-source |
-| mprocs | Multi-process runner — not log-focused, no filtering |
-| lnav | Powerful log file viewer — no Docker or process spawning |
+| Logs live in TTYs the agent can't read | It has no runtime feedback at all |
+| A crash loop emits the same error 400 times | 400 lines of near-identical text swamps the context window |
+| Errors and their stack traces are separate lines | A `level >= error` filter drops the trace |
+| "Nothing failed" and "nothing started" look identical | The agent reports a green build for a stack that never booted |
+| Checking for an async failure means sleeping | Either too short to catch it or too slow to be useful |
 
-None of them unify all three source types — Docker containers, spawned processes, and log files — in a single filterable, color-coded view with both a TUI and a web UI. That gap is what TailFlow fills.
-
----
-
-## What TailFlow Solves
-
-| Problem | Solution |
-|---|---|
-| Logs scattered across terminal tabs | Single multiplexed TUI or browser dashboard |
-| Hard to correlate events across microservices | All sources share one timestamped stream |
-| Docker-only or file-only log tooling | Docker + processes + files in one tool |
-| Heavy agents (Datadog, Elastic) for local dev | Rust binary, < 50 MB RAM, no daemon required |
-| Per-project tool configuration | `tailflow.toml` at your monorepo root |
-| Terminal-only access to local logs | `tailflow-daemon` SSE endpoint at `localhost:7878` |
+TailFlow fixes the shape, not just the access.
 
 ---
 
-## Features
+## What the Agent Gets
 
-- **Unified log ingestion** — Docker containers (via socket), spawned child processes (`sh -c`), tailed log files, and piped stdin
-- **Zero-config startup** — drop a `tailflow.toml` at your repo root and run `tailflow` from anywhere inside it
-- **Real-time regex filtering** — filter by keyword, source name, or regex in both the TUI and web dashboard
-- **Color-coded sources** — each service gets a distinct color; palette is consistent between the TUI and web UI
-- **Sub-10ms latency** — Tokio async runtime with a broadcast channel; zero polling
-- **Embedded web dashboard** — `tailflow-daemon` serves a Preact UI at `localhost:7878`, no separate install
-- **npx-ready** — `npx tailflow` works on macOS, Linux, and Windows without installing Rust
-- **Dual binaries** — `tailflow` (interactive TUI) and `tailflow-daemon` (headless HTTP + web UI)
+Four MCP tools, backed by a running daemon.
+
+### `get_recent_errors` — distinct failures, not repeated lines
+
+Identical errors are collapsed into one group with an occurrence count, and each
+group carries the stack trace that followed it. A crash loop that printed 120
+lines becomes:
+
+```
+2 distinct failures across 41 records · buffer reaches back to 14:07:31 · cursor 125
+
+[1] x1 error api first 14:07:33 last 14:07:33
+    ERROR Cannot find module "@reko/pricing"
+
+[2] x40 error api first 14:07:31 last 14:07:33
+    ERROR connection refused: postgres:5432 (attempt 39)
+      at Pool.connect (/app/db.js:42:11)
+      at async bootstrap (/app/main.js:9:3)
+```
+
+Grouping is by *fingerprint* — the line with its variable parts (numbers, UUIDs,
+hex ids, quoted strings, addresses) replaced by placeholders — so `postgres:5432`
+and `postgres:5433` are recognised as one failure while genuinely different
+errors stay apart.
+
+### `wait_for_logs` — block until something happens
+
+Replaces sleep-and-poll. The agent triggers a rebuild, then asks to be woken the
+moment anything matches:
+
+```
+wait_for_logs(grep: "compiled successfully|Failed to compile", timeout_ms: 30000)
+→ Matched after 2168ms.
+  14:12:34 error web  Failed to compile: Type error in src/app/page.tsx:22
+```
+
+It returns on the first match plus the burst that follows it, so the whole event
+arrives in one round trip — or it reports plainly that nothing matched, which is
+information too.
+
+### `list_log_sources` — what is actually running
+
+```
+2 sources · 125 records buffered · cursor 125
+api    122 records    41 err     0 warn  last 14:07:33  ERROR Cannot find module "@reko/pricing"
+web      3 records     0 err     1 warn  last 14:07:33  WARN slow render: 1240ms
+```
+
+This is the tool that stops an agent declaring success over a dead stack: a
+service that never started is visibly absent, rather than merely quiet.
+
+### `search_logs` — the exact sequence of events
+
+Individual lines when the summary isn't enough — a request's lifecycle, startup
+ordering, what a process printed just before it died. Every response ends with a
+cursor; passing it back returns only what has arrived since, so following a live
+stack costs a few tokens per poll instead of a re-read.
 
 ---
 
-## Installation
+## Setup
 
-### npm / npx — no Rust required
+TailFlow is two pieces: a **daemon** that collects logs, and an **MCP server**
+that serves them to your agent.
 
-The fastest way to get started. Works on macOS (ARM64 + x64), Linux (x64 + ARM64), and Windows x64.
-
-```bash
-# One-off run — no install needed
-npx tailflow --docker
-npx tailflow-daemon --docker
-
-# Global install
-npm install -g tailflow
-tailflow --docker
-tailflow-daemon --port 7878
-```
-
-npm installs only the binary matching your OS and CPU via platform-specific optional dependencies — the same distribution pattern used by esbuild and Biome.
-
-### Homebrew (macOS / Linux)
-
-```bash
-brew tap thinkgrid-labs/tap
-brew install tailflow
-```
-
-### From source — requires Rust 1.75+
-
-```bash
-git clone https://github.com/thinkgrid-labs/tailflow.git
-cd tailflow
-cargo install --path crates/tailflow-tui
-cargo install --path crates/tailflow-daemon
-```
-
-### Verify
-
-```bash
-tailflow --help
-tailflow-daemon --help
-```
-
----
-
-## Usage
-
-### Tail all running Docker containers
-
-```bash
-tailflow --docker
-```
-
-### Tail containers and a log file together
-
-```bash
-tailflow --docker --file logs/app.log
-```
-
-### Pipe any process into the TUI
-
-```bash
-npm run dev | tailflow
-go run ./cmd/api | tailflow
-python manage.py runserver | tailflow
-```
-
-### Config file — recommended for monorepos
-
-Create `tailflow.toml` at your project root to define your full local stack:
+**1. Describe your stack** in `tailflow.toml` at your project root:
 
 ```toml
 [sources]
-docker = true
+docker = true                      # every running container
 
 [[sources.process]]
-label = "frontend"
-cmd   = "npm run dev --prefix packages/web"
+label = "web"
+cmd   = "npm run dev --prefix apps/web"
 
 [[sources.process]]
 label = "api"
@@ -171,255 +149,223 @@ cmd   = "go run ./cmd/api"
 
 [[sources.file]]
 path  = "logs/worker.log"
-label = "worker"
 ```
 
-Then from anywhere inside the repo:
+**2. Start the daemon** — this also starts the processes above, so it replaces
+your `npm run dev` tab rather than adding to it:
 
 ```bash
-tailflow          # TUI mode
-tailflow-daemon   # browser mode → open http://localhost:7878
+tailflow-daemon
 ```
 
-TailFlow auto-discovers `tailflow.toml` by walking up from the current directory.
-
----
-
-## TUI Keybindings
-
-| Key | Action |
-|---|---|
-| `/` | Enter filter mode |
-| `Enter` | Apply filter and return to stream |
-| `Esc` | Exit filter mode |
-| `j` / `↓` | Scroll down |
-| `k` / `↑` | Scroll up |
-| `G` | Jump to latest log line |
-| `q` / `Ctrl-C` | Quit |
-
-### Filter syntax
-
-The filter bar accepts plain text substrings or full regex patterns. Matches against both the log payload and the source name:
-
-```
-# Show only logs from the "api" source
-api
-
-# Show error-level lines (case-insensitive)
-(?i)error
-
-# Match lines containing a specific request ID
-req-[a-f0-9]{8}
-
-# Show output from multiple sources
-frontend|api
-```
-
----
-
-## Web Dashboard
-
-`tailflow-daemon` embeds a full Preact web dashboard into its binary. Start the daemon, then open your browser — no extra install or `npm run` needed:
-
-```
-http://localhost:7878
-```
-
-### Dashboard features
-
-| Feature | Detail |
-|---|---|
-| **Source sidebar** | Active sources with color dots and record counts. Click to isolate a source. |
-| **Level filter pills** | `ERR` `WRN` `INF` `DBG` `TRC` — toggle individual log levels on/off. |
-| **Regex filter bar** | Substring or regex, matched against payload and source name. |
-| **Auto-scroll** | Follows new records automatically. Scroll up to pause; **↓ latest** button resumes. |
-| **Consistent colors** | Source colors match the TUI palette exactly. |
-| **60 fps rendering** | Records are batched to `requestAnimationFrame` cadence — handles high-velocity streams without thrashing. |
-
-### Building the web UI from source
-
-The web UI is compiled with Vite + Preact and embedded into the daemon binary via `rust-embed`. Build it before `cargo build`:
+**3. Register the MCP server** with your agent:
 
 ```bash
-cd web && npm install && npm run build
-cd .. && cargo build -p tailflow-daemon --release
+# Claude Code
+claude mcp add tailflow -- tailflow-mcp
 ```
 
-For hot-reload development:
-
-```bash
-# Terminal 1: run the daemon with live sources
-cargo run -p tailflow-daemon -- --docker
-
-# Terminal 2: Vite dev server (proxies /events and /api to the daemon)
-cd web && npm run dev
-# open http://localhost:5173
-```
-
----
-
-## HTTP Daemon
-
-`tailflow-daemon` runs as a lightweight background process and exposes your local log stream over HTTP. Useful for browser-based inspection or sharing logs with a teammate on the same local network.
-
-```bash
-tailflow-daemon                  # auto-discovers tailflow.toml
-tailflow-daemon --port 9000      # custom port
-tailflow-daemon --docker         # Docker only, no config file
-```
-
-### Endpoints
-
-| Endpoint | Description |
-|---|---|
-| `GET /events` | Server-Sent Events stream — one JSON `LogRecord` per event |
-| `GET /api/records` | Last 500 buffered records as a JSON array |
-| `GET /health` | `{"ok": true}` liveness check |
-| `GET /` | Embedded Preact web dashboard |
-
-### Consuming the SSE stream
-
-```javascript
-const source = new EventSource("http://localhost:7878/events");
-
-source.onmessage = (e) => {
-  const record = JSON.parse(e.data);
-  // { timestamp, source, level, payload }
-  console.log(`[${record.source}] ${record.payload}`);
-};
-```
-
-### LogRecord schema
+<details>
+<summary>Other MCP clients (JSON config)</summary>
 
 ```json
 {
-  "timestamp": "2026-04-04T10:23:45.123Z",
-  "source":    "api",
-  "level":     "error",
-  "payload":   "connection refused: postgres:5432"
+  "mcpServers": {
+    "tailflow": {
+      "command": "tailflow-mcp",
+      "env": { "TAILFLOW_URL": "http://127.0.0.1:7878" }
+    }
+  }
 }
 ```
 
-`level` is one of: `trace` | `debug` | `info` | `warn` | `error` | `unknown`
+`TAILFLOW_URL` is only needed if the daemon runs on a non-default port.
+</details>
+
+The MCP server is a thin client — it holds no state and can be started before
+the daemon exists. If the daemon is down, tools return an actionable message
+saying so rather than an empty result.
+
+See [docs/agents.md](docs/agents.md) for tool arguments, workflow patterns, and
+the design rationale behind the output format.
 
 ---
 
-## Configuration Reference
+## Shell Access (agents without MCP)
 
-`tailflow.toml` is optional. When present, both `tailflow` and `tailflow-daemon` load it automatically.
+Every tool is also a one-shot command, for agents that only have a terminal:
+
+```bash
+tailflow-logs errors --since 5m        # deduplicated failures
+tailflow-logs search 'timeout' --source api
+tailflow-logs sources
+tailflow-logs wait --grep 'compiled successfully' --timeout-ms 30000
+tailflow-logs status
+```
+
+Exit codes are meaningful, so a script can branch without parsing stdout:
+`0` ok (and for `wait`, matched), `1` bad request, `2` `wait` timed out,
+`3` no daemon running. Add `--json` to any command for the raw response.
+
+---
+
+## For Humans: TUI and Web Dashboard
+
+The same daemon still drives the interactive views. Nothing here changed.
+
+```bash
+tailflow                 # color-coded TUI over your whole stack
+tailflow --docker        # or just the containers
+npm run dev | tailflow   # or one piped process
+```
+
+| Key | Action |
+|---|---|
+| `/` | Filter (substring or regex, matched against payload and source) |
+| `j` `k` / `↓` `↑` | Scroll |
+| `G` | Jump to latest |
+| `p` | Toggle JSON pretty-printing |
+| `q` / `Ctrl-C` | Quit |
+
+`tailflow-daemon` additionally serves a Preact dashboard at
+**http://localhost:7878** — source sidebar with per-service counts, level filter
+pills, regex filter, and auto-scroll that pauses when you scroll up.
+
+---
+
+## Installation
+
+### npm / npx — no Rust required
+
+```bash
+npm install -g tailflow
+```
+
+Installs four binaries: `tailflow` (TUI), `tailflow-daemon` (collector + web UI),
+`tailflow-mcp` (MCP server), `tailflow-logs` (shell client). Only the binary
+matching your OS and CPU is downloaded, via platform-specific optional
+dependencies — the same pattern esbuild and Biome use. macOS (ARM64 + x64),
+Linux (x64 + ARM64), Windows x64.
+
+### Homebrew
+
+```bash
+brew tap thinkgrid-labs/tap
+brew install tailflow
+```
+
+### From source — Rust 1.75+
+
+```bash
+git clone https://github.com/thinkgrid-labs/tailflow.git
+cd tailflow
+cargo install --path crates/tailflow-tui
+cargo install --path crates/tailflow-daemon
+cargo install --path crates/tailflow-agent
+```
+
+---
+
+## Configuration
+
+`tailflow.toml` is discovered by walking up from the current directory. CLI flags
+are **additive** on top of it — `tailflow --docker` adds containers to whatever
+the file already defines.
 
 ```toml
 [sources]
-# Tail all running Docker containers
-docker = false
+docker = false           # tail all running containers
+# stdin = "pipe"         # label piped stdin (only when stdin is not a TTY)
 
-# Label piped stdin (active only when stdin is not a TTY)
-# stdin = "pipe"
-
-# ── File sources ──────────────────────────────────────────
 [[sources.file]]
 path  = "logs/app.log"
-label = "app"           # optional; defaults to the filename
-
-# ── Process sources ───────────────────────────────────────
-# TailFlow spawns these commands and captures stdout + stderr.
+label = "app"            # optional; defaults to the filename
 
 [[sources.process]]
 label = "frontend"
-cmd   = "npm run dev"
-
-[[sources.process]]
-label = "api"
-cmd   = "go run ./cmd/api"
+cmd   = "npm run dev"    # spawned by TailFlow; stdout + stderr captured
 ```
 
-CLI flags are **additive** on top of the config file. `tailflow --docker` adds Docker containers to whatever sources are already defined in `tailflow.toml`.
+Daemon flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--port` | `7878` | HTTP listen port |
+| `--buffer` | `5000` | Records retained for retrospective queries |
+| `--docker` | off | Add all running containers |
+| `--file PATH` | — | Add a log file (repeatable) |
+| `--grep REGEX` | — | Drop non-matching records at ingest |
+| `--source NAME` | — | Ingest only matching sources |
+
+---
+
+## HTTP API
+
+The MCP server and CLI are both clients of this; you can call it directly.
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/errors` | Deduplicated failure groups with stack-trace context |
+| `GET /api/query` | Individual records, cursor-paginated |
+| `GET /api/sources` | Per-source counters and last line |
+| `GET /api/wait` | Long-poll until a matching record arrives |
+| `GET /events` | SSE stream — one JSON record per event |
+| `GET /api/records` | Last N raw records (drives the web dashboard) |
+| `GET /health` | Liveness, version, buffer state |
+| `GET /` | Embedded web dashboard |
+
+Shared parameters: `grep` (regex), `source` (substring), `level`
+(`trace`…`error`), `since` (`30s`/`5m`/`2h`/`1d` or RFC 3339), `limit`, `cursor`.
+Invalid arguments return **400 with an explanation** — never a silently empty
+result, which a caller that can't see the screen would misread as "all clear".
+
+Full reference: [docs/agents.md](docs/agents.md).
 
 ---
 
 ## Architecture
 
-TailFlow separates ingestion from presentation through a Tokio broadcast channel. Adding a new UI (desktop app, VS Code extension, etc.) only requires a new consumer — the core engine is untouched.
+Ingestion is separated from presentation by a Tokio broadcast channel. Adding a
+consumer never touches the collection engine.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     tailflow-core                        │
-│                                                          │
-│  DockerSource ──┐                                        │
-│  ProcessSource ─┼──► broadcast::channel<LogRecord> ─┐   │
-│  FileSource ────┘                                    │   │
-│  StdinSource ───┘                                    │   │
-└──────────────────────────────────────────────────────┼───┘
-                                                       │
-              ┌────────────────────┬───────────────────┘
-              │                    │
-     ┌────────▼────────┐  ┌────────▼───────────────────────────┐
-     │  tailflow-tui   │  │        tailflow-daemon              │
-     │                 │  │                                     │
-     │  ratatui TUI    │  │  axum HTTP server                   │
-     │  color-coded    │  │  GET /events      (SSE stream)      │
-     │  regex filter   │  │  GET /api/records (last 500 JSON)   │
-     │  scroll/search  │  │  GET /health                        │
-     └─────────────────┘  │  GET /*           (embedded web UI) │
-                          └─────────────────────────────────────┘
+┌─────────────────────────── tailflow-core ───────────────────────────┐
+│  DockerSource ─┐                                                     │
+│  ProcessSource ┼──► broadcast::channel<LogRecord> ──┬──► LogStore    │
+│  FileSource ───┤                                    │    (ring +     │
+│  StdinSource ──┘                                    │    fingerprint │
+│                                                     │    grouping)   │
+└─────────────────────────────────────────────────────┼───────────────┘
+                    ┌────────────────────┬────────────┘
+                    │                    │
+           ┌────────▼────────┐  ┌────────▼──────────────────────────┐
+           │  tailflow-tui   │  │        tailflow-daemon             │
+           │  ratatui TUI    │  │  axum: /api/errors  /api/query     │
+           └─────────────────┘  │        /api/wait    /api/sources   │
+                                │        /events      web dashboard  │
+                                └────────┬───────────────────────────┘
+                                         │ HTTP
+                          ┌──────────────┴──────────────┐
+                          │      tailflow-agent          │
+                          │  tailflow-mcp   (MCP stdio)  │
+                          │  tailflow-logs  (shell CLI)  │
+                          └──────────────────────────────┘
 ```
 
-### Tech stack
+`tailflow-agent` deliberately does **not** depend on `tailflow-core`. Its two
+binaries are HTTP clients of a daemon that is already running, so they carry
+none of the ingestion dependency tree and stay small.
 
 | Layer | Technology |
 |---|---|
-| Language | Rust (2021 edition) |
+| Language | Rust 2021 |
 | Async runtime | Tokio |
-| Docker integration | bollard |
+| Docker | bollard |
 | File watching | notify |
-| TUI framework | ratatui + crossterm |
+| TUI | ratatui + crossterm |
 | HTTP server | axum |
 | Web UI | Preact + Vite (embedded via rust-embed) |
-| npm distribution | Platform-specific optional dependencies |
-
----
-
-## Project Layout
-
-```
-tailflow/
-├── tailflow.example.toml          # annotated config reference
-├── Cargo.toml                     # Rust workspace
-├── web/                           # Preact web dashboard source
-│   ├── package.json
-│   ├── vite.config.ts             # dev proxy → daemon :7878
-│   └── src/
-│       ├── App.tsx                # layout, filter state, auto-scroll
-│       ├── types.ts               # LogRecord type, color palette
-│       ├── hooks/useLogStream.ts  # EventSource + RAF batching
-│       └── components/
-│           ├── LogRow.tsx
-│           └── Sidebar.tsx
-├── crates/
-│   ├── tailflow-core/             # ingestion engine — no UI dependencies
-│   │   └── src/
-│   │       ├── lib.rs             # LogRecord, LogLevel, broadcast bus
-│   │       ├── config.rs          # tailflow.toml parser
-│   │       └── ingestion/
-│   │           ├── docker.rs      # bollard: Docker socket
-│   │           ├── file.rs        # notify: filesystem tail
-│   │           ├── process.rs     # tokio::process: spawn + capture
-│   │           └── stdin.rs       # async stdin reader
-│   ├── tailflow-tui/              # `tailflow` binary
-│   └── tailflow-daemon/           # `tailflow-daemon` binary
-├── npm/
-│   ├── tailflow/                  # published as `tailflow` on npm
-│   │   └── bin/run.js             # platform detection + spawnSync launcher
-│   └── platforms/                 # @tailflow/<platform> packages
-│       ├── darwin-arm64/
-│       ├── darwin-x64/
-│       ├── linux-x64/
-│       ├── linux-arm64/
-│       └── win32-x64/
-└── scripts/
-    ├── bump-version.js            # sync version across package.json + Cargo.toml
-    └── pack-local.sh              # local build + npm pack for testing
-```
+| MCP | hand-rolled JSON-RPC 2.0 over stdio (no SDK dependency) |
 
 ---
 
@@ -427,43 +373,56 @@ tailflow/
 
 ### Near-term
 
-- [ ] **Web dashboard search bar** — live `?grep=` filter input in the UI so users don't need to hand-craft query params
-- [ ] **Log export** — download filtered records as `.ndjson` or `.txt` from the web dashboard
-- [ ] **Graceful shutdown** — SIGTERM drains in-flight records and flushes the ring buffer before exit
-- [ ] **`--follow` flag for files** — tail from the end by default; `--no-follow` reads the whole file and exits (like `tail -f` vs `cat`)
-- [ ] **Docker Compose integration** — auto-discover services from a `docker-compose.yml` in the project root without listing them manually
+- [ ] **`tailflow-daemon --mcp`** — serve MCP directly from the daemon over
+      streamable HTTP, so agents need no second process
+- [ ] **Auto-start the daemon** from `tailflow-mcp` when one isn't running and a
+      `tailflow.toml` is present
+- [ ] **Docker Compose discovery** — read services from `docker-compose.yml`
+      instead of listing them by hand
+- [ ] **`get_recent_errors` diffing** — "what is failing now that wasn't before
+      my change", using a cursor as the baseline
 
 ### High-impact
 
-- [ ] **Log level filter toggles in TUI** — press `e`/`w`/`i`/`d` to show/hide Error, Warn, Info, Debug levels; currently only regex filter exists
-- [ ] **Persistent log buffer to disk** — optional SQLite ring buffer so logs survive daemon restarts and can be queried historically
-- [ ] **`[[sources.http]]` webhook receiver** — accept POST payloads from external services (Vercel, Render, Fly.io log drains) and ingest them as a named source
-- [ ] **Web dashboard dark/light theme toggle** — currently hardcoded dark; one `prefers-color-scheme` CSS variable swap would cover both
-- [ ] **OpenTelemetry / OTLP exporter** — forward collected logs to a collector (Grafana Cloud, Honeycomb, Datadog) for teams who want cloud retention without changing their local workflow
+- [ ] **Request correlation** — group records sharing a trace/request id so an
+      agent can follow one request across services
+- [ ] **MCP resources** — expose each source as a readable resource, not just
+      tools
+- [ ] **Persistent buffer** — optional SQLite ring so history survives a daemon
+      restart
+- [ ] **`[[sources.http]]` webhook receiver** — ingest log drains from Vercel,
+      Render, Fly.io as named sources
+- [ ] **Log level filter toggles in the TUI** — `e`/`w`/`i`/`d`, matching the
+      web dashboard's pills
 
-### Speculative / community interest
+### Speculative
 
-- [ ] **TUI split-pane view** — side-by-side panes showing two sources simultaneously; useful when debugging a frontend + backend at the same time
-- [ ] **Plugin system for custom sources** — WASM or subprocess-based source plugins so users can add sources (Kafka, Redis pub/sub, AWS CloudWatch) without forking
-- [ ] **AI log summarisation** — `s` key in TUI calls a local LLM (Ollama) or cloud API to summarise the last N error records into a plain-English diagnosis
+- [ ] **Fingerprint tuning per-runtime** — language-aware normalisation for
+      Rust panics, Java stack traces, Go `panic:` blocks
+- [ ] **Plugin system for custom sources** — Kafka, Redis pub/sub, CloudWatch
+- [ ] **TUI split-pane view** — two sources side by side
 
 ---
 
 ## Contributing
 
-Contributions are welcome. Please open an issue before submitting a large PR so we can align on the approach.
+Contributions are welcome. Please open an issue before a large PR so we can align
+on the approach.
 
 ```bash
-# Run the full quality gate locally before pushing
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
-The CI workflow runs `fmt`, `clippy`, `build`, and `test` on every push and pull request targeting `main` or `dev`.
+CI runs `fmt`, `clippy`, `build`, and `test` on every push and PR targeting
+`main` or `dev`.
+
+Release notes for every version live in [CHANGELOG.md](CHANGELOG.md). Bump all
+version-carrying files together with `node scripts/bump-version.js <semver>`.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE)  — © 2026 ThinkGrid Labs

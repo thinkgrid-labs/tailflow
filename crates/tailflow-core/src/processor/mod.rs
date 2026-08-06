@@ -1,27 +1,30 @@
-use crate::{LogReceiver, LogRecord};
+use crate::{LogLevel, LogReceiver, LogRecord};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use tokio::sync::broadcast;
 
+#[derive(Default)]
 pub struct Filter {
     /// Regex matched against `record.payload`.
     grep: Option<Regex>,
     /// Substring matched against `record.source`.
     source: Option<String>,
+    /// Minimum severity, inclusive. See [`LogLevel::severity`].
+    min_level: Option<LogLevel>,
+    /// Only records at or after this instant.
+    since: Option<DateTime<Utc>>,
 }
 
 impl Filter {
     pub fn none() -> Self {
-        Self {
-            grep: None,
-            source: None,
-        }
+        Self::default()
     }
 
     /// Build a filter that matches records whose payload matches `pattern`.
     pub fn regex(pattern: &str) -> Result<Self, regex::Error> {
         Ok(Self {
             grep: Some(Regex::new(pattern)?),
-            source: None,
+            ..Self::default()
         })
     }
 
@@ -31,10 +34,32 @@ impl Filter {
         self
     }
 
+    /// Only match records at or above `level`.
+    pub fn with_min_level(mut self, level: LogLevel) -> Self {
+        self.min_level = Some(level);
+        self
+    }
+
+    /// Only match records at or after `since`.
+    pub fn with_since(mut self, since: DateTime<Utc>) -> Self {
+        self.since = Some(since);
+        self
+    }
+
     /// Returns `true` if the record passes all active filters.
     pub fn matches(&self, record: &LogRecord) -> bool {
         if let Some(src) = &self.source {
             if !record.source.contains(src.as_str()) {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_level {
+            if record.level.severity() < min.severity() {
+                return false;
+            }
+        }
+        if let Some(since) = self.since {
+            if record.timestamp < since {
                 return false;
             }
         }
