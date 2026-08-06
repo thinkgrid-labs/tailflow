@@ -418,6 +418,9 @@ cargo test --all
 CI runs `fmt`, `clippy`, `build`, and `test` on every push and PR targeting
 `main` or `dev`.
 
+Release notes for every version live in [CHANGELOG.md](CHANGELOG.md). Bump all
+version-carrying files together with `node scripts/bump-version.js <semver>`.
+
 ---
 
 ## License
