@@ -1,41 +1,31 @@
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
-use tailflow_core::{LogReceiver, LogRecord, LogSender};
+use std::sync::Arc;
+use tailflow_core::{query::LogStore, LogReceiver, LogSender};
 use tokio::sync::broadcast;
-
-const RING_SIZE: usize = 500;
 
 /// Shared state for all HTTP handlers.
 pub struct AppState {
     /// Subscribe to the live stream by calling `tx.subscribe()`.
     pub tx: LogSender,
-    /// Rolling buffer of the last RING_SIZE records (for `/api/records`).
-    pub ring: Mutex<VecDeque<LogRecord>>,
+    /// Retrospective buffer backing `/api/records` and the agent endpoints.
+    pub store: Arc<LogStore>,
 }
 
 impl AppState {
     /// Create shared state and start the fan-out task.
-    pub fn new(mut source_rx: LogReceiver) -> Arc<Self> {
+    pub fn new(source_rx: LogReceiver, capacity: usize) -> Arc<Self> {
         let (tx, _) = broadcast::channel(tailflow_core::BUS_CAPACITY);
         let state = Arc::new(AppState {
             tx: tx.clone(),
-            ring: Mutex::new(VecDeque::with_capacity(RING_SIZE)),
+            store: Arc::new(LogStore::new(capacity)),
         });
-        let state2 = state.clone();
 
+        let store = state.store.clone();
+        let mut source_rx = source_rx;
         tokio::spawn(async move {
             loop {
                 match source_rx.recv().await {
                     Ok(record) => {
-                        {
-                            let mut buf = state2.ring.lock().unwrap_or_else(|p| p.into_inner());
-                            if buf.len() >= RING_SIZE {
-                                buf.pop_front(); // O(1) vs Vec::remove(0) O(n)
-                            }
-                            buf.push_back(record.clone());
-                        }
+                        store.push(record.clone());
                         let _ = tx.send(record);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {

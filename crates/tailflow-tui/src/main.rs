@@ -12,7 +12,7 @@ use tailflow_core::{
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "tailflow", about = "Zero-config local log aggregator")]
+#[command(version, name = "tailflow", about = "Zero-config local log aggregator")]
 struct Cli {
     /// Path to tailflow.toml (auto-discovered if omitted)
     #[arg(long, value_name = "PATH")]

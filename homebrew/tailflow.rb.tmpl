@@ -1,5 +1,5 @@
 class Tailflow < Formula
-  desc "Zero-configuration local log aggregator for full-stack developers"
+  desc "Local log aggregator that gives your coding agent eyes on your running stack"
   homepage "https://github.com/thinkgrid-labs/tailflow"
   version "{{VERSION}}"
   license "MIT"
@@ -27,6 +27,8 @@ class Tailflow < Formula
   def install
     bin.install "tailflow"
     bin.install "tailflow-daemon"
+    bin.install "tailflow-mcp"
+    bin.install "tailflow-logs"
   end
 
   test do
