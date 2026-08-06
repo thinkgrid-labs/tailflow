@@ -242,22 +242,56 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           node scripts/bump-version.js "$VERSION"
 
-      # Publish platform packages first (main package depends on them)
+      # Fail fast with a readable message. npm answers an unauthorised publish
+      # with 404 rather than 403 (it will not confirm that a package exists to
+      # someone who cannot write to it), so an expired token surfaces as
+      # "E404 Not Found" against a package that demonstrably does exist.
+      - name: Verify npm credentials
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set on this repository."
+            exit 1
+          fi
+          if ! WHO=$(npm whoami 2>&1); then
+            echo "::error::NPM_TOKEN is invalid, expired, or revoked (npm said: $WHO)."
+            echo "::error::Granular npm tokens expire — mint a new one with write access to the @thinkgrid scope and update the NPM_TOKEN secret."
+            exit 1
+          fi
+          echo "authenticated to npm as $WHO"
+
+      # Publish platform packages first (main package depends on them).
+      #
+      # Idempotent by version: npm refuses to republish a version, so a run that
+      # failed partway through would otherwise be unretryable — the platforms
+      # that succeeded would abort the retry before reaching the ones that did
+      # not, leaving the release permanently half-published.
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
-            echo "Publishing @thinkgrid/tailflow-$platform …"
-            cd npm/platforms/$platform
-            npm publish --access public
-            cd ../../..
+            pkg="@thinkgrid/tailflow-$platform"
+            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
+              echo "$pkg@$VERSION is already published — skipping"
+              continue
+            fi
+            echo "Publishing $pkg@$VERSION …"
+            ( cd "npm/platforms/$platform" && npm publish --access public )
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd npm/tailflow && npm publish
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "tailflow@$VERSION" version >/dev/null 2>&1; then
+            echo "tailflow@$VERSION is already published — skipping"
+            exit 0
+          fi
+          ( cd npm/tailflow && npm publish )
 
       # Download tarballs so they can be attached to the GitHub Release
       - uses: actions/download-artifact@v4
@@ -332,6 +366,26 @@ jobs:
             -e "s/{{SHA256_LINUX_ARM64}}/$SHA_LINUX_ARM64/g" \
             -e "s/{{SHA256_LINUX_X64}}/$SHA_LINUX_X64/g" \
             homebrew/tailflow.rb.tmpl > tailflow.rb
+
+      # `brew tap thinkgrid-labs/tap` resolves to the repository
+      # thinkgrid-labs/homebrew-tap — Homebrew requires the `homebrew-` prefix.
+      # git reports a missing repository and an unauthorised one identically
+      # ("Invalid username or token"), so check and say which it is.
+      - name: Verify tap repository is reachable
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN secret is not set on this repository."
+            exit 1
+          fi
+          if ! git ls-remote \
+              "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/thinkgrid-labs/homebrew-tap.git" \
+              >/dev/null 2>&1; then
+            echo "::error::Cannot reach thinkgrid-labs/homebrew-tap."
+            echo "::error::Either the repository does not exist — create it (the 'homebrew-' prefix is required for 'brew tap thinkgrid-labs/tap' to resolve) — or HOMEBREW_TAP_TOKEN has expired or lacks write access to it."
+            exit 1
+          fi
 
       - name: Push formula to homebrew-tap
         env:
