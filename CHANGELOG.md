@@ -66,10 +66,23 @@ by an agent — deduplicated, bounded, and served over MCP.
 - npm package metadata: repository URLs pointed at a `your-org` placeholder,
   which rendered as a broken link on the npm page. Now `thinkgrid-labs`.
 
+### Removed
+
+- **Homebrew tap.** The formula and its release job are gone. The tap repository
+  it pushed to never existed, so `brew tap thinkgrid-labs/tap` never worked;
+  prebuilt archives on each GitHub release cover the same platforms without a
+  second repository to keep in sync. Install via npm or direct download.
+
 ### Fixed
 
 - npm package versions were pinned at `0.1.0` while the Rust workspace was at
   `0.2.0`. All artifacts are now bumped together.
+- The npm publish steps now skip versions already on the registry, so a run that
+  failed partway through can be retried. Previously the packages that had
+  succeeded would abort the retry before it reached the ones that had not,
+  leaving a release permanently half-published.
+- Release preflight checks now report a missing or under-privileged `NPM_TOKEN`
+  directly, instead of surfacing it as an unexplained `E404` from `npm publish`.
 
 ## [0.2.0] - 2026-04-05
 

@@ -247,12 +247,19 @@ matching your OS and CPU is downloaded, via platform-specific optional
 dependencies — the same pattern esbuild and Biome use. macOS (ARM64 + x64),
 Linux (x64 + ARM64), Windows x64.
 
-### Homebrew
+### Direct binary download
+
+Every release attaches prebuilt archives for macOS (ARM64, x64) and Linux
+(x64, ARM64), plus raw `.exe` files for Windows, to its
+[GitHub release](https://github.com/thinkgrid-labs/tailflow/releases). Each
+archive contains all four binaries:
 
 ```bash
-brew tap thinkgrid-labs/tap
-brew install tailflow
+curl -fsSL https://github.com/thinkgrid-labs/tailflow/releases/latest/download/tailflow-darwin-arm64.tar.gz \
+  | tar -xz -C /usr/local/bin
 ```
+
+Substitute `darwin-x64`, `linux-x64`, or `linux-arm64` as appropriate.
 
 ### From source — Rust 1.75+
 
