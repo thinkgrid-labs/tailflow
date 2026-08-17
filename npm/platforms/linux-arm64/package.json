@@ -1,6 +1,6 @@
 {
   "name": "@thinkgrid/tailflow-linux-arm64",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "TailFlow compiled binary for Linux ARM64",
   "license": "MIT",
   "os": [

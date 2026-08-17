@@ -1,8 +1,9 @@
 mod app;
+mod init;
 mod ui;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tailflow_core::{
     config::Config,
@@ -13,8 +14,15 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, name = "tailflow", about = "Zero-config local log aggregator")]
+#[command(
+    version,
+    name = "tailflow",
+    about = "Runtime verification for coding agents and developers"
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to tailflow.toml (auto-discovered if omitted)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -32,14 +40,24 @@ struct Cli {
     stdin: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Detect local sources and create tailflow.toml
+    Init(init::InitArgs),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if let Some(Command::Init(args)) = cli.command {
+        return init::run(args);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .init();
-
-    let cli = Cli::parse();
 
     let (tx, rx) = new_bus();
     let mut sources: Vec<Box<dyn Source>> = Vec::new();

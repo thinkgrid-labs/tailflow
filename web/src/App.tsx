@@ -14,6 +14,20 @@ function tryRegex(s: string): RegExp | null {
 export function App() {
   const { records, status, clear } = useLogStream()
 
+  const [version, setVersion] = useState<string | null>(null)
+  useEffect(() => {
+    let active = true
+    fetch('/health')
+      .then(response => response.ok
+        ? response.json()
+        : Promise.reject(new Error('health request failed')))
+      .then((health: { version?: unknown }) => {
+        if (active && typeof health.version === 'string') setVersion(health.version)
+      })
+      .catch(() => { /* the dashboard remains usable without version metadata */ })
+    return () => { active = false }
+  }, [])
+
   // ── Filter state ──────────────────────────────────────────────────────────
   const [filter,          setFilter]          = useState('')
   const [selectedSources, setSelectedSources] = useState<Set<string> | null>(null)
@@ -113,6 +127,7 @@ export function App() {
       {/* ── Header ──────────────────────────────────────────────────────── */}
       <header class="header">
         <span class="logo">TailFlow</span>
+        {version && <span class="version">v{version}</span>}
 
         <input
           class="filter-input"

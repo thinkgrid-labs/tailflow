@@ -90,7 +90,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         "p:json-off"
     };
     let header_text = format!(
-        " TailFlow  |  {} records  |  / filter  |  {}  |  q quit",
+        " TailFlow v{}  |  {} records  |  / filter  |  {}  |  q quit",
+        env!("CARGO_PKG_VERSION"),
         app.records.len(),
         json_label,
     );

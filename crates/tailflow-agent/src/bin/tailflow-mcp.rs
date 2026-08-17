@@ -42,8 +42,10 @@ async fn main() -> Result<()> {
     // The daemon is allowed to be down at startup and come up later, so this
     // is a note, not a failure — the agent gets an actionable message from the
     // first tool call either way.
-    eprintln!("tailflow-mcp: MCP server on stdio, reading logs from {url}");
-    eprintln!("tailflow-mcp: override with --url or {URL_ENV}");
+    eprintln!("TailFlow v{} · MCP server", env!("CARGO_PKG_VERSION"));
+    eprintln!("  transport  stdio");
+    eprintln!("  logs       {url}");
+    eprintln!("  override   --url or {URL_ENV}");
 
     let server = Arc::new(Server::new(client));
 

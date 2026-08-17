@@ -23,11 +23,12 @@ Roadmap work should preserve four properties:
 
 ### Reduce setup friction
 
-- Serve MCP directly from the daemon over streamable HTTP, removing the need
-  for a separate stdio bridge where clients support remote MCP transports.
-- Optionally let `tailflow-mcp` start a local daemon when `tailflow.toml` exists
+- [x] Add `tailflow init` with project detection, interactive selection, safe
+  config generation, explicit source flags, and a noninteractive `--yes` mode.
+- [ ] Optionally let `tailflow-mcp` start a local daemon when `tailflow.toml` exists
   and no daemon is reachable.
-- Add a guided initialization command that can create a starter configuration.
+- [ ] Serve MCP directly from the daemon over streamable HTTP, removing the need
+  for a separate stdio bridge where clients support remote MCP transports.
 
 ### Improve change verification
 

@@ -147,12 +147,13 @@ async fn main() -> Result<()> {
     let app = routes::router(shared);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
-    info!(%addr, "tailflow-daemon listening");
-    eprintln!("tailflow-daemon: dashboard   http://{addr}");
-    eprintln!("                 SSE stream  http://{addr}/events");
-    eprintln!("                 agent API   http://{addr}/api/errors");
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, "tailflow-daemon listening");
+    eprintln!("TailFlow v{} · daemon", env!("CARGO_PKG_VERSION"));
+    eprintln!("  dashboard   http://{addr}");
+    eprintln!("  SSE stream  http://{addr}/events");
+    eprintln!("  agent API   http://{addr}/api/errors");
+
     let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

@@ -33,7 +33,7 @@ The package installs:
 | `tailflow-daemon` | Collects logs, stores the bounded buffer, and serves clients |
 | `tailflow-mcp` | Exposes daemon queries to an MCP client over stdio |
 | `tailflow-logs` | Queries the daemon from a shell or script |
-| `tailflow` | Displays sources in an interactive terminal UI |
+| `tailflow` | Initializes projects or displays sources in an interactive terminal UI |
 
 You can try the TUI without installing globally:
 
@@ -67,13 +67,72 @@ cargo install --path crates/tailflow-daemon
 cargo install --path crates/tailflow-agent
 ```
 
-## Configure log sources
+## Initialize a project
+
+Run the initializer from the project or monorepo root:
+
+```bash
+tailflow init
+```
+
+It looks for:
+
+- `dev`, `dev:*`, `develop`, `serve`, and `start` scripts in `package.json`;
+- the `packageManager` field and pnpm, Yarn, or Bun lockfiles so generated
+  commands use the right package manager;
+- `compose.yml`, `compose.yaml`, or Docker Compose's legacy filenames; and
+- `.log` files under `logs/`, `log/`, or `var/log/`.
+
+The interactive prompt marks safe defaults as recommended and lets you select
+any combination. It then writes a runtime-valid `tailflow.toml` and prints the
+commands for starting the daemon and connecting Claude Code.
+
+```text
+TailFlow found:
+
+  1. process web: pnpm run dev [recommended]
+  2. Docker containers (compose.yml) [recommended]
+  3. file worker: logs/worker.log [recommended]
+
+Select sources (Enter for 1,2,3, numbers, 'all', or 'none'):
+```
+
+For automation, accept the recommended selection without a prompt:
+
+```bash
+tailflow init --yes
+```
+
+You can also provide sources that cannot be detected:
+
+```bash
+tailflow init --docker \
+  --process 'api=go run ./cmd/api' \
+  --file logs/worker.log
+```
+
+| Option | Purpose |
+|---|---|
+| `--dir PATH` | Inspect another project directory |
+| `-y`, `--yes` | Select all recommended discoveries without prompting |
+| `-f`, `--force` | Replace an existing `tailflow.toml` |
+| `--docker` | Explicitly enable local Docker discovery |
+| `--process LABEL=COMMAND` | Add a process source; repeatable |
+| `--file PATH` | Add a file source; repeatable |
+
+The initializer refuses to replace an existing configuration without `--force`
+and does not write a file when no sources are selected. Review generated commands
+before starting TailFlow; detection proposes runtime sources but does not execute
+them.
+
+## Configure log sources manually
 
 Create `tailflow.toml` at the project or monorepo root. TailFlow searches the
 current directory and then each parent directory. Relative file paths and
 process commands still use the directory where TailFlow was launched, so start
 it from the project root unless the configuration uses absolute paths.
 
+Use this section when customizing generated output or writing the file by hand.
 Start with one of these recipes, then combine sources as needed.
 
 ### Let TailFlow start development processes

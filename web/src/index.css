@@ -65,6 +65,13 @@ input {
   white-space: nowrap;
 }
 
+.version {
+  margin-left: -7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .filter-input {
   flex: 1;
   background: #0d0d0d;

@@ -641,6 +641,7 @@ mod tests {
         let (status, body) = get(flood(), "/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["buffered"], 32);
         assert!(body["cursor"].as_u64().unwrap() > 0);
     }

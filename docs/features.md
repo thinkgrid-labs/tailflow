@@ -39,6 +39,10 @@ TailFlow collects:
 The sources share timestamps, labels, detected levels, and one ordered record
 model. CLI source flags can add temporary inputs on top of `tailflow.toml`.
 
+`tailflow init` reduces the initial configuration work by detecting package
+development scripts, Compose files, and common log files. It proposes sources
+and writes the configuration only after an interactive or explicit selection.
+
 ### Runtime behavior
 
 - Docker discovery is continuous. New and replacement containers are attached

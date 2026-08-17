@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-agent"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-daemon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "atty",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-tui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "atty",
@@ -1934,9 +1934,12 @@ dependencies = [
  "ratatui",
  "regex",
  "serde",
+ "serde_json",
  "tailflow-core",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

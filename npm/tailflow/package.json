@@ -1,6 +1,6 @@
 {
   "name": "tailflow",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Runtime verification for coding agents using local process, Docker and file logs over MCP",
   "license": "MIT",
   "keywords": [
@@ -32,10 +32,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@thinkgrid/tailflow-darwin-arm64": "0.3.1",
-    "@thinkgrid/tailflow-darwin-x64": "0.3.1",
-    "@thinkgrid/tailflow-linux-arm64": "0.3.1",
-    "@thinkgrid/tailflow-linux-x64": "0.3.1",
-    "@thinkgrid/tailflow-win32-x64": "0.3.1"
+    "@thinkgrid/tailflow-darwin-arm64": "0.3.2",
+    "@thinkgrid/tailflow-darwin-x64": "0.3.2",
+    "@thinkgrid/tailflow-linux-arm64": "0.3.2",
+    "@thinkgrid/tailflow-linux-x64": "0.3.2",
+    "@thinkgrid/tailflow-win32-x64": "0.3.2"
   }
 }

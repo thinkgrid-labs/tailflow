@@ -69,30 +69,20 @@ npm install -g tailflow
 This installs four commands: `tailflow`, `tailflow-daemon`, `tailflow-mcp`, and
 `tailflow-logs`.
 
-### 2. Describe the local stack
+### 2. Initialize the project
 
-Create `tailflow.toml` in the project root:
-
-```toml
-[sources]
-docker = true
-
-[[sources.process]]
-label = "web"
-cmd = "npm run dev --prefix apps/web"
-
-[[sources.process]]
-label = "api"
-cmd = "go run ./cmd/api"
-
-[[sources.file]]
-path = "logs/worker.log"
-label = "worker"
+```bash
+cd your-project
+tailflow init
 ```
 
-Only configure sources you use. TailFlow continuously follows configured files,
-starts configured processes, and discovers running and replacement Docker
-containers when `docker = true`.
+TailFlow detects development scripts, Compose files, and common log files, lets
+you choose the sources, and writes `tailflow.toml`. Use `tailflow init --yes` to
+accept the recommended sources noninteractively.
+
+Nothing is overwritten unless you pass `--force`. For manual configuration and
+explicit `--process`, `--file`, or `--docker` setup, see the
+[getting-started guide](docs/getting-started.md#initialize-a-project).
 
 ### 3. Start the collector
 

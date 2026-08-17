@@ -308,7 +308,7 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.3.1", "buffered": 125, "cursor": 125 }
+{ "ok": true, "version": "0.3.2", "buffered": 125, "cursor": 125 }
 ```
 
 ---

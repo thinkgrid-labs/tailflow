@@ -14,6 +14,7 @@ It helps an agent:
 
 ```bash
 npm install -g tailflow
+tailflow init
 tailflow-daemon
 claude mcp add tailflow -- tailflow-mcp
 ```
