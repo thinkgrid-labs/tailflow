@@ -195,7 +195,18 @@ fn read_available(
         return Ok(());
     };
     let mut line = String::new();
-    while file.reader.read_line(&mut line)? > 0 {
+    loop {
+        let line_start = file.position;
+        if file.reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            // A write notification may arrive between truncate and the final
+            // newline. Rewind so the next pass emits one complete record
+            // instead of splitting it into arbitrary filesystem write chunks.
+            file.reader.seek(SeekFrom::Start(line_start))?;
+            break;
+        }
         file.position = file.reader.stream_position()?;
         let payload = line.trim_end_matches(['\n', '\r']).to_string();
         if !payload.is_empty()
