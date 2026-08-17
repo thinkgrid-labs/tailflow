@@ -222,13 +222,16 @@ async fn terminate_child_tree(child: &mut Child) {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        let leader_reaped = tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
-            .is_err()
-        {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+            .is_ok();
+
+        // The shell can exit before a descendant that ignores SIGTERM. Always
+        // follow up against the process group; ESRCH simply means it is empty.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        if !leader_reaped {
             let _ = child.wait().await;
         }
         return;

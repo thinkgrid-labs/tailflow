@@ -161,6 +161,29 @@ async fn cancellation_stops_a_running_process() {
         .unwrap()
         .unwrap();
 
-    let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
-    assert!(!alive, "descendant process {descendant_pid} was orphaned");
+    assert!(
+        !process_is_running(descendant_pid),
+        "descendant process {descendant_pid} was left running"
+    );
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+
+    // Linux keeps an exited orphan in the process table as a zombie until its
+    // new parent reaps it. A zombie still answers kill(pid, 0), but cannot run.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+        {
+            return false;
+        }
+    }
+
+    true
 }
