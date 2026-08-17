@@ -6,19 +6,12 @@ Thank you for your interest in contributing! This document covers how to get sta
 
 ## Table of Contents
 
-- [Code of Conduct](#code-of-conduct)
 - [Getting Started](#getting-started)
 - [Development Workflow](#development-workflow)
 - [Project Structure](#project-structure)
 - [Submitting Changes](#submitting-changes)
 - [Reporting Bugs](#reporting-bugs)
 - [Requesting Features](#requesting-features)
-
----
-
-## Code of Conduct
-
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you agree to uphold it. Please report unacceptable behavior to the maintainers via a GitHub issue marked **[private]** or by email if listed in the repository.
 
 ---
 
@@ -37,7 +30,7 @@ git clone https://github.com/thinkgrid-labs/tailflow.git
 cd tailflow
 
 # Build the web dashboard (required for the daemon binary)
-cd web && npm install && npm run build && cd ..
+cd web && npm ci && npm run build && cd ..
 
 # Build all Rust crates
 cargo build --all
@@ -75,9 +68,11 @@ tailflow/
 ├── crates/
 │   ├── tailflow-core/     # Ingestion engine — no UI dependencies
 │   ├── tailflow-tui/      # ratatui terminal UI binary
-│   └── tailflow-daemon/   # axum HTTP daemon binary
+│   ├── tailflow-daemon/   # axum HTTP daemon binary
+│   └── tailflow-agent/    # MCP and shell client binaries
 ├── web/                   # Preact web dashboard (Vite)
 ├── npm/                   # npm distribution packages
+├── docs/                  # User guides and design documentation
 └── scripts/               # Version bumping and packaging scripts
 ```
 

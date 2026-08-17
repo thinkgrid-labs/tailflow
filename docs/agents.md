@@ -2,6 +2,9 @@
 
 Reference for the MCP server, the shell client, and the HTTP API underneath both.
 
+New to TailFlow? Start with the [getting-started guide](getting-started.md).
+Return to the [documentation index](README.md) for the rest of the guides.
+
 - [Setup](#setup)
 - [MCP tools](#mcp-tools)
 - [Workflow patterns](#workflow-patterns)

@@ -1,7 +1,7 @@
 {
   "name": "tailflow",
   "version": "0.3.1",
-  "description": "Give your coding agent eyes on your running local stack — unified logs from Docker, processes and files, exposed over MCP",
+  "description": "Runtime verification for coding agents using local process, Docker and file logs over MCP",
   "license": "MIT",
   "keywords": [
     "mcp",

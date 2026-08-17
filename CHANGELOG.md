@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
+## [Unreleased]
+
+### Documentation
+
+- Reworked the README around the problem TailFlow solves and a shorter first-run
+  path, with dedicated guides for setup, architecture, limitations, and roadmap.
+- Added a task-oriented documentation index, troubleshooting guidance, honest
+  operational boundaries, and complete process restart examples.
+- Added a concise npm package README and aligned package metadata with the
+  runtime-verification positioning.
+- Reframed features around the jobs they perform in an agent verification loop,
+  with a capability guide covering outcomes, use cases, interfaces, and evidence
+  boundaries.
+
 ## [0.3.1] - 2026-08-17
 
 Correctness and release-hardening follow-up to 0.3.0.

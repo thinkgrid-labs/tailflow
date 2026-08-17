@@ -17,8 +17,8 @@ docker = false
 # path = "/var/log/nginx/access.log"
 
 # ── Process sources ───────────────────────────────────────────────────────────
-# Tailflow spawns these processes and captures their stdout + stderr.
-# Perfect for a monorepo: define your whole stack here.
+# TailFlow spawns these processes and captures their stdout + stderr.
+# Stopping TailFlow also stops their process trees.
 
 # [[sources.process]]
 # label = "frontend"
@@ -27,6 +27,8 @@ docker = false
 # [[sources.process]]
 # label = "api"
 # cmd   = "go run ./cmd/api"
+# restart = "on-failure"   # never (default), on-failure, or always
+# restart_delay_ms = 1000  # doubles after each restart, capped at 30 seconds
 
 # [[sources.process]]
 # label = "worker"
