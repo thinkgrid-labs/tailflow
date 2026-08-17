@@ -113,9 +113,11 @@ impl DaemonClient {
         let mut stream = TcpStream::connect(&self.authority)
             .await
             .map_err(|e| match e.kind() {
-                std::io::ErrorKind::ConnectionRefused => ClientError::NotRunning {
-                    url: self.display_url.clone(),
-                },
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::PermissionDenied => {
+                    ClientError::NotRunning {
+                        url: self.display_url.clone(),
+                    }
+                }
                 _ => ClientError::Io(e.to_string()),
             })?;
 

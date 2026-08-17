@@ -49,7 +49,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .count();
 
     let max_scroll = filtered_count.saturating_sub(list_height);
-    if app.scroll >= max_scroll {
+    if app.follow || app.scroll >= max_scroll {
         app.scroll = max_scroll;
     }
     let scroll = app.scroll;

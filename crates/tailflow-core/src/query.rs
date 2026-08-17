@@ -61,6 +61,13 @@ pub struct QueryResult {
     pub truncated: bool,
     /// Pass back as `cursor` to fetch only what arrives after this call.
     pub next_cursor: u64,
+    /// Sequence number of the oldest retained record. A caller can use this to
+    /// understand the exact retrospective horizon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_start_cursor: Option<u64>,
+    /// True when the requested cursor predates the ring buffer or belongs to a
+    /// previous daemon lifetime. Results after a gap are never called exact.
+    pub cursor_gap: bool,
 }
 
 /// One distinct failure, with every occurrence folded into it.
@@ -98,6 +105,9 @@ pub struct Summary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_starts_at: Option<DateTime<Utc>>,
     pub next_cursor: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_start_cursor: Option<u64>,
+    pub cursor_gap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +186,9 @@ pub fn parse_since(s: &str) -> Option<DateTime<Utc>> {
         return Some(ts.with_timezone(&Utc));
     }
 
-    let (value, unit) = s.split_at(s.len() - 1);
+    let unit_char = s.chars().last()?;
+    let split = s.len() - unit_char.len_utf8();
+    let (value, unit) = s.split_at(split);
     let n: i64 = value.parse().ok()?;
     if n < 0 {
         return None;
@@ -350,7 +362,7 @@ impl LogStore {
         }
     }
 
-    pub fn push(&self, record: LogRecord) {
+    pub fn push(&self, record: LogRecord) -> SeqRecord {
         let seq = {
             let mut n = self.next_seq.lock().unwrap_or_else(|p| p.into_inner());
             let seq = *n;
@@ -361,7 +373,16 @@ impl LogStore {
         if ring.len() >= self.capacity {
             ring.pop_front();
         }
+        let emitted = SeqRecord {
+            seq,
+            timestamp: record.timestamp,
+            source: record.source.clone(),
+            level: record.level,
+            payload: record.payload.clone(),
+            payload_truncated_from: None,
+        };
         ring.push_back(Entry { seq, record });
+        emitted
     }
 
     pub fn len(&self) -> usize {
@@ -384,6 +405,7 @@ impl LogStore {
     /// Most recent `limit` records, oldest-first (reading order).
     pub fn records(&self, q: &Query) -> QueryResult {
         let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring, q.cursor);
         let matched: Vec<&Entry> = ring
             .iter()
             .filter(|e| q.cursor.is_none_or(|c| e.seq > c))
@@ -403,6 +425,52 @@ impl LogStore {
             total_matching,
             truncated: skip > 0,
             next_cursor: ring.back().map(|e| e.seq).unwrap_or(0),
+            buffer_start_cursor,
+            cursor_gap,
+        }
+    }
+
+    /// Most recent retained record that matches a query.
+    pub fn latest_matching_seq(&self, q: &Query) -> Option<u64> {
+        self.ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .rev()
+            .find(|e| q.cursor.is_none_or(|c| e.seq > c) && q.filter.matches(&e.record))
+            .map(|e| e.seq)
+    }
+
+    /// First matching record after an explicit snapshot cursor.
+    pub fn first_matching_seq_after(&self, q: &Query, cursor: u64) -> Option<u64> {
+        self.ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|e| e.seq > cursor && q.filter.matches(&e.record))
+            .map(|e| e.seq)
+    }
+
+    /// The event burst beginning at `anchor`, without reapplying the trigger
+    /// filter. This preserves stack frames and correlated downstream output.
+    pub fn records_from(&self, anchor: u64, limit: usize, max_payload_chars: usize) -> QueryResult {
+        let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let (buffer_start_cursor, cursor_gap) =
+            cursor_horizon(&ring, Some(anchor.saturating_sub(1)));
+        let matching: Vec<&Entry> = ring.iter().filter(|e| e.seq >= anchor).collect();
+        let total_matching = matching.len();
+        let records = matching
+            .into_iter()
+            .take(limit)
+            .map(|e| to_seq_record(e, max_payload_chars))
+            .collect();
+        QueryResult {
+            records,
+            total_matching,
+            truncated: total_matching > limit,
+            next_cursor: ring.back().map(|e| e.seq).unwrap_or(0),
+            buffer_start_cursor,
+            cursor_gap,
         }
     }
 
@@ -415,6 +483,7 @@ impl LogStore {
     /// survive a `level >= error` filter that would otherwise drop them.
     pub fn summarize(&self, q: &Query, context_lines: usize) -> Summary {
         let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring, q.cursor);
         let entries: Vec<&Entry> = ring.iter().collect();
 
         let mut order: Vec<String> = Vec::new();
@@ -458,6 +527,8 @@ impl LogStore {
             truncated,
             buffer_starts_at: entries.first().map(|e| e.record.timestamp),
             next_cursor: entries.last().map(|e| e.seq).unwrap_or(0),
+            buffer_start_cursor,
+            cursor_gap,
         }
     }
 
@@ -628,6 +699,16 @@ fn to_seq_record(e: &Entry, max_payload_chars: usize) -> SeqRecord {
     }
 }
 
+fn cursor_horizon(ring: &VecDeque<Entry>, cursor: Option<u64>) -> (Option<u64>, bool) {
+    let oldest = ring.front().map(|e| e.seq);
+    let latest = ring.back().map_or(0, |e| e.seq);
+    let gap = cursor.is_some_and(|c| match oldest {
+        Some(start) => c.saturating_add(1) < start || c > latest,
+        None => c > 0,
+    });
+    (oldest, gap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +795,8 @@ mod tests {
         assert!(parse_since("yesterday").is_none());
         assert!(parse_since("-5m").is_none());
         assert!(parse_since("").is_none());
+        assert!(parse_since("é").is_none());
+        assert!(parse_since("🔥").is_none());
     }
 
     // ── store ─────────────────────────────────────────────────────────────────
@@ -740,6 +823,29 @@ mod tests {
         let out = store.records(&Query::default().with_cursor(Some(cursor)));
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].payload, "new");
+    }
+
+    #[test]
+    fn store_reports_when_cursor_fell_behind_the_ring() {
+        let store = LogStore::new(2);
+        for i in 0..4 {
+            store.push(rec("api", LogLevel::Info, &format!("line {i}")));
+        }
+        let out = store.records(&Query::default().with_cursor(Some(1)));
+        assert!(out.cursor_gap);
+        assert_eq!(out.buffer_start_cursor, Some(3));
+    }
+
+    #[test]
+    fn records_from_keeps_unfiltered_context_after_anchor() {
+        let store = LogStore::new(20);
+        store.push(rec("api", LogLevel::Info, "before"));
+        let anchor = store.push(rec("api", LogLevel::Error, "ERROR boom")).seq;
+        store.push(rec("api", LogLevel::Unknown, "    at frame"));
+        store.push(rec("worker", LogLevel::Info, "correlated stop"));
+        let out = store.records_from(anchor, 10, 2_000);
+        assert_eq!(out.records.len(), 3);
+        assert_eq!(out.records[1].payload, "    at frame");
     }
 
     #[test]

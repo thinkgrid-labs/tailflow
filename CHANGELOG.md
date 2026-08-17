@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
+## [0.3.1] - 2026-08-17
+
+Correctness and release-hardening follow-up to 0.3.0.
+
+### Added
+
+- Source lifecycle reporting (`starting`, `running`, `exited`, `failed`) so a
+  configured but quiet or failed source remains visible to agents.
+- Explicit cursor-horizon fields (`buffer_start_cursor`, `cursor_gap`) when an
+  incremental reader falls behind the bounded ring or reconnects to a new daemon.
+- MCP compatibility for legacy protocol `2025-11-25` and modern protocol
+  `2026-07-28`, including discovery, response metadata and cacheable tool lists.
+- CI coverage for the web production build and the declared Rust 1.88 MSRV.
+
+### Changed
+
+- `wait_for_logs` now uses its filter only to select the trigger, then returns
+  the unfiltered event burst so stack frames and downstream lines survive.
+- Docker discovery runs continuously and follows containers started or replaced
+  after TailFlow launches. File tails survive rename/recreate rotation and
+  truncate-and-rewrite. Spawned process trees are cancelled on shutdown and use
+  the native shell on Windows.
+- Severity detection uses structured JSON levels and token-aware failure terms,
+  avoiding common false positives such as `0 errors`.
+- The dashboard hydrates buffered records before following SSE, deduplicates by
+  sequence, and reconnects after transient stream failures. The TUI pauses follow
+  mode when the user scrolls and resumes with `G`.
+- Agent payload requests are capped at 10,000 characters. The local HTTP server
+  no longer enables permissive CORS and rejects non-loopback Host headers.
+- npm releases use trusted publishing with GitHub OIDC and provenance, with the
+  existing token retained only as a migration fallback. Web dependencies were
+  refreshed to resolve all reported audit findings.
+- Minimum supported Rust version is now stated and tested as 1.88.
+
+### Fixed
+
+- Unicode input can no longer panic relative-time parsing.
+- SSE records carry their real sequence number, closing hydration/reconnect gaps.
+- Local npm packaging now stages all four binaries and ignores every staged
+  executable, preventing release artifacts from dirtying the repository.
+
 ## [0.3.0] - 2026-08-06
 
 Repositioned around a single question: **an AI agent writes code it cannot see
@@ -123,6 +164,7 @@ Initial release.
   (ARM64, x64), Linux (x64, ARM64), and Windows x64.
 - CI running `fmt`, `clippy`, `build`, and `test`.
 
+[0.3.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thinkgrid-labs/tailflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thinkgrid-labs/tailflow/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thinkgrid-labs/tailflow/releases/tag/v0.1.0

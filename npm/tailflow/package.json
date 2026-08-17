@@ -1,6 +1,6 @@
 {
   "name": "tailflow",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Give your coding agent eyes on your running local stack — unified logs from Docker, processes and files, exposed over MCP",
   "license": "MIT",
   "keywords": [
@@ -32,10 +32,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@thinkgrid/tailflow-darwin-arm64": "0.3.0",
-    "@thinkgrid/tailflow-darwin-x64": "0.3.0",
-    "@thinkgrid/tailflow-linux-arm64": "0.3.0",
-    "@thinkgrid/tailflow-linux-x64": "0.3.0",
-    "@thinkgrid/tailflow-win32-x64": "0.3.0"
+    "@thinkgrid/tailflow-darwin-arm64": "0.3.1",
+    "@thinkgrid/tailflow-darwin-x64": "0.3.1",
+    "@thinkgrid/tailflow-linux-arm64": "0.3.1",
+    "@thinkgrid/tailflow-linux-x64": "0.3.1",
+    "@thinkgrid/tailflow-win32-x64": "0.3.1"
   }
 }

@@ -1,6 +1,7 @@
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'unknown'
 
 export interface LogRecord {
+  seq: number
   timestamp: string
   source: string
   level: LogLevel

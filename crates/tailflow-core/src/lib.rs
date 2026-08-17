@@ -73,21 +73,111 @@ impl LogLevel {
 
     /// Attempt to detect level from raw log text.
     pub fn detect(text: &str) -> Self {
+        if let Some(level) = structured_level(text) {
+            return level;
+        }
         let lower = text.to_lowercase();
-        if lower.contains("error") || lower.contains("err ") || lower.contains("fatal") {
+        let tokens: Vec<&str> = text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|token| !token.is_empty())
+            .collect();
+        let words: Vec<String> = tokens
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+        let explicitly_clean = [
+            "0 error",
+            "0 failure",
+            "no error",
+            "no failure",
+            "without error",
+            "error_count 0",
+            "error_count=0",
+            "errors: 0",
+            "errors=0",
+            "error-free",
+            "failure-free",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        let failure_word = words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "err"
+                    | "error"
+                    | "errors"
+                    | "fatal"
+                    | "panic"
+                    | "panicked"
+                    | "exception"
+                    | "failed"
+                    | "failure"
+                    | "traceback"
+            )
+        }) || tokens
+            .iter()
+            .any(|token| token.ends_with("Error") || token.ends_with("Exception"))
+            || lower.contains("segmentation fault")
+            || lower.contains("unhandled rejection")
+            || lower.contains("uncaught exception");
+
+        if failure_word && !explicitly_clean {
             LogLevel::Error
-        } else if lower.contains("warn") {
+        } else if words.iter().any(|word| word.starts_with("warn")) {
             LogLevel::Warn
-        } else if lower.contains("debug") {
+        } else if words.iter().any(|word| word == "debug") {
             LogLevel::Debug
-        } else if lower.contains("trace") {
+        } else if words.iter().any(|word| word == "trace") {
             LogLevel::Trace
-        } else if lower.contains("info") {
+        } else if words.iter().any(|word| word == "info") {
             LogLevel::Info
         } else {
             LogLevel::Unknown
         }
     }
+}
+
+fn structured_level(text: &str) -> Option<LogLevel> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let object = value.as_object()?;
+    for key in [
+        "level",
+        "severity",
+        "severity_text",
+        "log_level",
+        "loglevel",
+        "log.level",
+    ] {
+        if let Some(level) = object
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| level_value(value))
+        {
+            return Some(level);
+        }
+    }
+    object
+        .get("log")?
+        .as_object()?
+        .get("level")
+        .and_then(level_value)
+}
+
+fn level_value(value: &serde_json::Value) -> Option<LogLevel> {
+    if let Some(level) = value.as_str() {
+        return match level.trim().to_ascii_lowercase().as_str() {
+            "critical" | "crit" | "emergency" | "emerg" | "alert" => Some(LogLevel::Error),
+            other => LogLevel::parse(other),
+        };
+    }
+    // Syslog severities: 0–3 error, 4 warning, 5–6 informational, 7 debug.
+    value.as_u64().and_then(|n| match n {
+        0..=3 => Some(LogLevel::Error),
+        4 => Some(LogLevel::Warn),
+        5..=6 => Some(LogLevel::Info),
+        7 => Some(LogLevel::Debug),
+        _ => None,
+    })
 }
 
 /// Shared broadcast bus capacity (number of buffered records).
@@ -115,6 +205,12 @@ mod tests {
         assert_eq!(LogLevel::detect("error: timeout"), LogLevel::Error);
         assert_eq!(LogLevel::detect("FATAL: out of memory"), LogLevel::Error);
         assert_eq!(LogLevel::detect("something err happened"), LogLevel::Error);
+        assert_eq!(LogLevel::detect("Failed to compile"), LogLevel::Error);
+        assert_eq!(
+            LogLevel::detect("thread panicked at src/main.rs"),
+            LogLevel::Error
+        );
+        assert_eq!(LogLevel::detect("NullPointerException"), LogLevel::Error);
     }
 
     #[test]
@@ -150,6 +246,40 @@ mod tests {
             LogLevel::Unknown
         );
         assert_eq!(LogLevel::detect("compiled successfully"), LogLevel::Unknown);
+        assert_eq!(
+            LogLevel::detect("Build finished with 0 errors"),
+            LogLevel::Unknown
+        );
+        assert_eq!(LogLevel::detect("no failures detected"), LogLevel::Unknown);
+        assert_eq!(LogLevel::detect("error-free build"), LogLevel::Unknown);
+        assert_eq!(
+            LogLevel::detect("terror level increased"),
+            LogLevel::Unknown
+        );
+    }
+
+    #[test]
+    fn detect_prefers_structured_json_level() {
+        assert_eq!(
+            LogLevel::detect(r#"{"level":"warn","message":"error budget healthy"}"#),
+            LogLevel::Warn
+        );
+        assert_eq!(
+            LogLevel::detect(r#"{"severity_text":"ERROR","message":"boom"}"#),
+            LogLevel::Error
+        );
+        assert_eq!(
+            LogLevel::detect(r#"{"log":{"level":"debug"},"message":"x"}"#),
+            LogLevel::Debug
+        );
+        assert_eq!(
+            LogLevel::detect(r#"{"log.level":"error","message":"boom"}"#),
+            LogLevel::Error
+        );
+        assert_eq!(
+            LogLevel::detect(r#"{"severity":3,"message":"x"}"#),
+            LogLevel::Error
+        );
     }
 
     #[test]

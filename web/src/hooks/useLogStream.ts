@@ -17,7 +17,10 @@ export function useLogStream() {
     const batch = pending.current.splice(0)
     if (batch.length === 0) return
     setRecords(prev => {
-      const next = [...prev, ...batch]
+      const bySeq = new Map<number, LogRecord>()
+      for (const record of prev) bySeq.set(record.seq, record)
+      for (const record of batch) bySeq.set(record.seq, record)
+      const next = [...bySeq.values()].sort((a, b) => a.seq - b.seq)
       return next.length > MAX_RECORDS
         ? next.slice(next.length - MAX_RECORDS)
         : next
@@ -25,7 +28,25 @@ export function useLogStream() {
   }, [])
 
   useEffect(() => {
+    let active = true
+    let hydrating = false
     const es = new EventSource('/events')
+
+    const hydrate = () => {
+      if (!active || hydrating) return
+      hydrating = true
+      fetch('/api/records')
+        .then(response => response.ok
+          ? response.json()
+          : Promise.reject(new Error('history request failed')))
+        .then((history: LogRecord[]) => {
+          if (!active) return
+          pending.current.push(...history)
+          if (raf.current === null) raf.current = requestAnimationFrame(flush)
+        })
+        .catch(() => { /* the live stream remains useful without history */ })
+        .finally(() => { hydrating = false })
+    }
 
     es.onopen = () => setStatus('connected')
 
@@ -41,11 +62,19 @@ export function useLogStream() {
     }
 
     es.onerror = () => {
-      setStatus('disconnected')
-      es.close()
+      // EventSource reconnects automatically after transient daemon restarts.
+      setStatus(es.readyState === EventSource.CLOSED ? 'disconnected' : 'connecting')
+      // Rehydrate on reconnect errors so anything emitted while SSE was down
+      // is recovered from the daemon's bounded buffer.
+      hydrate()
     }
 
+    // Subscribe first, then hydrate retained history. Sequence IDs deduplicate
+    // records that arrive through both paths during the race window.
+    hydrate()
+
     return () => {
+      active = false
       es.close()
       if (raf.current !== null) cancelAnimationFrame(raf.current)
     }

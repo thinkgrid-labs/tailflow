@@ -4,6 +4,11 @@ use tailflow_core::{
     ingestion::{process::ProcessSource, Source},
     new_bus,
 };
+use tokio_util::sync::CancellationToken;
+
+fn shutdown() -> CancellationToken {
+    CancellationToken::new()
+}
 
 /// Collect up to `limit` records from `rx` within `timeout`.
 async fn collect(
@@ -31,14 +36,14 @@ async fn never_policy_does_not_restart_on_failure() {
     let src =
         ProcessSource::new("test", "echo hello && exit 1").with_restart(RestartPolicy::Never, 50);
 
-    tokio::spawn(async move { Box::new(src).run(tx).await });
+    tokio::spawn(async move { Box::new(src).run(tx, shutdown()).await });
 
     let payloads = collect(rx, 10, Duration::from_secs(3)).await;
-    // Should get exactly one "hello", no restart synthetic record.
+    // Should get exactly one "hello" and an explicit terminal exit record.
     assert_eq!(payloads.iter().filter(|p| p.as_str() == "hello").count(), 1);
     assert!(
-        !payloads.iter().any(|p| p.contains("[tailflow]")),
-        "unexpected restart record with Never policy"
+        payloads.iter().any(|p| p.contains("will not restart")),
+        "missing non-zero exit record with Never policy"
     );
 }
 
@@ -50,7 +55,7 @@ async fn on_failure_restarts_after_non_zero_exit() {
     // Exits non-zero — should trigger a restart synthetic record.
     let src = ProcessSource::new("test", "exit 1").with_restart(RestartPolicy::OnFailure, 50);
 
-    tokio::spawn(async move { Box::new(src).run(tx).await });
+    tokio::spawn(async move { Box::new(src).run(tx, shutdown()).await });
 
     let payloads = collect(rx, 5, Duration::from_secs(3)).await;
     assert!(
@@ -67,7 +72,7 @@ async fn on_failure_does_not_restart_after_clean_exit() {
     // Exits zero — should NOT restart.
     let src = ProcessSource::new("test", "echo done").with_restart(RestartPolicy::OnFailure, 50);
 
-    tokio::spawn(async move { Box::new(src).run(tx).await });
+    tokio::spawn(async move { Box::new(src).run(tx, shutdown()).await });
 
     let payloads = collect(rx, 10, Duration::from_secs(2)).await;
     assert!(
@@ -84,7 +89,7 @@ async fn always_policy_restarts_after_clean_exit() {
     // Exits zero — Always policy should still restart.
     let src = ProcessSource::new("test", "echo hi").with_restart(RestartPolicy::Always, 50);
 
-    tokio::spawn(async move { Box::new(src).run(tx).await });
+    tokio::spawn(async move { Box::new(src).run(tx, shutdown()).await });
 
     let payloads = collect(rx, 10, Duration::from_secs(3)).await;
     assert!(
@@ -103,7 +108,7 @@ async fn restart_delay_is_respected() {
     // 200 ms initial delay so we can measure it.
     let src = ProcessSource::new("test", "exit 1").with_restart(RestartPolicy::OnFailure, 200);
 
-    tokio::spawn(async move { Box::new(src).run(tx).await });
+    tokio::spawn(async move { Box::new(src).run(tx, shutdown()).await });
 
     let start = Instant::now();
     // Wait for the first restart synthetic record.
@@ -119,4 +124,43 @@ async fn restart_delay_is_respected() {
         elapsed >= Duration::from_millis(150),
         "restart fired too fast ({elapsed:?})"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_stops_a_running_process() {
+    let (tx, _rx) = new_bus();
+    let dir = tempfile::TempDir::new().unwrap();
+    let pid_path = dir.path().join("descendant.pid");
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let command = format!(
+        "sleep 30 & child=$!; echo $child > '{}'; wait $child",
+        pid_path.display()
+    );
+    let src = ProcessSource::new("test", command);
+    let task = tokio::spawn(async move { Box::new(src).run(tx, task_shutdown).await });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pid_path.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("descendant process did not start");
+    let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("process source did not stop after cancellation")
+        .unwrap()
+        .unwrap();
+
+    let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    assert!(!alive, "descendant process {descendant_pid} was orphaned");
 }

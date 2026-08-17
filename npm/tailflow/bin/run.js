@@ -1,8 +1,8 @@
 /**
- * Shared launcher for tailflow and tailflow-daemon.
+ * Shared launcher for TailFlow's four binaries.
  *
  * Resolves the compiled binary from the correct platform-specific optional
- * dependency (@tailflow/<platform>) and exec's it, forwarding all args and
+ * dependency (@thinkgrid/tailflow-<platform>) and exec's it, forwarding all args and
  * stdio so that ratatui TUI and TTY interaction work correctly.
  */
 'use strict'

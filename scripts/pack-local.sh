@@ -34,14 +34,17 @@ echo "==> Building web UI …"
 # ── Compile Rust binaries ──────────────────────────────────────────────────
 echo ""
 echo "==> Building Rust binaries …"
-cargo build --release --target "$TARGET" -p tailflow-tui -p tailflow-daemon
+cargo build --release --target "$TARGET" \
+  -p tailflow-tui -p tailflow-daemon -p tailflow-agent
 
 # ── Stage into npm platform package ───────────────────────────────────────
 BIN_DIR="npm/platforms/$PLATFORM/bin"
 mkdir -p "$BIN_DIR"
 cp "target/$TARGET/release/tailflow"        "$BIN_DIR/tailflow"
 cp "target/$TARGET/release/tailflow-daemon" "$BIN_DIR/tailflow-daemon"
-chmod +x "$BIN_DIR/tailflow" "$BIN_DIR/tailflow-daemon"
+cp "target/$TARGET/release/tailflow-mcp"    "$BIN_DIR/tailflow-mcp"
+cp "target/$TARGET/release/tailflow-logs"   "$BIN_DIR/tailflow-logs"
+chmod +x "$BIN_DIR"/*
 
 echo ""
 echo "==> Staged binaries:"
@@ -57,7 +60,7 @@ fi
 
 # ── Pack ───────────────────────────────────────────────────────────────────
 echo ""
-echo "==> Packing @tailflow/$PLATFORM …"
+echo "==> Packing @thinkgrid/tailflow-$PLATFORM …"
 (cd "npm/platforms/$PLATFORM" && npm pack)
 
 echo ""

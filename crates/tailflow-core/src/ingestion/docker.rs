@@ -4,11 +4,37 @@ use anyhow::Result;
 use bollard::{container::LogsOptions, Docker};
 use chrono::Utc;
 use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub struct DockerSource {
     container_id: String,
     container_name: String,
+}
+
+/// Supervises all running containers for the lifetime of TailFlow. Container
+/// IDs are reconciled continuously so `docker compose up --build` replacements
+/// and containers started after the daemon are captured automatically.
+pub struct DockerAllSource;
+
+impl DockerAllSource {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DockerAllSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ManagedContainer {
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
 }
 
 impl DockerSource {
@@ -51,7 +77,7 @@ impl Source for DockerSource {
         &self.container_name
     }
 
-    async fn run(self: Box<Self>, tx: LogSender) -> Result<()> {
+    async fn run(self: Box<Self>, tx: LogSender, shutdown: CancellationToken) -> Result<()> {
         let docker = Docker::connect_with_local_defaults()?;
         info!(container = %self.container_name, "starting docker log tail");
 
@@ -65,7 +91,12 @@ impl Source for DockerSource {
 
         let mut stream = docker.logs(&self.container_id, Some(opts));
 
-        while let Some(output) = stream.next().await {
+        loop {
+            let output = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                output = stream.next() => output,
+            };
+            let Some(output) = output else { break };
             match output {
                 Ok(log_output) => {
                     let payload = log_output.to_string();
@@ -91,6 +122,92 @@ impl Source for DockerSource {
         }
 
         info!(container = %self.container_name, "docker log tail ended");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Source for DockerAllSource {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    async fn run(self: Box<Self>, tx: LogSender, shutdown: CancellationToken) -> Result<()> {
+        let mut managed: HashMap<String, ManagedContainer> = HashMap::new();
+
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            match DockerSource::discover().await {
+                Ok(discovered) => {
+                    let active: HashSet<String> =
+                        discovered.iter().map(|s| s.container_id.clone()).collect();
+
+                    let removed: Vec<String> = managed
+                        .keys()
+                        .filter(|id| !active.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in removed {
+                        if let Some(entry) = managed.remove(&id) {
+                            entry.cancel.cancel();
+                            let _ = entry.task.await;
+                        }
+                    }
+                    managed.retain(|_, entry| !entry.task.is_finished());
+
+                    for source in discovered {
+                        if managed.contains_key(&source.container_id) {
+                            continue;
+                        }
+                        let id = source.container_id.clone();
+                        let name = source.container_name.clone();
+                        let cancel = shutdown.child_token();
+                        let child_cancel = cancel.clone();
+                        let child_tx = tx.clone();
+                        let _ = tx.send(LogRecord {
+                            timestamp: Utc::now(),
+                            source: name.clone(),
+                            level: LogLevel::Info,
+                            payload: "[tailflow] attached to Docker container".into(),
+                        });
+                        let task = tokio::spawn(async move {
+                            if let Err(e) =
+                                Box::new(source).run(child_tx.clone(), child_cancel).await
+                            {
+                                let _ = child_tx.send(LogRecord {
+                                    timestamp: Utc::now(),
+                                    source: name,
+                                    level: LogLevel::Error,
+                                    payload: format!("[tailflow] Docker log stream failed: {e}"),
+                                });
+                            }
+                        });
+                        managed.insert(id, ManagedContainer { cancel, task });
+                    }
+                }
+                Err(e) => {
+                    warn!(err = %e, "Docker discovery failed; will retry");
+                    let _ = tx.send(LogRecord {
+                        timestamp: Utc::now(),
+                        source: "docker".into(),
+                        level: LogLevel::Error,
+                        payload: format!("[tailflow] Docker discovery failed: {e}"),
+                    });
+                }
+            }
+
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+
+        for (_, entry) in managed {
+            entry.cancel.cancel();
+            let _ = entry.task.await;
+        }
         Ok(())
     }
 }

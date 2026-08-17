@@ -39,7 +39,11 @@ web/dist/*.css
 # and the release CI — never committed)
 npm/platforms/*/bin/tailflow
 npm/platforms/*/bin/tailflow-daemon
+npm/platforms/*/bin/tailflow-mcp
+npm/platforms/*/bin/tailflow-logs
 npm/platforms/*/bin/tailflow.exe
 npm/platforms/*/bin/tailflow-daemon.exe
+npm/platforms/*/bin/tailflow-mcp.exe
+npm/platforms/*/bin/tailflow-logs.exe
 npm/platforms/*/*.tgz
 npm/tailflow/*.tgz

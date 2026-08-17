@@ -2,7 +2,7 @@
 # Run `tailflow` or `tailflow-daemon` and all sources below start automatically.
 
 [sources]
-# Tail all running Docker containers
+# Continuously discover running Docker containers, including replacements
 docker = false
 
 # Treat piped stdin as a named source (only used when piping into tailflow)

@@ -74,6 +74,24 @@ async function main() {
   const username = who.json.username
   ok(`authenticates as "${username}"`)
 
+  // Token type matters more than permission level. Only classic tokens can
+  // enumerate themselves through this endpoint; a granular token is refused.
+  // Granular tokens are the ones with a separate package *selection* that can
+  // silently exclude a scope, and the ones npm has been migrating people onto
+  // — which is how a pipeline that published fine months ago starts failing
+  // without anything in the repository changing.
+  const tokens = await get('/-/npm/v1/tokens', true)
+  if (tokens.status === 200) {
+    ok('token type: classic (automation or publish)')
+  } else if (tokens.status === 401 || tokens.status === 403) {
+    bad(`token type: granular (HTTP ${tokens.status} listing tokens)`)
+    info('Granular tokens carry a "Packages and scopes" selection that is')
+    info('separate from the read/write permission level. If that selection')
+    info(`excludes ${SCOPE}, publish fails with E404 while whoami succeeds.`)
+  } else {
+    info(`token type: undetermined (HTTP ${tokens.status})`)
+  }
+
   // ── 2. Write access, from the public collaborator map ─────────────────────
   console.log('\n2. Write access to the published packages')
   let identityMismatch = false
@@ -142,16 +160,23 @@ async function main() {
   console.log('  the account is not the problem. If `npm publish` still returns')
   console.log('  E404, two causes remain — neither is visible to this script:\n')
   console.log('  1. The token is granular and its "Packages and scopes"')
-  console.log(`     selection excludes ${SCOPE}. Permission level "Read and`)
-  console.log('     write" is not sufficient on its own — the selection')
-  console.log('     controls which packages that permission applies to.')
-  console.log('     Check it on npmjs.com → Access Tokens → your token.')
+  console.log(`     selection excludes ${SCOPE}. These packages belong to the`)
+  console.log('     "thinkgrid" ORGANISATION, not to a personal account, and a')
+  console.log('     granular token set to "All packages" covers only packages')
+  console.log('     the user owns personally — org-scoped packages must be')
+  console.log('     added explicitly by selecting the organisation. Permission')
+  console.log('     level "Read and write" does not change which packages it')
+  console.log('     applies to. npmjs.com → Access Tokens → your token.')
   console.log('  2. The NPM_TOKEN secret in GitHub is not the token you just')
   console.log('     tested — e.g. it was pasted with a trailing newline, or')
   console.log('     rotated locally but never updated in the repo settings.\n')
-  console.log('  Simplest fix for both: create a classic Automation token on')
-  console.log(`  "${username}". It carries write access to everything the`)
-  console.log('  account owns, bypasses 2FA prompts, and does not expire.')
+  console.log('  Preferred fix: configure npm Trusted Publishing for each')
+  console.log('  TailFlow package, using GitHub organisation "thinkgrid-labs",')
+  console.log('  repository "tailflow", and workflow "release.yml". The release')
+  console.log('  then uses a short-lived OIDC credential and no publish token.')
+  console.log('  If retaining token fallback, replace the repository secret with')
+  console.log(`  a granular token from "${username}" that explicitly includes`)
+  console.log(`  the ${SCOPE} organisation and every TailFlow package.`)
   process.exit(0)
 }
 

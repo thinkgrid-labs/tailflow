@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-agent"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1876,13 +1876,14 @@ dependencies = [
 
 [[package]]
 name = "tailflow-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "bollard",
  "chrono",
  "futures-util",
+ "libc",
  "notify 7.0.0",
  "notify-debouncer-mini",
  "regex",
@@ -1892,13 +1893,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tracing",
 ]
 
 [[package]]
 name = "tailflow-daemon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "atty",
@@ -1913,6 +1915,7 @@ dependencies = [
  "tailflow-core",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -1921,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "atty",
@@ -1933,6 +1936,7 @@ dependencies = [
  "serde",
  "tailflow-core",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2069,6 +2073,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

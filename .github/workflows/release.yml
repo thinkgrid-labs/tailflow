@@ -195,13 +195,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to create a GitHub Release
+      id-token: write   # npm trusted publishing (short-lived OIDC credential)
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          # npm trusted publishing requires Node >=22.14 and npm >=11.5.1.
+          node-version: '24'
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Use a trusted-publishing capable npm CLI
+        run: npm install --global npm@latest
 
       # Download each platform's binaries into the right directory
       - uses: actions/download-artifact@v4
@@ -232,9 +238,10 @@ jobs:
       # Restore execute bits lost during artifact upload
       - name: Restore execute permissions
         run: |
-          find npm/platforms -name 'tailflow' -o -name 'tailflow-daemon' \
-            -o -name 'tailflow-mcp' -o -name 'tailflow-logs' \
-            | xargs -r chmod +x
+          find npm/platforms \
+            \( -name 'tailflow' -o -name 'tailflow-daemon' \
+               -o -name 'tailflow-mcp' -o -name 'tailflow-logs' \) \
+            -exec chmod +x {} +
 
       # Sync version from git tag → all package.json files
       - name: Bump version from tag
@@ -242,48 +249,15 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           node scripts/bump-version.js "$VERSION"
 
-      # Fail fast with a readable message. npm answers an unauthorised publish
-      # with 404 rather than 403 (it will not confirm that a package exists to
-      # someone who cannot write to it), so an expired token surfaces as
-      # "E404 Not Found" against a package that demonstrably does exist.
-      - name: Verify npm credentials
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::NPM_TOKEN secret is not set on this repository."
-            exit 1
-          fi
-
-          # Authentication and authorisation are separate failures here, and
-          # only the first one is legible from npm's output. A read-only token
-          # passes `whoami` and then fails `publish` with E404, because npm
-          # will not confirm that a scoped package exists to a caller that
-          # cannot write to it — so the "not found" is really "not allowed".
-          if ! WHO=$(npm whoami 2>&1); then
-            echo "::error::NPM_TOKEN is invalid, expired, or revoked (npm said: $WHO)."
-            exit 1
-          fi
-          echo "authenticated to npm as: $WHO"
-
-          # Diagnostics only — never fail the release on these. The permission
-          # strings npm reports vary between the CLI and the registry
-          # ("read-write" vs "write"), and a preflight that blocks a valid
-          # release over a formatting difference is worse than no preflight.
-          # If publishing then fails, this output is what explains why.
-          echo "--- access reported for the @thinkgrid scope ---"
-          npm access list packages @thinkgrid 2>&1 | head -20 || true
-          echo "--- collaborators on one platform package ---"
-          npm access list collaborators @thinkgrid/tailflow-darwin-arm64 2>&1 | head -10 || true
-          echo "--- if the publish below fails with E404, run locally: ---"
-          echo "      NPM_TOKEN=<the secret> node scripts/check-npm-token.js"
-
       # Publish platform packages first (main package depends on them).
       #
       # Idempotent by version: npm refuses to republish a version, so a run that
       # failed partway through would otherwise be unretryable — the platforms
       # that succeeded would abort the retry before reaching the ones that did
       # not, leaving the release permanently half-published.
+      # OIDC is preferred automatically when each package trusts
+      # thinkgrid-labs/tailflow's release.yml. NODE_AUTH_TOKEN remains only as
+      # a migration fallback for package settings not switched over yet.
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -296,7 +270,7 @@ jobs:
               continue
             fi
             echo "Publishing $pkg@$VERSION …"
-            ( cd "npm/platforms/$platform" && npm publish --access public )
+            ( cd "npm/platforms/$platform" && npm publish --access public --provenance )
           done
 
       - name: Publish main package
@@ -308,7 +282,7 @@ jobs:
             echo "tailflow@$VERSION is already published — skipping"
             exit 0
           fi
-          ( cd npm/tailflow && npm publish )
+          ( cd npm/tailflow && npm publish --access public --provenance )
 
       # Download tarballs so they can be attached to the GitHub Release
       - uses: actions/download-artifact@v4

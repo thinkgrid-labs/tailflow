@@ -21,6 +21,8 @@ pub struct App {
     pub filter_mode: bool,
     rx: LogReceiver,
     pub scroll: usize,
+    /// Sticky tail mode. Scrolling up pauses it; `G` resumes it.
+    pub follow: bool,
     pub source_colors: SourceColorMap,
     /// When true, JSON payloads are shown as flattened key=value pairs.
     pub pretty_json: bool,
@@ -73,6 +75,7 @@ impl App {
             filter_mode: false,
             rx,
             scroll: 0,
+            follow: true,
             source_colors: SourceColorMap::new(),
             pretty_json: false,
         }
@@ -140,12 +143,15 @@ impl App {
                         // Scroll
                         (false, KeyCode::Down) | (false, KeyCode::Char('j')) => {
                             self.scroll = self.scroll.saturating_add(1);
+                            self.follow = false;
                         }
                         (false, KeyCode::Up) | (false, KeyCode::Char('k')) => {
                             self.scroll = self.scroll.saturating_sub(1);
+                            self.follow = false;
                         }
                         (false, KeyCode::Char('G')) => {
-                            self.scroll = usize::MAX; // snap to bottom on next render
+                            self.follow = true;
+                            self.scroll = usize::MAX;
                         }
 
                         // Toggle JSON pretty-printing
@@ -160,6 +166,7 @@ impl App {
                         (true, KeyCode::Enter) => {
                             self.filter_mode = false;
                             self.scroll = usize::MAX;
+                            self.follow = true;
                         }
                         (true, KeyCode::Backspace) => {
                             self.filter.pop();

@@ -1,4 +1,4 @@
-use crate::{LogLevel, LogReceiver, LogRecord};
+use crate::{query::SeqRecord, LogLevel, LogReceiver, LogRecord};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use tokio::sync::broadcast;
@@ -48,24 +48,48 @@ impl Filter {
 
     /// Returns `true` if the record passes all active filters.
     pub fn matches(&self, record: &LogRecord) -> bool {
+        self.matches_fields(
+            &record.source,
+            record.level,
+            record.timestamp,
+            &record.payload,
+        )
+    }
+
+    pub fn matches_seq(&self, record: &SeqRecord) -> bool {
+        self.matches_fields(
+            &record.source,
+            record.level,
+            record.timestamp,
+            &record.payload,
+        )
+    }
+
+    fn matches_fields(
+        &self,
+        source: &str,
+        level: LogLevel,
+        timestamp: DateTime<Utc>,
+        payload: &str,
+    ) -> bool {
         if let Some(src) = &self.source {
-            if !record.source.contains(src.as_str()) {
+            if !source.contains(src.as_str()) {
                 return false;
             }
         }
         if let Some(min) = self.min_level {
-            if record.level.severity() < min.severity() {
+            if level.severity() < min.severity() {
                 return false;
             }
         }
         if let Some(since) = self.since {
-            if record.timestamp < since {
+            if timestamp < since {
                 return false;
             }
         }
         match &self.grep {
             None => true,
-            Some(re) => re.is_match(&record.payload),
+            Some(re) => re.is_match(payload),
         }
     }
 }

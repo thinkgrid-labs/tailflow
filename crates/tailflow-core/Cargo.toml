@@ -2,11 +2,13 @@
 name = "tailflow-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -27,6 +29,7 @@ toml = "0.8"
 # Async trait support
 async-trait = "0.1"
 futures-util = "0.3"
+libc = "0.2"
 
 # Regex (used in processor)
 regex = "1"

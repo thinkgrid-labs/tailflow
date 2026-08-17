@@ -26,7 +26,7 @@ This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.
 
 ### Prerequisites
 
-- **Rust 1.75+** — install via [rustup](https://rustup.rs)
+- **Rust 1.88+** — install via [rustup](https://rustup.rs)
 - **Node.js 20+** — only needed if you are working on the web dashboard
 - **Docker** (optional) — for testing Docker log ingestion
 

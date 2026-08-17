@@ -5,9 +5,9 @@
 [![Crates.io](https://img.shields.io/crates/v/tailflow-core?color=f74c00)](https://crates.io/crates/tailflow-core)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Your AI agent writes code it cannot see running.** TailFlow aggregates every log
-your local stack produces — Docker containers, dev servers, background workers,
-log files — and serves them to the agent over MCP, deduplicated and bounded.
+**Your AI agent writes code it cannot see running.** TailFlow captures the local
+sources you configure — Docker containers, dev servers, background workers and
+log files — and serves their output to the agent over MCP, deduplicated and bounded.
 
 ```bash
 npm install -g tailflow
@@ -116,8 +116,10 @@ api    122 records    41 err     0 warn  last 14:07:33  ERROR Cannot find module
 web      3 records     0 err     1 warn  last 14:07:33  WARN slow render: 1240ms
 ```
 
-This is the tool that stops an agent declaring success over a dead stack: a
-service that never started is visibly absent, rather than merely quiet.
+This is the tool that stops an agent declaring success over a dead stack:
+configured sources report `starting`, `running`, `exited`, or `failed`, including
+quiet services that have not emitted a line. Docker containers discovered from
+the stream are marked `observed`; the Docker supervisor carries the live status.
 
 ### `search_logs` — the exact sequence of events
 
@@ -137,7 +139,7 @@ that serves them to your agent.
 
 ```toml
 [sources]
-docker = true                      # every running container
+docker = true                      # running containers, including later replacements
 
 [[sources.process]]
 label = "web"
@@ -211,7 +213,7 @@ Exit codes are meaningful, so a script can branch without parsing stdout:
 
 ## For Humans: TUI and Web Dashboard
 
-The same daemon still drives the interactive views. Nothing here changed.
+The same ingestion engine also drives interactive views.
 
 ```bash
 tailflow                 # color-coded TUI over your whole stack
@@ -222,8 +224,8 @@ npm run dev | tailflow   # or one piped process
 | Key | Action |
 |---|---|
 | `/` | Filter (substring or regex, matched against payload and source) |
-| `j` `k` / `↓` `↑` | Scroll |
-| `G` | Jump to latest |
+| `j` `k` / `↓` `↑` | Scroll and pause follow mode |
+| `G` | Resume following at the latest line |
 | `p` | Toggle JSON pretty-printing |
 | `q` / `Ctrl-C` | Quit |
 
@@ -261,7 +263,7 @@ curl -fsSL https://github.com/thinkgrid-labs/tailflow/releases/latest/download/t
 
 Substitute `darwin-x64`, `linux-x64`, or `linux-arm64` as appropriate.
 
-### From source — Rust 1.75+
+### From source — Rust 1.88+
 
 ```bash
 git clone https://github.com/thinkgrid-labs/tailflow.git
@@ -281,7 +283,7 @@ the file already defines.
 
 ```toml
 [sources]
-docker = false           # tail all running containers
+docker = false           # continuously discover running containers when enabled
 # stdin = "pipe"         # label piped stdin (only when stdin is not a TTY)
 
 [[sources.file]]
@@ -325,6 +327,9 @@ Shared parameters: `grep` (regex), `source` (substring), `level`
 (`trace`…`error`), `since` (`30s`/`5m`/`2h`/`1d` or RFC 3339), `limit`, `cursor`.
 Invalid arguments return **400 with an explanation** — never a silently empty
 result, which a caller that can't see the screen would misread as "all clear".
+Agent responses also report `cursor_gap` when a requested cursor predates the
+bounded ring buffer or belongs to an earlier daemon lifetime. The HTTP server
+binds to loopback and rejects non-loopback Host headers; it is not a remote log API.
 
 Full reference: [docs/agents.md](docs/agents.md).
 

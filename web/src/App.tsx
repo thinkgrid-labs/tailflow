@@ -154,7 +154,7 @@ export function App() {
         />
 
         <div class="feed" ref={feedRef}>
-          {filtered.map((r, i) => <LogRow key={i} record={r} />)}
+          {filtered.map(r => <LogRow key={r.seq} record={r} />)}
           <div ref={sentinelRef} class="sentinel" />
 
           {!atBottom && (

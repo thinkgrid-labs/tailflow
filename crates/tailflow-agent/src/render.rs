@@ -76,10 +76,11 @@ pub fn errors(v: &Value) -> String {
         } else {
             format!(" ({h})")
         };
+        let gap = cursor_gap_note(v);
         return format!(
             "No matching errors{suffix}.\n\
              If you expected output, check `list_log_sources` — a source that never \
-             started produces no logs to fail on.\ncursor {cursor}"
+             started produces no logs to fail on.\n{gap}cursor {cursor}"
         );
     }
 
@@ -94,6 +95,7 @@ pub fn errors(v: &Value) -> String {
         out.push_str(&format!(" · {h}"));
     }
     out.push_str(&format!(" · cursor {cursor}\n"));
+    out.push_str(&cursor_gap_note(v));
 
     if v.get("truncated").and_then(Value::as_bool) == Some(true) {
         out.push_str(&format!(
@@ -147,10 +149,11 @@ pub fn records(v: &Value) -> String {
     let cursor = n(v, "next_cursor");
 
     if recs.is_empty() {
-        return format!("No matching records. cursor {cursor}");
+        return format!("No matching records. {}cursor {cursor}", cursor_gap_note(v));
     }
 
     let mut out = String::new();
+    out.push_str(&cursor_gap_note(v));
     if v.get("truncated").and_then(Value::as_bool) == Some(true) {
         out.push_str(&format!(
             "{} of {total} matching records (newest kept — narrow the filter or raise `limit`) · cursor {cursor}\n",
@@ -221,13 +224,18 @@ pub fn sources(v: &Value) -> String {
         let errors = n(src, "errors");
         let warns = n(src, "warns");
         out.push_str(&format!(
-            "{:<width$}  {:>5} records  {:>4} err  {:>4} warn  last {}  {}\n",
+            "{:<width$}  {:<8} {:>5} records  {:>4} err  {:>4} warn  last {}  {}{}\n",
             s(src, "name"),
+            s(src, "status"),
             n(src, "total"),
             errors,
             warns,
             short_time(src.get("last_seen")),
             truncate(s(src, "last_line"), 80),
+            src.get("detail")
+                .and_then(Value::as_str)
+                .map(|d| format!(" · {}", truncate(d, 80)))
+                .unwrap_or_default(),
             width = width,
         ));
     }
@@ -256,6 +264,15 @@ fn plural(n: u64) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+fn cursor_gap_note(v: &Value) -> String {
+    if v.get("cursor_gap").and_then(Value::as_bool) == Some(true) {
+        let start = n(v, "buffer_start_cursor");
+        format!("WARNING: cursor history has a gap; oldest retained cursor is {start}.\n")
+    } else {
+        String::new()
     }
 }
 

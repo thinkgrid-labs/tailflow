@@ -6,9 +6,10 @@ use clap::Parser;
 use std::path::PathBuf;
 use tailflow_core::{
     config::Config,
-    ingestion::{docker::DockerSource, file::FileSource, stdin::StdinSource, Source},
+    ingestion::{docker::DockerAllSource, file::FileSource, stdin::StdinSource, Source},
     new_bus,
 };
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -56,13 +57,7 @@ async fn main() -> Result<()> {
 
     // CLI flags are additive on top of config
     if cli.docker {
-        let containers = DockerSource::discover().await?;
-        if containers.is_empty() {
-            eprintln!("tailflow: no running Docker containers found");
-        }
-        for src in containers {
-            sources.push(Box::new(src));
-        }
+        sources.push(Box::new(DockerAllSource::new()));
     }
 
     for path in cli.files {
@@ -82,18 +77,42 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    let shutdown = CancellationToken::new();
+    let mut source_tasks = Vec::new();
     for source in sources {
         let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = source.run(tx_clone).await {
+        let source_shutdown = shutdown.child_token();
+        source_tasks.push(tokio::spawn(async move {
+            if let Err(e) = source.run(tx_clone, source_shutdown).await {
                 tracing::error!(err = %e, "source error");
             }
-        });
+        }));
     }
     drop(tx);
+    let source_aborts: Vec<_> = source_tasks
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
 
     let mut app = app::App::new(rx);
-    app.run().await?;
+    let result = app.run().await;
+    shutdown.cancel();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        for task in source_tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(err = ?error, "source task did not shut down cleanly");
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("timed out waiting for source shutdown");
+        for abort in source_aborts {
+            abort.abort();
+        }
+    }
+    result?;
 
     Ok(())
 }

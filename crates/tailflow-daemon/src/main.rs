@@ -6,10 +6,11 @@ use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
 use tailflow_core::{
     config::Config,
-    ingestion::{docker::DockerSource, file::FileSource, stdin::StdinSource, Source},
+    ingestion::{docker::DockerAllSource, file::FileSource, stdin::StdinSource, Source},
     new_bus,
     processor::{filtered_bus, Filter},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -81,9 +82,7 @@ async fn main() -> Result<()> {
 
     // CLI overrides / additions
     if cli.docker {
-        for c in DockerSource::discover().await? {
-            sources.push(Box::new(c));
-        }
+        sources.push(Box::new(DockerAllSource::new()));
     }
     for path in cli.files {
         sources.push(Box::new(FileSource::new(path)));
@@ -99,16 +98,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    for source in sources {
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = source.run(tx_clone).await {
-                tracing::error!(err = %e, "source error");
-            }
-        });
-    }
-    drop(tx);
-
     // Apply global CLI filters before records enter the ring buffer / SSE bus.
     let rx = {
         let mut filter = match cli.grep.as_deref() {
@@ -123,8 +112,38 @@ async fn main() -> Result<()> {
         }
         filtered_bus(rx, filter)
     };
-
     let shared = state::AppState::new(rx, cli.buffer.max(1));
+
+    let shutdown = CancellationToken::new();
+    let mut source_tasks = Vec::new();
+    for source in sources {
+        let name = source.name().to_string();
+        shared.register_source(&name);
+        let tx_clone = tx.clone();
+        let shared = shared.clone();
+        let source_shutdown = shutdown.child_token();
+        source_tasks.push(tokio::spawn(async move {
+            shared.mark_source_running(&name);
+            match source.run(tx_clone.clone(), source_shutdown).await {
+                Ok(()) => shared.mark_source_exited(&name, None),
+                Err(e) => {
+                    tracing::error!(source = %name, err = %e, "source error");
+                    shared.mark_source_exited(&name, Some(e.to_string()));
+                    let _ = tx_clone.send(tailflow_core::LogRecord {
+                        timestamp: chrono::Utc::now(),
+                        source: name,
+                        level: tailflow_core::LogLevel::Error,
+                        payload: format!("[tailflow] source failed: {e}"),
+                    });
+                }
+            }
+        }));
+    }
+    drop(tx);
+    let source_aborts: Vec<_> = source_tasks
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
     let app = routes::router(shared);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
@@ -134,7 +153,29 @@ async fn main() -> Result<()> {
     eprintln!("                 agent API   http://{addr}/api/errors");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let shutdown_signal = shutdown.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal.cancel();
+        })
+        .await?;
+    shutdown.cancel();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        for task in source_tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(err = ?error, "source task did not shut down cleanly");
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("timed out waiting for source shutdown");
+        for abort in source_aborts {
+            abort.abort();
+        }
+    }
 
     Ok(())
 }

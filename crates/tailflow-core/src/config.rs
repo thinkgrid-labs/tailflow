@@ -1,5 +1,5 @@
 use crate::ingestion::{
-    docker::DockerSource, file::FileSource, process::ProcessSource, stdin::StdinSource, Source,
+    docker::DockerAllSource, file::FileSource, process::ProcessSource, stdin::StdinSource, Source,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -91,10 +91,7 @@ impl Config {
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
 
         if self.sources.docker {
-            let containers = DockerSource::discover().await?;
-            for c in containers {
-                sources.push(Box::new(c));
-            }
+            sources.push(Box::new(DockerAllSource::new()));
         }
 
         for entry in self.sources.file {

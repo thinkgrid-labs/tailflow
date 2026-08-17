@@ -1,7 +1,8 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Query as AxumQuery, State},
+    extract::{Query as AxumQuery, Request, State},
     http::{header, StatusCode, Uri},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json, Response,
@@ -19,7 +20,6 @@ use tailflow_core::{
     LogLevel,
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
-use tower_http::cors::CorsLayer;
 
 /// The compiled web UI, embedded at build time from `../../web/dist`.
 /// Run `npm run build` in the `web/` directory before `cargo build`.
@@ -40,8 +40,31 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         // Everything else → embedded web UI
         .fallback(static_handler)
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(validate_local_host))
         .with_state(state)
+}
+
+async fn validate_local_host(request: Request, next: Next) -> Response {
+    let allowed = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|host| {
+            host == "localhost"
+                || host.starts_with("localhost:")
+                || host == "127.0.0.1"
+                || host.starts_with("127.0.0.1:")
+                || host == "[::1]"
+                || host.starts_with("[::1]:")
+        });
+    if !allowed {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "TailFlow accepts loopback Host headers only",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 // ── Shared filter params ──────────────────────────────────────────────────────
@@ -85,7 +108,7 @@ async fn sse_handler(
     let filter = params.into_filter();
     let rx = state.tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
-        Ok(record) if filter.matches(&record) => match serde_json::to_string(&record) {
+        Ok(record) if filter.matches_seq(&record) => match serde_json::to_string(&record) {
             Ok(data) => Some(Ok(Event::default().data(data))),
             Err(e) => {
                 tracing::error!(err = %e, "failed to serialize log record for SSE");
@@ -157,6 +180,7 @@ struct AgentParams {
 const MAX_LIMIT: usize = 1_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_CONTEXT_LINES: usize = 50;
+const MAX_PAYLOAD_CHARS: usize = 10_000;
 
 struct ApiError(StatusCode, String);
 
@@ -205,7 +229,11 @@ impl AgentParams {
         Ok(Query::new(self.build_filter()?)
             .with_limit(self.limit.unwrap_or(default_limit).clamp(1, MAX_LIMIT))
             .with_cursor(self.cursor)
-            .with_max_payload_chars(self.max_payload_chars.unwrap_or(DEFAULT_MAX_PAYLOAD_CHARS)))
+            .with_max_payload_chars(
+                self.max_payload_chars
+                    .unwrap_or(DEFAULT_MAX_PAYLOAD_CHARS)
+                    .clamp(1, MAX_PAYLOAD_CHARS),
+            ))
     }
 }
 
@@ -242,7 +270,7 @@ async fn errors_handler(
 
 async fn sources_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "sources": state.store.sources(),
+        "sources": state.source_views(),
         "buffered": state.store.len(),
         "cursor": state.store.cursor(),
     }))
@@ -266,60 +294,84 @@ async fn wait_handler(
     // two is caught by the subscription instead of falling through the gap.
     let mut rx = state.tx.subscribe();
 
-    let existing = state.store.records(&q);
-    if !existing.records.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "matched": true,
-            "records": existing.records,
-            "total_matching": existing.total_matching,
-            "truncated": existing.truncated,
-            "next_cursor": existing.next_cursor,
-            "waited_ms": 0,
-        })));
+    let snapshot = state.store.cursor();
+    if let Some(anchor) = state.store.latest_matching_seq(&q) {
+        let result = state
+            .store
+            .records_from(anchor, q.limit, q.max_payload_chars);
+        return Ok(Json(wait_result(true, result, 0)));
     }
 
     let deadline = Duration::from_millis(timeout_ms);
-    let matched = tokio::time::timeout(deadline, async {
+    let matched_seq = tokio::time::timeout(deadline, async {
         loop {
             match rx.recv().await {
-                Ok(record) if q.filter.matches(&record) => return true,
+                Ok(record)
+                    if record.seq > snapshot
+                        && q.cursor.is_none_or(|cursor| record.seq > cursor)
+                        && q.filter.matches_seq(&record) =>
+                {
+                    return Some(record.seq)
+                }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "wait subscriber lagged");
+                    if let Some(anchor) = state.store.latest_matching_seq(&q) {
+                        return Some(anchor);
+                    }
                     continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
     })
     .await
-    .unwrap_or(false);
+    .unwrap_or(None);
 
-    if !matched {
+    let Some(anchor) = matched_seq else {
+        let horizon = state.store.records(&q);
         return Ok(Json(serde_json::json!({
             "matched": false,
             "records": [],
             "total_matching": 0,
             "truncated": false,
-            "next_cursor": state.store.cursor(),
+            "next_cursor": horizon.next_cursor,
+            "buffer_start_cursor": horizon.buffer_start_cursor,
+            "cursor_gap": horizon.cursor_gap,
             "waited_ms": started.elapsed().as_millis() as u64,
         })));
-    }
+    };
 
     // A failure rarely arrives as one line. Let the rest of the burst — the
     // stack trace, the retry, the cascading downstream error — land before
     // answering, so the caller gets the whole event in one round trip.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let result = state.store.records(&q);
-    Ok(Json(serde_json::json!({
-        "matched": true,
+    let result = state
+        .store
+        .records_from(anchor, q.limit, q.max_payload_chars);
+    Ok(Json(wait_result(
+        true,
+        result,
+        started.elapsed().as_millis() as u64,
+    )))
+}
+
+fn wait_result(
+    matched: bool,
+    result: tailflow_core::query::QueryResult,
+    waited_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "matched": matched,
         "records": result.records,
         "total_matching": result.total_matching,
         "truncated": result.truncated,
         "next_cursor": result.next_cursor,
-        "waited_ms": started.elapsed().as_millis() as u64,
-    })))
+        "buffer_start_cursor": result.buffer_start_cursor,
+        "cursor_gap": result.cursor_gap,
+        "waited_ms": waited_ms,
+    })
 }
 
 // ── Static file server ────────────────────────────────────────────────────────
@@ -356,21 +408,21 @@ mod tests {
     use axum::http::Request;
     use chrono::Utc;
     use http_body_util::BodyExt;
-    use tailflow_core::{query::LogStore, LogRecord};
+    use tailflow_core::LogRecord;
     use tower::ServiceExt;
 
     fn state_with(records: Vec<(&str, LogLevel, &str)>) -> Arc<AppState> {
-        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
-        let store = Arc::new(LogStore::new(1000));
+        let (_source_tx, source_rx) = tailflow_core::new_bus();
+        let state = AppState::new(source_rx, 1000);
         for (source, level, payload) in records {
-            store.push(LogRecord {
+            state.store.push(LogRecord {
                 timestamp: Utc::now(),
                 source: source.into(),
                 level,
                 payload: payload.into(),
             });
         }
-        Arc::new(AppState { tx, store })
+        state
     }
 
     async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -453,6 +505,13 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("since"));
     }
 
+    #[tokio::test]
+    async fn unicode_since_is_rejected_without_panicking() {
+        let (status, body) = get(flood(), "/api/query?since=%F0%9F%95%92").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("since"));
+    }
+
     // ── /api/query ────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -501,6 +560,20 @@ mod tests {
         assert_eq!(human[0]["payload"].as_str().unwrap().len(), 9_000);
     }
 
+    #[tokio::test]
+    async fn query_clamps_requested_payload_limit() {
+        let state = state_with(vec![("api", LogLevel::Info, &"x".repeat(12_000))]);
+        let (_, body) = get(state, "/api/query?max_payload_chars=999999999").await;
+        let payload = body["records"][0]["payload"].as_str().unwrap();
+        assert_eq!(
+            payload.chars().take(MAX_PAYLOAD_CHARS).count(),
+            MAX_PAYLOAD_CHARS
+        );
+        assert!(payload.ends_with("… [+2000 chars]"));
+        assert!(payload.chars().count() < 12_000);
+        assert_eq!(body["records"][0]["payload_truncated_from"], 12_000);
+    }
+
     // ── /api/sources ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -533,6 +606,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_timeout_reports_an_invalid_cursor_horizon() {
+        let (_, body) = get(flood(), "/api/wait?cursor=999999&timeout_ms=1").await;
+        assert_eq!(body["matched"], false);
+        assert_eq!(body["cursor_gap"], true);
+        assert!(body["buffer_start_cursor"].as_u64().is_some());
+    }
+
+    #[tokio::test]
     async fn wait_wakes_on_a_record_published_after_the_call_starts() {
         let state = state_with(vec![]);
         let publisher = state.clone();
@@ -544,7 +625,7 @@ mod tests {
                 level: LogLevel::Error,
                 payload: "ERROR deploy failed".into(),
             };
-            publisher.store.push(record.clone());
+            let record = publisher.store.push(record);
             let _ = publisher.tx.send(record);
         });
 
@@ -562,5 +643,79 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["buffered"], 32);
         assert!(body["cursor"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_unfiltered_burst_after_matching_anchor() {
+        let state = state_with(vec![]);
+        let publisher = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for (level, payload) in [
+                (LogLevel::Error, "ERROR deploy failed"),
+                (LogLevel::Unknown, "    at deploy.js:10:2"),
+                (LogLevel::Info, "worker stopped"),
+            ] {
+                let record = publisher.store.push(LogRecord {
+                    timestamp: Utc::now(),
+                    source: "api".into(),
+                    level,
+                    payload: payload.into(),
+                });
+                let _ = publisher.tx.send(record);
+            }
+        });
+        let (_, body) = get(state, "/api/wait?grep=deploy%20failed&timeout_ms=2000").await;
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "the trigger filter must not remove burst context"
+        );
+        assert!(records[1]["payload"]
+            .as_str()
+            .unwrap()
+            .contains("deploy.js"));
+    }
+
+    #[tokio::test]
+    async fn sources_include_configured_sources_that_have_no_records() {
+        let state = state_with(vec![]);
+        state.register_source("quiet-api");
+        state.mark_source_running("quiet-api");
+        let (_, body) = get(state, "/api/sources").await;
+        assert_eq!(body["sources"][0]["name"], "quiet-api");
+        assert_eq!(body["sources"][0]["status"], "running");
+        assert_eq!(body["sources"][0]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn hostile_host_header_is_rejected_and_cors_is_not_permissive() {
+        let response = router(state_with(vec![]))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        let response = router(state_with(vec![]))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "127.0.0.1:7878")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
     }
 }

@@ -1,9 +1,8 @@
 //! Model Context Protocol server over stdio.
 //!
-//! Implements the JSON-RPC 2.0 subset MCP needs for a tools-only server:
-//! `initialize`, `tools/list`, `tools/call`, `ping`, and the `initialized`
-//! notification. That is a few hundred lines against a stable wire format —
-//! cheaper than an SDK dependency for two binaries that ship over npm.
+//! A dual-era tools-only server: modern clients use per-request metadata and
+//! `server/discover`; legacy clients use `initialize`. Keeping the wire layer
+//! here avoids pulling the ingestion dependency tree into either agent binary.
 
 use crate::client::{ClientError, DaemonClient};
 use crate::ops::{self, ErrorsArgs, SearchArgs, WaitArgs};
@@ -12,8 +11,9 @@ use serde_json::{json, Value};
 
 /// Protocol revisions this server speaks. The client's requested version is
 /// echoed back when we know it, per the negotiation rule in the spec.
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-pub const LATEST_PROTOCOL: &str = "2025-06-18";
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub const LATEST_PROTOCOL: &str = "2025-11-25";
+pub const MODERN_PROTOCOL: &str = "2026-07-28";
 
 pub const SERVER_NAME: &str = "tailflow";
 
@@ -22,6 +22,8 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
 pub struct Server {
     client: DaemonClient,
@@ -37,8 +39,11 @@ impl Server {
     /// Returns `None` for notifications — a JSON-RPC notification has no `id`
     /// and must not be answered. Replying to one desynchronises strict clients.
     pub async fn handle(&self, msg: Value) -> Option<Value> {
-        let method = msg.get("method").and_then(Value::as_str)?.to_string();
         let id = msg.get("id").cloned();
+        let method = match msg.get("method").and_then(Value::as_str) {
+            Some(method) => method.to_string(),
+            None => return Some(invalid_request("request requires a string `method`")),
+        };
         let params = msg.get("params").cloned().unwrap_or(json!({}));
 
         // No id → notification. Nothing to do for any we currently accept.
@@ -47,24 +52,61 @@ impl Server {
             _ => return None,
         };
 
+        let requested_protocol = request_protocol(&params);
+        if let Some(version) = requested_protocol {
+            if version != MODERN_PROTOCOL {
+                return Some(rpc_error_response(
+                    id,
+                    RpcError {
+                        code: UNSUPPORTED_PROTOCOL_VERSION,
+                        message: "Unsupported protocol version".into(),
+                        data: Some(json!({
+                            "supported": [MODERN_PROTOCOL, LATEST_PROTOCOL],
+                            "requested": version,
+                        })),
+                    },
+                ));
+            }
+            if !has_client_capabilities(&params) {
+                return Some(rpc_error_response(
+                    id,
+                    RpcError {
+                        code: MISSING_REQUIRED_CLIENT_CAPABILITY,
+                        message: "Missing required client capability metadata".into(),
+                        data: Some(json!({
+                            "required": "io.modelcontextprotocol/clientCapabilities"
+                        })),
+                    },
+                ));
+            }
+        }
+        let modern = requested_protocol == Some(MODERN_PROTOCOL);
+
         let result = match method.as_str() {
             "initialize" => Ok(self.initialize(&params)),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+            "server/discover" => Ok(self.discover()),
+            "tools/list" => Ok(if modern {
+                json!({ "tools": tool_definitions(), "ttlMs": 300_000, "cacheScope": "public" })
+            } else {
+                json!({ "tools": tool_definitions() })
+            }),
             "tools/call" => self.call_tool(&params).await,
             "ping" => Ok(json!({})),
             other => Err(RpcError {
                 code: METHOD_NOT_FOUND,
                 message: format!("unknown method: {other}"),
+                data: None,
             }),
         };
 
         Some(match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(e) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": e.code, "message": e.message }
-            }),
+            Ok(mut result) => {
+                if modern || method == "server/discover" {
+                    stamp_modern_result(&mut result);
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            }
+            Err(e) => rpc_error_response(id, e),
         })
     }
 
@@ -82,16 +124,29 @@ impl Server {
                 "name": SERVER_NAME,
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": format!(
-                "Reads the live local development stack aggregated by a TailFlow daemon at {}. \
-                 Use it to see what a running service actually printed — build failures, \
-                 request errors, panics, stack traces — instead of guessing from source code. \
-                 After changing code and triggering a rebuild or request, call wait_for_logs to \
-                 be woken the moment something matches, then get_recent_errors to read what \
-                 broke. Timestamps are local to the developer's machine.",
-                self.client.url()
-            ),
+            "instructions": self.instructions(),
         })
+    }
+
+    fn discover(&self) -> Value {
+        json!({
+            "resultType": "complete",
+            "supportedVersions": [MODERN_PROTOCOL],
+            "capabilities": { "tools": { "listChanged": false } },
+            "instructions": self.instructions(),
+            "ttlMs": 300_000,
+            "cacheScope": "public",
+        })
+    }
+
+    fn instructions(&self) -> String {
+        format!(
+            "Reads the live local development stack aggregated by a TailFlow daemon at {}. \
+             Use it to verify runtime behavior after code changes. Call list_log_sources first, \
+             use wait_for_logs with a snapshot cursor for asynchronous work, and use \
+             get_recent_errors for deduplicated failures.",
+            self.client.url()
+        )
     }
 
     async fn call_tool(&self, params: &Value) -> Result<Value, RpcError> {
@@ -101,6 +156,7 @@ impl Server {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "tools/call requires a `name`".into(),
+                data: None,
             })?;
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -117,12 +173,16 @@ impl Server {
                 return Err(RpcError {
                     code: INVALID_PARAMS,
                     message: format!("unknown tool: {other}"),
+                    data: None,
                 })
             }
         };
 
         Ok(match outcome {
-            Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+            Ok(text) => json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+            }),
             Err(e) => json!({
                 "content": [{ "type": "text", "text": e.to_string() }],
                 "isError": true,
@@ -177,6 +237,36 @@ impl Server {
     }
 }
 
+fn request_protocol(params: &Value) -> Option<&str> {
+    params
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+}
+
+fn has_client_capabilities(params: &Value) -> bool {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .is_some_and(Value::is_object)
+}
+
+fn stamp_modern_result(result: &mut Value) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("resultType")
+        .or_insert_with(|| json!("complete"));
+    let meta = object.entry("_meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(
+            "io.modelcontextprotocol/serverInfo".into(),
+            json!({ "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }),
+        );
+    }
+}
+
 /// Render as compact text unless the caller explicitly asked for JSON.
 fn finish(args: &Value, v: Value, renderer: fn(&Value) -> String) -> String {
     if str_arg(args, "format").as_deref() == Some("json") {
@@ -205,6 +295,15 @@ fn num_arg(args: &Value, key: &str) -> Option<u64> {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    pub data: Option<Value>,
+}
+
+fn rpc_error_response(id: Value, error: RpcError) -> Value {
+    let mut detail = json!({ "code": error.code, "message": error.message });
+    if let Some(data) = error.data {
+        detail["data"] = data;
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "error": detail })
 }
 
 /// Build a JSON-RPC error for a message that could not even be parsed.
@@ -366,6 +465,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res["result"]["protocolVersion"], LATEST_PROTOCOL);
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_advertises_current_protocol_and_identity() {
+        let res = server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": "discover", "method": "server/discover",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["result"]["supportedVersions"][0], MODERN_PROTOCOL);
+        assert_eq!(res["result"]["resultType"], "complete");
+        assert_eq!(res["result"]["cacheScope"], "public");
+        assert!(res["result"]["ttlMs"].as_u64().unwrap() > 0);
+        assert_eq!(
+            res["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            SERVER_NAME
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_tool_list_is_cacheable_and_stamped() {
+        let res = server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["result"]["cacheScope"], "public");
+        assert!(res["result"]["ttlMs"].as_u64().unwrap() > 0);
+        assert_eq!(res["result"]["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn modern_requests_reject_unsupported_versions() {
+        let res = server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(res["error"]["data"]["requested"], "2099-01-01");
+        assert!(res["error"]["data"]["supported"].is_array());
+    }
+
+    #[tokio::test]
+    async fn modern_requests_require_client_capabilities() {
+        let res = server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL
+                }}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["error"]["code"], MISSING_REQUIRED_CLIENT_CAPABILITY);
     }
 
     #[tokio::test]

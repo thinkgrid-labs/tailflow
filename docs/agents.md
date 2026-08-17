@@ -71,8 +71,11 @@ the compact text rendering.
 
 ### `list_log_sources`
 
-No arguments. Returns each source with record, error and warning counts, its last
-activity time, and its most recent line.
+No arguments. Returns each source with runtime status, record, error and warning
+counts, its last activity time, and its most recent line. Configured sources use
+`starting`, `running`, `exited`, or `failed`; dynamically discovered sources are
+`observed` when the daemon has records but cannot prove current liveness from the
+ring buffer alone.
 
 Call it first in a session. It is the only tool that distinguishes **"the service
 is quiet"** from **"the service never started"** — both produce an empty error
@@ -121,7 +124,9 @@ startup ordering, a request's lifecycle, what a process printed before it died.
 | `limit` | int | 100 | Maximum lines returned |
 
 Blocks server-side until a match arrives, then waits 250 ms more to collect the
-rest of the burst — a failure is rarely one line — and returns everything at once.
+rest of the burst — a failure is rarely one line — and returns the unfiltered
+lines from that matching record onward. The trigger filter chooses when to wake;
+it does not discard stack frames that follow.
 
 If a match already exists in the buffer, it returns immediately with
 `waited_ms: 0`. **Pass a `cursor`** when you only care about events caused by an
@@ -220,7 +225,7 @@ All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
 | `since` | `/api/errors`, `/api/query` | `30s`/`5m`/`2h`/`1d` or RFC 3339 |
 | `limit` | all | Max records or groups (capped at 1000) |
 | `cursor` | all | Only records with `seq >` this |
-| `max_payload_chars` | `/api/errors`, `/api/query` | Per-line elision cap (default 2000) |
+| `max_payload_chars` | `/api/errors`, `/api/query` | Per-line elision cap (default 2000, max 10000) |
 | `context_lines` | `/api/errors` | Trailing context per group (max 50) |
 | `timeout_ms` | `/api/wait` | Long-poll deadline (max 120000) |
 
@@ -245,7 +250,9 @@ An invalid `grep`, `level`, or `since` returns **400** with
   "distinct": 2,
   "truncated": false,
   "buffer_starts_at": "2026-08-06T14:07:31.001Z",
-  "next_cursor": 125
+  "next_cursor": 125,
+  "buffer_start_cursor": 1,
+  "cursor_gap": false
 }
 ```
 
@@ -264,7 +271,9 @@ An invalid `grep`, `level`, or `since` returns **400** with
   }],
   "total_matching": 41,
   "truncated": true,
-  "next_cursor": 125
+  "next_cursor": 125,
+  "buffer_start_cursor": 1,
+  "cursor_gap": false
 }
 ```
 
@@ -276,16 +285,18 @@ original character count.
 ```json
 {
   "sources": [{
-    "name": "api", "total": 122, "errors": 41, "warns": 0,
+    "name": "api", "status": "running",
+    "total": 122, "errors": 41, "warns": 0,
     "last_seen": "2026-08-06T14:07:33.891Z",
-    "last_line": "ERROR Cannot find module \"@reko/pricing\""
+    "last_line": "ERROR Cannot find module \"@reko/pricing\"",
+    "status_changed_at": "2026-08-06T14:07:20.000Z"
   }],
   "buffered": 125,
   "cursor": 125
 }
 ```
 
-Sorted by error count, then volume.
+Sorted by runtime status, then error count and name.
 
 ### `GET /api/wait`
 
@@ -294,7 +305,7 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.2.0", "buffered": 125, "cursor": 125 }
+{ "ok": true, "version": "0.3.1", "buffered": 125, "cursor": 125 }
 ```
 
 ---
@@ -340,10 +351,14 @@ interleaved from other services is skipped rather than treated as a terminator.
 ### Cursors
 
 Every response carries `next_cursor`, a monotonic sequence number. Passing it
-back as `cursor` returns exactly what arrived since — no timestamp-collision
-double-reads, no gaps. This is what makes polling a live stack cheap.
+back as `cursor` returns what arrived since without timestamp-collision
+double-reads. This is what makes polling a live stack cheap.
 
-Cursors are per-daemon and reset when the daemon restarts.
+Cursors are per-daemon and reset when the daemon restarts. Because the buffer is
+bounded, an old cursor can also fall behind its oldest retained record. In both
+cases `cursor_gap: true` makes the loss explicit and `buffer_start_cursor` says
+where complete history begins; callers should refresh their baseline instead of
+claiming the incremental read was exact.
 
 ### Failing loudly
 
@@ -360,7 +375,7 @@ validated, and every failure explains what was expected.
 Three independent limits keep a single query from flooding a context window:
 
 - `limit` on records or groups, capped at 1000 server-side
-- `max_payload_chars` per line (default 2000), with the elision marked
+- `max_payload_chars` per line (default 2000, server maximum 10000), with the elision marked
 - deduplication, which is where the real compression comes from
 
 Every response reports `truncated` and `total_matching`, so a caller always knows
