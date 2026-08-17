@@ -37,7 +37,12 @@ async fn file_source_survives_rotation_and_truncation() {
     let task = tokio::spawn(async move { Box::new(source).run(tx, task_shutdown).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    fs::write(&path, "old\none\n").unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"one\n")
+        .unwrap();
     assert_eq!(next_payload(&mut rx).await, "one");
 
     fs::rename(&path, dir.path().join("app.log.1")).unwrap();
