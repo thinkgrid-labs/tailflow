@@ -254,6 +254,24 @@ pub fn wait(v: &Value) -> String {
             n(v, "next_cursor")
         );
     }
+    // "Matched after 0ms" reads as "it happened the instant I asked". For a line
+    // that was already in the buffer the truthful reading is the opposite: it
+    // happened before the call, and is not evidence about what the caller just
+    // triggered.
+    if v.get("matched_from_buffer").and_then(Value::as_bool) == Some(true) {
+        let when = short_time(
+            v.get("records")
+                .and_then(Value::as_array)
+                .and_then(|r| r.first())
+                .and_then(|r| r.get("timestamp")),
+        );
+        return format!(
+            "Matched a line that was already in the buffer, logged at {when} — this did NOT \
+             happen during the wait.\nIf you needed an event caused by your change, re-run \
+             with `since`, or with the `cursor` from before you made it.\n{}",
+            records(v)
+        );
+    }
     format!("Matched after {waited}ms.\n{}", records(v))
 }
 
@@ -288,6 +306,49 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_does_not_present_a_stale_match_as_a_fresh_one() {
+        let v = serde_json::json!({
+            "matched": true,
+            "matched_from_buffer": true,
+            "waited_ms": 0,
+            "records": [{
+                "seq": 4, "timestamp": "2026-08-19T09:14:02.100Z",
+                "source": "web", "level": "info", "payload": "compiled successfully"
+            }],
+            "total_matching": 1, "truncated": false, "next_cursor": 4
+        });
+        let out = wait(&v);
+        assert!(
+            !out.contains("Matched after"),
+            "must not read as an event that just happened: {out}"
+        );
+        assert!(out.contains("already in the buffer"), "{out}");
+        assert!(out.contains("09:14:02"), "must date the stale line: {out}");
+        assert!(
+            out.contains("since"),
+            "must say how to demand a new event: {out}"
+        );
+        assert!(out.contains("compiled successfully"), "{out}");
+    }
+
+    #[test]
+    fn wait_reports_a_live_match_as_timed() {
+        let v = serde_json::json!({
+            "matched": true,
+            "matched_from_buffer": false,
+            "waited_ms": 1840,
+            "records": [{
+                "seq": 9, "timestamp": "2026-08-19T09:20:00.000Z",
+                "source": "web", "level": "error", "payload": "Failed to compile"
+            }],
+            "total_matching": 1, "truncated": false, "next_cursor": 9
+        });
+        let out = wait(&v);
+        assert!(out.contains("Matched after 1840ms"), "{out}");
+        assert!(!out.contains("already in the buffer"), "{out}");
+    }
     use serde_json::json;
 
     #[test]

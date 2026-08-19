@@ -9,6 +9,71 @@ crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-19
+
+Correctness release for the agent contract. Every change here closes a path
+where a malformed request could return a successful-looking empty result — the
+one failure mode an agent cannot detect, because "nothing came back" and
+"nothing is wrong" are the same answer.
+
+### Fixed
+
+- MCP tool arguments are now validated against the schema each tool advertises.
+  An unknown argument name, an argument belonging to a different tool, a
+  wrong-typed value, or a value outside a declared `enum` is returned to the
+  model as a tool error instead of being dropped. Previously a misspelled
+  `pattern` or a non-string `grep` was silently ignored and the query ran
+  unfiltered, so a stack full of errors could answer as though it were clean.
+  Rejected arguments are reported with the accepted names and a "did you mean"
+  suggestion, and validation runs before the daemon is contacted.
+- Malformed query-string values on `/api/query`, `/api/errors`, and `/api/wait`
+  now return the same `{"error": "..."}` JSON body as every other rejected
+  argument. They previously fell through to the framework's plain-text
+  rejection, which a caller reading the `error` field would find empty.
+- `limit=0` and `max_payload_chars=0` are rejected rather than quietly raised to
+  1. A clamped-up zero returns a single record that looks like a deliberate
+  answer, and there is no truncation flag that can say otherwise.
+- `wait_for_logs` no longer presents a pre-existing log line as a fresh event.
+  A wait is also satisfied by a match already held in the buffer, so
+  `wait_for_logs(grep: "compiled successfully")` could return the *previous*
+  build's success line, report `waited_ms: 0`, and render as "Matched after
+  0ms" — reading exactly like the caller's own change compiling. Responses now
+  carry `matched_from_buffer`, and the text rendering states that the line
+  predates the wait, dates it, and says how to require a new event.
+- A wait that fell behind the broadcast bus could recover by anchoring to a
+  record that predated the call. Recovery now searches forward of the call's
+  snapshot only.
+- `context_lines` above the maximum is rejected rather than clamped. A group
+  carrying 50 of 200 requested stack frames is indistinguishable from a
+  50-frame stack trace, so this bound cannot be reduced silently the way
+  `limit` and `max_payload_chars` can — both of those announce the reduction
+  through `truncated` and `payload_truncated_from`.
+
+### Added
+
+- `wait_for_logs`, `tailflow-logs wait --require-new`, and
+  `/api/wait?require_new=true` wait strictly forward: the buffer is not
+  consulted, so only a line arriving after the call starts can end the wait.
+  This is the precise form of "did my change cause this?" for a caller holding
+  no baseline cursor and unable to guess a `since` window. The CLI exits
+  non-zero when nothing new arrives, so a shell gate cannot pass on a stale
+  line. A daemon older than 0.3.3 would drop the argument silently, so the
+  client checks `matched_from_buffer` in the reply and reports the version
+  mismatch instead of accepting a weaker answer than it asked for.
+- `wait_for_logs` and `tailflow-logs wait` accept `since`, which bounds the
+  retrospective half of a wait so an old buffered line cannot satisfy it. The
+  daemon already honoured `since` on `/api/wait`; only the agent surfaces were
+  missing it.
+- `list_log_sources` accepts `format`, matching the other three tools. It
+  previously advertised no arguments, so a caller asking for JSON silently
+  received text.
+- Test coverage for the three agent-facing invariants: bad filters fail loudly
+  and never return an empty result, an unreachable daemon is a tool error
+  rather than a JSON-RPC protocol error the model never sees, and every bound
+  either announces the reduction it made or refuses the request. Included is a
+  test pinning the advertised tool list to the dispatch table so the two cannot
+  drift.
+
 ## [0.3.2] - 2026-08-17
 
 Setup and documentation release focused on making TailFlow easier to understand,
@@ -193,7 +258,8 @@ Initial release.
   (ARM64, x64), Linux (x64, ARM64), and Windows x64.
 - CI running `fmt`, `clippy`, `build`, and `test`.
 
-[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thinkgrid-labs/tailflow/compare/v0.2.0...v0.3.0

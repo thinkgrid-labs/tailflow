@@ -8,6 +8,7 @@ use crate::client::{ClientError, DaemonClient};
 use crate::ops::{self, ErrorsArgs, SearchArgs, WaitArgs};
 use crate::render;
 use serde_json::{json, Value};
+use std::fmt;
 
 /// Protocol revisions this server speaks. The client's requested version is
 /// echoed back when we know it, per the negotiation rule in the spec.
@@ -160,22 +161,27 @@ impl Server {
             })?;
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+        // The advertised schema is also the dispatch table, so the tool list a
+        // client sees and the tools this server actually runs cannot drift.
+        let schema = tool_schema(name).ok_or_else(|| RpcError {
+            code: INVALID_PARAMS,
+            message: format!("unknown tool: {name}"),
+            data: None,
+        })?;
+
         // A tool that fails is reported *inside* a successful result with
         // `isError: true`, not as a JSON-RPC error. That is what puts the
         // failure text in front of the model so it can react — a protocol
         // error is handled by the client and the model never sees it.
-        let outcome = match name {
-            "list_log_sources" => self.tool_sources().await,
-            "get_recent_errors" => self.tool_errors(&args).await,
-            "search_logs" => self.tool_search(&args).await,
-            "wait_for_logs" => self.tool_wait(&args).await,
-            other => {
-                return Err(RpcError {
-                    code: INVALID_PARAMS,
-                    message: format!("unknown tool: {other}"),
-                    data: None,
-                })
-            }
+        let outcome = match validate_args(name, &schema, &args) {
+            Err(message) => Err(ToolFailure::Args(message)),
+            Ok(()) => match name {
+                "list_log_sources" => self.tool_sources(&args).await,
+                "get_recent_errors" => self.tool_errors(&args).await,
+                "search_logs" => self.tool_search(&args).await,
+                "wait_for_logs" => self.tool_wait(&args).await,
+                _ => unreachable!("tool_schema resolves only the names dispatched here"),
+            },
         };
 
         Ok(match outcome {
@@ -192,12 +198,12 @@ impl Server {
 
     // ── Tools ─────────────────────────────────────────────────────────────────
 
-    async fn tool_sources(&self) -> Result<String, ClientError> {
+    async fn tool_sources(&self, args: &Value) -> Result<String, ToolFailure> {
         let v = ops::sources(&self.client).await?;
-        Ok(render::sources(&v))
+        Ok(finish(args, v, render::sources))
     }
 
-    async fn tool_errors(&self, args: &Value) -> Result<String, ClientError> {
+    async fn tool_errors(&self, args: &Value) -> Result<String, ToolFailure> {
         let a = ErrorsArgs {
             grep: str_arg(args, "grep"),
             source: str_arg(args, "source"),
@@ -210,7 +216,7 @@ impl Server {
         Ok(finish(args, v, render::errors))
     }
 
-    async fn tool_search(&self, args: &Value) -> Result<String, ClientError> {
+    async fn tool_search(&self, args: &Value) -> Result<String, ToolFailure> {
         let a = SearchArgs {
             grep: str_arg(args, "grep"),
             source: str_arg(args, "source"),
@@ -223,18 +229,206 @@ impl Server {
         Ok(finish(args, v, render::records))
     }
 
-    async fn tool_wait(&self, args: &Value) -> Result<String, ClientError> {
+    async fn tool_wait(&self, args: &Value) -> Result<String, ToolFailure> {
         let a = WaitArgs {
             grep: str_arg(args, "grep"),
             source: str_arg(args, "source"),
             level: str_arg(args, "level"),
+            since: str_arg(args, "since"),
             timeout_ms: num_arg(args, "timeout_ms"),
             cursor: num_arg(args, "cursor"),
             limit: num_arg(args, "limit").map(|n| n as usize),
+            require_new: bool_arg(args, "require_new").unwrap_or(false),
         };
         let v = ops::wait(&self.client, &a).await?;
         Ok(finish(args, v, render::wait))
     }
+}
+
+/// Why a tool call failed.
+///
+/// Both variants reach the model as `isError: true` content rather than a
+/// JSON-RPC error. A protocol error is consumed by the MCP client, so the model
+/// would only see that its call produced nothing — indistinguishable from a
+/// stack with nothing wrong in it.
+pub enum ToolFailure {
+    /// The daemon was unreachable, or rejected the request.
+    Daemon(ClientError),
+    /// The arguments were malformed. Rejected rather than partially applied:
+    /// a filter that quietly vanishes turns a broken stack into an empty
+    /// result, and an empty result reads as "all clear".
+    Args(String),
+}
+
+impl From<ClientError> for ToolFailure {
+    fn from(e: ClientError) -> Self {
+        ToolFailure::Daemon(e)
+    }
+}
+
+impl fmt::Display for ToolFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ToolFailure::Daemon(e) => write!(f, "{e}"),
+            ToolFailure::Args(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+// ── Argument validation ───────────────────────────────────────────────────────
+
+/// The `inputSchema` of one advertised tool, or `None` if no such tool exists.
+fn tool_schema(name: &str) -> Option<Value> {
+    tool_definitions()
+        .as_array()?
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))?
+        .get("inputSchema")
+        .cloned()
+}
+
+/// Check `args` against the schema the client was given.
+///
+/// Every tool advertises `additionalProperties: false`, but nothing in MCP
+/// obliges a client to enforce it, and the model on the other end is generating
+/// these names from a description. Without this check a misspelled `pattern`,
+/// a `since` passed to the one tool that has no `since`, or a stringified array
+/// where a string belongs is simply not read: the request runs *unfiltered*,
+/// succeeds, and returns an answer to a question nobody asked.
+fn validate_args(tool: &str, schema: &Value, args: &Value) -> Result<(), String> {
+    let supplied = match args {
+        Value::Object(map) => map,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(format!(
+                "`arguments` for {tool} must be a JSON object, got {}.",
+                json_type(other)
+            ))
+        }
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+
+    for (key, value) in supplied {
+        // A client that sends an explicit `null` for an argument it chose not
+        // to set is saying "absent", which is a legitimate thing to say.
+        if value.is_null() {
+            continue;
+        }
+        let Some(spec) = properties.get(key) else {
+            let accepted: Vec<&str> = properties.keys().map(String::as_str).collect();
+            let hint = match nearest(key, &accepted) {
+                Some(near) => format!(" Did you mean `{near}`?"),
+                None => String::new(),
+            };
+            let accepted = if accepted.is_empty() {
+                "it takes no arguments".to_string()
+            } else {
+                format!("accepted: {}", accepted.join(", "))
+            };
+            return Err(format!(
+                "Unknown argument `{key}` for {tool} — {accepted}.{hint} \
+                 The call was rejected rather than run without it: an ignored filter \
+                 returns an unfiltered result that looks like nothing is wrong."
+            ));
+        };
+        check_type(tool, key, spec, value)?;
+    }
+    Ok(())
+}
+
+fn check_type(tool: &str, key: &str, spec: &Value, value: &Value) -> Result<(), String> {
+    if let Some(allowed) = spec.get("enum").and_then(Value::as_array) {
+        let names: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        if !value.as_str().is_some_and(|v| names.contains(&v)) {
+            return Err(format!(
+                "Argument `{key}` for {tool} must be one of: {} — got {}.",
+                names.join(", "),
+                compact(value)
+            ));
+        }
+        return Ok(());
+    }
+
+    match spec.get("type").and_then(Value::as_str) {
+        Some("string") if !value.is_string() => Err(format!(
+            "Argument `{key}` for {tool} must be a string, got {} ({}). \
+             Rejected rather than dropped: the query would otherwise have run \
+             without this filter and reported a clean result.",
+            json_type(value),
+            compact(value)
+        )),
+        // `num_arg` accepts a stringified number because some clients emit one;
+        // validation has to accept exactly the same set, or a call this server
+        // would have handled fine gets refused.
+        Some("integer")
+            if !(value.as_u64().is_some()
+                || value.as_str().is_some_and(|s| s.parse::<u64>().is_ok())) =>
+        {
+            Err(format!(
+                "Argument `{key}` for {tool} must be a non-negative integer, got {} ({}).",
+                json_type(value),
+                compact(value)
+            ))
+        }
+        Some("boolean")
+            if !(value.is_boolean()
+                || value.as_str().is_some_and(|s| s.parse::<bool>().is_ok())) =>
+        {
+            Err(format!(
+                "Argument `{key}` for {tool} must be true or false, got {} ({}).",
+                json_type(value),
+                compact(value)
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// A short, quotable rendering of a rejected value for the error message.
+fn compact(v: &Value) -> String {
+    let raw = v.to_string();
+    if raw.chars().count() <= 60 {
+        raw
+    } else {
+        raw.chars().take(60).collect::<String>() + "…"
+    }
+}
+
+/// Cheap "did you mean" for a misspelled argument — one edit away, or one name
+/// contained in the other (`sources` for `source`, `time` for `timeout_ms`).
+fn nearest<'a>(key: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .find(|c| c.contains(key) || key.contains(*c) || edit_distance(key, c) <= 2)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut row = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            row[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut row);
+    }
+    prev[b.len()]
 }
 
 fn request_protocol(params: &Value) -> Option<&str> {
@@ -281,6 +475,14 @@ fn str_arg(args: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+}
+
+fn bool_arg(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(|v| {
+        v.as_bool()
+            // Same leniency as `num_arg`: some clients stringify scalars.
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
 }
 
 fn num_arg(args: &Value, key: &str) -> Option<u64> {
@@ -341,7 +543,14 @@ pub fn tool_definitions() -> Value {
                  warning counts and each one's most recent line. Call this first: it tells you \
                  what is actually running, and distinguishes 'the service is quiet' from 'the \
                  service never started' — which look identical in an empty error list.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "format": { "type": "string", "enum": ["text", "json"],
+                                "description": FORMAT_DESC }
+                },
+                "additionalProperties": false
+            }
         },
         {
             "name": "get_recent_errors",
@@ -416,11 +625,21 @@ pub fn tool_definitions() -> Value {
                         "Only watch this service. Substring match." },
                     "level": { "type": "string", "description":
                         "Only wake on lines at or above this severity, e.g. 'error'." },
+                    "since": { "type": "string", "description":
+                        "Ignore matches older than this ('30s', '5m', or RFC 3339). A wait \
+                         also answers with a match already in the buffer, so without this — \
+                         or 'cursor' — the previous build's 'compiled successfully' can \
+                         satisfy the call instantly." },
                     "timeout_ms": { "type": "integer", "description":
                         "How long to wait before giving up (default 30000, max 120000)." },
                     "cursor": { "type": "integer", "description":
                         "Ignore anything at or before this sequence number. Take it from an \
                          earlier response so you match only events caused by your action." },
+                    "require_new": { "type": "boolean", "description":
+                        "Wait only for a line that arrives after this call starts, ignoring \
+                         anything already in the buffer. Use it when you just triggered \
+                         something and hold no earlier cursor — otherwise the previous \
+                         build's matching line can satisfy the wait instantly." },
                     "limit": { "type": "integer", "description":
                         "Maximum lines to return (default 100)." },
                     "format": { "type": "string", "enum": ["text", "json"],
@@ -640,6 +859,231 @@ mod tests {
         let args = json!({ "grep": "", "source": "api" });
         assert_eq!(str_arg(&args, "grep"), None);
         assert_eq!(str_arg(&args, "source"), Some("api".into()));
+    }
+
+    // ── Argument validation ───────────────────────────────────────────────────
+    //
+    // Every test here asserts the same thing from a different angle: a call the
+    // server cannot honour exactly must come back as a visible failure, never as
+    // a successful-looking empty or unfiltered result. The daemon in these tests
+    // is deliberately unreachable, so any answer that is *not* the "no daemon"
+    // message proves validation ran first, before the network.
+
+    async fn call(tool: &str, args: Value) -> Value {
+        server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": tool, "arguments": args }
+            }))
+            .await
+            .unwrap()
+    }
+
+    fn tool_error_text(res: &Value) -> String {
+        assert!(res.get("error").is_none(), "must not be a protocol error");
+        assert_eq!(
+            res["result"]["isError"], true,
+            "must be flagged as an error"
+        );
+        res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn unknown_argument_is_rejected_not_run_unfiltered() {
+        let res = call("get_recent_errors", json!({ "pattern": "timeout" })).await;
+        let text = tool_error_text(&res);
+        assert!(text.contains("`pattern`"), "must name the argument: {text}");
+        assert!(text.contains("grep"), "must list what it accepts: {text}");
+        assert!(
+            !text.contains("No TailFlow daemon"),
+            "must fail before the request is sent, not after: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn misspelled_argument_suggests_the_real_one() {
+        let text = tool_error_text(&call("search_logs", json!({ "sources": "api" })).await);
+        assert!(text.contains("Did you mean `source`"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn argument_valid_on_another_tool_is_still_rejected() {
+        // `timeout_ms` is a real TailFlow argument, just not one that means
+        // anything to a tool that never blocks. Dropping it silently would let a
+        // caller believe search_logs had waited for something.
+        let text = tool_error_text(&call("search_logs", json!({ "timeout_ms": 5000 })).await);
+        assert!(text.contains("`timeout_ms`"), "got: {text}");
+        assert!(
+            text.contains("accepted:"),
+            "must list the real ones: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_accepts_since_to_bound_its_retrospective_half() {
+        let text = tool_error_text(&call("wait_for_logs", json!({ "since": "5m" })).await);
+        assert!(
+            text.contains("No TailFlow daemon"),
+            "`since` must reach the daemon, not be rejected: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_typed_filter_is_rejected() {
+        for bad in [json!(123), json!(["timeout", "refused"]), json!(true)] {
+            let text = tool_error_text(&call("get_recent_errors", json!({ "grep": bad })).await);
+            assert!(text.contains("must be a string"), "got: {text}");
+            assert!(text.contains("`grep`"), "got: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_numeric_integer_argument_is_rejected() {
+        let text = tool_error_text(&call("search_logs", json!({ "limit": "many" })).await);
+        assert!(text.contains("non-negative integer"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn negative_integer_argument_is_rejected() {
+        // Would otherwise parse to None and silently become the default limit.
+        let text = tool_error_text(&call("search_logs", json!({ "limit": -5 })).await);
+        assert!(text.contains("`limit`"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn bad_enum_value_is_rejected() {
+        let text = tool_error_text(&call("search_logs", json!({ "format": "yaml" })).await);
+        assert!(text.contains("text, json"), "must list the choices: {text}");
+    }
+
+    #[tokio::test]
+    async fn stringified_numbers_are_still_accepted() {
+        // Some clients emit numbers as strings; validation must accept exactly
+        // what `num_arg` accepts, or it refuses calls this server handles fine.
+        let text = tool_error_text(&call("search_logs", json!({ "limit": "25" })).await);
+        assert!(
+            text.contains("No TailFlow daemon"),
+            "should have reached the network: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_null_means_absent_not_invalid() {
+        let text = tool_error_text(
+            &call("get_recent_errors", json!({ "grep": null, "since": null })).await,
+        );
+        assert!(
+            text.contains("No TailFlow daemon"),
+            "null is a client saying 'unset': {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_object_arguments_are_rejected() {
+        let res = server()
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "search_logs", "arguments": "grep=error" }
+            }))
+            .await
+            .unwrap();
+        let text = tool_error_text(&res);
+        assert!(text.contains("must be a JSON object"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn omitted_arguments_are_valid() {
+        let text = tool_error_text(&call("list_log_sources", json!({})).await);
+        assert!(text.contains("No TailFlow daemon"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn list_log_sources_honours_format_rather_than_ignoring_it() {
+        // It advertises `format`, so it has to act on it — an advertised argument
+        // that does nothing is the same silent drop as an unknown one.
+        let text = tool_error_text(&call("list_log_sources", json!({ "format": "json" })).await);
+        assert!(text.contains("No TailFlow daemon"), "got: {text}");
+        assert!(tool_schema("list_log_sources").unwrap()["properties"]["format"].is_object());
+    }
+
+    #[tokio::test]
+    async fn every_advertised_tool_is_dispatchable() {
+        // The schema lookup is the dispatch table; this pins them together so a
+        // newly advertised tool cannot resolve to an "unknown tool" at call time.
+        for tool in tool_definitions().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let res = call(name, json!({})).await;
+            assert!(
+                res.get("error").is_none(),
+                "{name} is advertised but not dispatched"
+            );
+            assert_eq!(res["result"]["isError"], true, "{name}: daemon is down");
+        }
+    }
+
+    #[tokio::test]
+    async fn require_new_accepts_booleans_and_their_string_form() {
+        for value in [json!(true), json!(false), json!("true")] {
+            let text =
+                tool_error_text(&call("wait_for_logs", json!({ "require_new": value })).await);
+            assert!(text.contains("No TailFlow daemon"), "{value}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn require_new_rejects_a_non_boolean() {
+        let text = tool_error_text(&call("wait_for_logs", json!({ "require_new": "yes" })).await);
+        assert!(text.contains("must be true or false"), "got: {text}");
+    }
+
+    #[test]
+    fn bool_arg_matches_the_leniency_of_num_arg() {
+        let args = json!({ "a": true, "b": "false", "c": "yes", "d": 1 });
+        assert_eq!(bool_arg(&args, "a"), Some(true));
+        assert_eq!(bool_arg(&args, "b"), Some(false));
+        assert_eq!(bool_arg(&args, "c"), None);
+        assert_eq!(bool_arg(&args, "d"), None);
+    }
+
+    #[test]
+    fn validation_covers_every_declared_property() {
+        // A property advertised without a `type` would silently accept anything.
+        for tool in tool_definitions().as_array().unwrap() {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["additionalProperties"], false);
+            for (name, spec) in schema["properties"].as_object().unwrap() {
+                assert!(
+                    spec.get("type").and_then(Value::as_str).is_some(),
+                    "{}.{name} has no type to validate against",
+                    tool["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_tool_has_no_schema() {
+        assert!(tool_schema("drop_database").is_none());
+        assert!(tool_schema("search_logs").is_some());
+    }
+
+    #[test]
+    fn edit_distance_is_symmetric_and_zero_on_equal() {
+        assert_eq!(edit_distance("source", "source"), 0);
+        assert_eq!(edit_distance("sorce", "source"), 1);
+        assert_eq!(
+            edit_distance("grep", "limit"),
+            edit_distance("limit", "grep")
+        );
+    }
+
+    #[test]
+    fn nearest_declines_when_nothing_is_close() {
+        assert_eq!(nearest("pattern", &["grep", "level", "limit"]), None);
+        assert_eq!(nearest("levl", &["grep", "level", "limit"]), Some("level"));
     }
 
     #[test]

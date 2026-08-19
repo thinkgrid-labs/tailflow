@@ -31,6 +31,12 @@ pub enum ClientError {
     Timeout {
         after: Duration,
     },
+    /// The daemon answered, but demonstrably ignored an argument. Older daemons
+    /// drop query parameters they do not recognise, which would turn a stricter
+    /// request into a silently weaker one.
+    Unsupported {
+        detail: String,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -51,6 +57,7 @@ impl fmt::Display for ClientError {
             ClientError::Timeout { after } => {
                 write!(f, "daemon did not respond within {:?}", after)
             }
+            ClientError::Unsupported { detail } => write!(f, "{detail}"),
         }
     }
 }

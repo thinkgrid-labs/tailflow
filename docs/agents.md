@@ -65,6 +65,25 @@ This is reported as a *tool* error rather than a JSON-RPC protocol error,
 specifically so the model sees the text and can act on it — a protocol error is
 consumed by the MCP client and never reaches the model.
 
+### When an argument is wrong
+
+Tool arguments are checked against the schema each tool advertises, before the
+daemon is contacted. An unknown name, an argument that belongs to a different
+tool, a wrong-typed value, or a value outside a declared `enum` comes back as
+`isError: true`:
+
+```
+Unknown argument `pattern` for get_recent_errors — accepted: since, source,
+level, grep, limit, context_lines, format. The call was rejected rather than
+run without it: an ignored filter returns an unfiltered result that looks like
+nothing is wrong.
+```
+
+A dropped argument is worse than a rejected one. A `grep` that never applied
+returns the whole buffer, and a `source` that never applied returns other
+services' logs — both look like ordinary successful answers. An explicit `null`
+is accepted as "unset", and integers may be sent as strings.
+
 ---
 
 ## MCP tools
@@ -122,6 +141,8 @@ startup ordering, a request's lifecycle, what a process printed before it died.
 | `grep` | string | — | Regex the line must match |
 | `source` | string | all | Substring match |
 | `level` | string | all | Only wake at or above this severity |
+| `since` | string | whole buffer | Ignore matches older than this |
+| `require_new` | bool | false | Only match lines arriving after the call starts |
 | `timeout_ms` | int | 30000 (max 120000) | Give up after this long |
 | `cursor` | int | — | Ignore anything at or before this sequence number |
 | `limit` | int | 100 | Maximum lines returned |
@@ -132,9 +153,11 @@ lines from that matching record onward. The trigger filter chooses when to wake;
 it does not discard stack frames that follow.
 
 If a match already exists in the buffer, it returns immediately with
-`waited_ms: 0`. **Pass a `cursor`** when you only care about events caused by an
-action you just took; otherwise a matching line from five minutes ago satisfies
-the wait instantly.
+`waited_ms: 0` and `matched_from_buffer: true`, and the rendered text says the
+line predates the wait. **Pass a `cursor`** (or `since`) when you only care
+about events caused by an action you just took; otherwise a matching line from
+five minutes ago satisfies the wait instantly. See
+[Waiting is half retrospective](#waiting-is-half-retrospective).
 
 ---
 
@@ -187,6 +210,7 @@ tailflow-logs search [REGEX] [--source api] [--level error]
                      [--since 5m] [--limit 100] [--cursor 4210]
 tailflow-logs sources
 tailflow-logs wait [--grep REGEX] [--source api] [--level error]
+                   [--since 30s] [--require-new]
                    [--timeout-ms 30000] [--cursor 4210]
 tailflow-logs status
 ```
@@ -205,7 +229,8 @@ Global: `--url URL`, `--json`.
 So a script can gate on a real condition:
 
 ```bash
-if tailflow-logs wait --grep 'compiled successfully' --timeout-ms 30000; then
+# --require-new keeps the previous build's success line from satisfying this wait.
+if tailflow-logs wait --grep 'compiled successfully' --require-new --timeout-ms 30000; then
   echo "rebuild succeeded"
 else
   tailflow-logs errors --since 1m
@@ -225,15 +250,24 @@ All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
 | `grep` | all | Regex against the payload |
 | `source` | all | Substring against the source name |
 | `level` | all | Minimum severity (`trace`…`error`) |
-| `since` | `/api/errors`, `/api/query` | `30s`/`5m`/`2h`/`1d` or RFC 3339 |
+| `since` | all | `30s`/`5m`/`2h`/`1d` or RFC 3339 |
 | `limit` | all | Max records or groups (capped at 1000) |
 | `cursor` | all | Only records with `seq >` this |
 | `max_payload_chars` | `/api/errors`, `/api/query` | Per-line elision cap (default 2000, max 10000) |
 | `context_lines` | `/api/errors` | Trailing context per group (max 50) |
+| `require_new` | `/api/wait` | `true` to ignore matches already in the buffer |
 | `timeout_ms` | `/api/wait` | Long-poll deadline (max 120000) |
 
-An invalid `grep`, `level`, or `since` returns **400** with
-`{"error": "..."}`. It is never ignored — see [Design notes](#failing-loudly).
+Any rejected argument returns **400** with `{"error": "..."}`, including a
+value of the wrong type (`limit=abc`). It is never ignored — see
+[Design notes](#failing-loudly).
+
+`limit` and `max_payload_chars` are clamped down to their maximums but must be
+at least 1; `context_lines` above 50 is rejected rather than clamped, because a
+shortened stack trace is invisible in the response.
+
+`since` also applies to `/api/wait`, where it bounds the retrospective half of
+the wait — see [Waiting is half retrospective](#waiting-is-half-retrospective).
 
 ### `GET /api/errors`
 
@@ -308,7 +342,7 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.3.2", "buffered": 125, "cursor": 125 }
+{ "ok": true, "version": "0.3.3", "buffered": 125, "cursor": 125 }
 ```
 
 ---
@@ -365,13 +399,22 @@ claiming the incremental read was exact.
 
 ### Failing loudly
 
-Invalid arguments are rejected with 400 rather than being dropped.
+Invalid arguments are rejected rather than dropped — as a 400 at the HTTP layer,
+and as an `isError: true` tool result at the MCP layer.
 
 A human passing a bad regex to a TUI sees an empty screen and immediately knows
 something is wrong. An agent doesn't have that feedback. Silently ignoring a
 malformed `grep` would return "0 errors" — indistinguishable from a healthy
 stack, and the agent would report success. Every filter argument is therefore
 validated, and every failure explains what was expected.
+
+The same reasoning decides whether a bound is clamped or refused: **a bound may
+be reduced silently only when the response announces the reduction.** `limit`
+announces through `truncated` and `total_matching`, and `max_payload_chars`
+through `payload_truncated_from` and an inline `… [+N chars]` marker. Nothing
+announces a shortened `context_lines`, so an over-large one is refused. Zero is
+refused for the same reason — there is no "0 records, truncated" to report, so a
+zero raised to 1 would return a single record that reads as a deliberate answer.
 
 ### Bounded by construction
 
@@ -383,6 +426,46 @@ Three independent limits keep a single query from flooding a context window:
 
 Every response reports `truncated` and `total_matching`, so a caller always knows
 whether it saw everything.
+
+### Waiting is half retrospective
+
+A wait answers in two ways: a line that arrives while it blocks, or a line
+already in the buffer when the call started. The second is deliberate — the
+event you are waiting for may genuinely have landed in the moment between your
+edit and your call — but it is not the same evidence.
+
+`wait_for_logs(grep: "compiled successfully")` against a buffer holding the
+previous build's success line returns instantly, with `waited_ms: 0`. Read as
+"matched", it says your change compiled. It says nothing of the sort.
+
+Responses therefore carry `matched_from_buffer`, and the text rendering
+distinguishes the two cases explicitly:
+
+```
+Matched a line that was already in the buffer, logged at 09:14:02 — this did
+NOT happen during the wait.
+```
+
+To require a genuinely new event, use one of:
+
+| | Use when |
+|---|---|
+| `cursor` | You have a response from *before* the change. Most precise. |
+| `require_new: true` | You have no baseline and cannot guess a window. The buffer is skipped entirely, so only a line arriving after the call can end the wait. |
+| `since: "10s"` | You want a bounded look-back rather than none at all — the event may have landed between your edit and your call. |
+
+`tailflow-logs wait --require-new` exits non-zero when nothing new arrives, so a
+shell gate cannot pass on a stale line:
+
+```bash
+if tailflow-logs wait --grep 'compiled successfully' --require-new --timeout-ms 30000; then
+  echo "this build compiled"
+fi
+```
+
+A daemon older than 0.3.3 drops `require_new` rather than rejecting it. The
+client detects that from `matched_from_buffer` in the reply and fails with a
+version message, rather than accepting a weaker answer than it asked for.
 
 ### Buffer horizon
 

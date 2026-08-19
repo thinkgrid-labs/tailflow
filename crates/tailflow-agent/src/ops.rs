@@ -40,9 +40,14 @@ pub struct WaitArgs {
     pub grep: Option<String>,
     pub source: Option<String>,
     pub level: Option<String>,
+    /// Bounds the retrospective half of a wait: without it, a match already in
+    /// the buffer from ten minutes ago satisfies the call instantly.
+    pub since: Option<String>,
     pub timeout_ms: Option<u64>,
     pub cursor: Option<u64>,
     pub limit: Option<usize>,
+    /// Ignore matches already in the buffer; wait only for something new.
+    pub require_new: bool,
 }
 
 pub async fn errors(client: &DaemonClient, args: &ErrorsArgs) -> Result<Value, ClientError> {
@@ -77,15 +82,36 @@ pub async fn wait(client: &DaemonClient, args: &WaitArgs) -> Result<Value, Clien
     qs.push_opt("grep", args.grep.as_ref())
         .push_opt("source", args.source.as_ref())
         .push_opt("level", args.level.as_ref())
+        .push_opt("since", args.since.as_ref())
         .push_num("cursor", args.cursor)
         .push_num("limit", args.limit)
         .push("timeout_ms", timeout_ms.to_string());
-    client
+    if args.require_new {
+        qs.push("require_new", "true");
+    }
+    let response = client
         .get(
             &qs.build("/api/wait"),
             Duration::from_millis(timeout_ms) + WAIT_SLACK,
         )
-        .await
+        .await?;
+
+    // A daemon older than 0.3.3 drops `require_new` silently and answers from the
+    // buffer anyway — the precise failure the flag exists to prevent. The response
+    // convicts it, so check rather than trust.
+    if args.require_new
+        && response.get("matched_from_buffer").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(ClientError::Unsupported {
+            detail: format!(
+                "The daemon at {} ignored `require_new` and answered with a line that was \
+                 already in its buffer. It predates TailFlow 0.3.3 — upgrade it, or scope \
+                 the wait with `since`/`cursor` instead.",
+                client.url()
+            ),
+        });
+    }
+    Ok(response)
 }
 
 pub async fn health(client: &DaemonClient) -> Result<Value, ClientError> {
