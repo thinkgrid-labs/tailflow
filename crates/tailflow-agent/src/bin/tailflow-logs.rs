@@ -102,12 +102,20 @@ enum Command {
         /// Only wake on lines at or above this severity
         #[arg(long, value_name = "LEVEL")]
         level: Option<String>,
+        /// Ignore matches older than this — a wait is also satisfied by a line
+        /// already in the buffer
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
         /// Give up after this many milliseconds (max 120000)
         #[arg(long, value_name = "MS", default_value_t = 30_000)]
         timeout_ms: u64,
         /// Ignore anything at or before this sequence number
         #[arg(long, value_name = "SEQ")]
         cursor: Option<u64>,
+        /// Only succeed on a line that arrives after this command starts —
+        /// exits non-zero if the match was already in the buffer
+        #[arg(long)]
+        require_new: bool,
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
@@ -169,17 +177,21 @@ async fn run(cli: &Cli, client: &DaemonClient) -> i32 {
             grep,
             source,
             level,
+            since,
             timeout_ms,
             cursor,
             limit,
+            require_new,
         } => {
             let args = WaitArgs {
                 grep: grep.clone(),
                 source: source.clone(),
                 level: level.clone(),
+                since: since.clone(),
                 timeout_ms: Some(*timeout_ms),
                 cursor: *cursor,
                 limit: *limit,
+                require_new: *require_new,
             };
             match ops::wait(client, &args).await {
                 Ok(v) => {

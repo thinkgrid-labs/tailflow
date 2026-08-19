@@ -146,7 +146,7 @@ Four focused MCP tools support that loop:
 | `list_log_sources` | Confirm which services started, exited, failed, or were observed |
 | `get_recent_errors` | Read distinct recent failures with counts and stack-trace context |
 | `search_logs` | Inspect exact lines and event ordering with filters and cursors |
-| `wait_for_logs` | Wait for a rebuild, error, or other runtime event without polling |
+| `wait_for_logs` | Wait for a rebuild, error, or other runtime event without polling — `require_new` keeps a previous run's line from satisfying it |
 
 See [TailFlow for agents](docs/agents.md) for arguments, output contracts,
 workflow patterns, shell commands, and the HTTP API.

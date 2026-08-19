@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Query as AxumQuery, Request, State},
-    http::{header, StatusCode, Uri},
+    extract::{rejection::QueryRejection, FromRequestParts, Query as AxumQuery, Request, State},
+    http::{header, request::Parts, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -173,6 +173,9 @@ struct AgentParams {
     /// Trailing continuation lines attached to each error group.
     context_lines: Option<usize>,
     timeout_ms: Option<u64>,
+    /// Wait only for records that arrive *after* the call starts, ignoring any
+    /// match already held in the buffer.
+    require_new: Option<bool>,
 }
 
 /// Upper bounds. A caller can ask for less, never more — one runaway `limit`
@@ -188,6 +191,34 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
     }
+}
+
+/// [`AgentParams`], but with a rejection that matches the rest of the agent
+/// contract.
+///
+/// Axum's own `Query` rejection is a plain-text body. Every other bad argument
+/// on these endpoints answers with `{"error": "..."}`, and a caller that reads
+/// that field would find nothing at all in a plain-text body — the same silent
+/// nothing it gets from a successful empty result. A malformed `limit=abc` has
+/// to be as loud as a malformed `grep`.
+struct AgentQuery(AgentParams);
+
+impl<S: Send + Sync> FromRequestParts<S> for AgentQuery {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumQuery::<AgentParams>::from_request_parts(parts, state).await {
+            Ok(AxumQuery(params)) => Ok(Self(params)),
+            Err(rejection) => Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                describe_query_rejection(&rejection),
+            )),
+        }
+    }
+}
+
+fn describe_query_rejection(rejection: &QueryRejection) -> String {
+    format!("invalid query parameters: {}", rejection.body_text())
 }
 
 impl AgentParams {
@@ -226,21 +257,58 @@ impl AgentParams {
     }
 
     fn build_query(&self, default_limit: usize) -> Result<Query, ApiError> {
+        // Clamping *down* is safe here because the response says so: an over-large
+        // `limit` still reports `total_matching` and `truncated`, and an over-large
+        // `max_payload_chars` still marks each elided line. Zero is different —
+        // there is no "0 records, truncated" to report, so a silently-raised 0
+        // would look like a deliberate one-record answer. Reject it.
+        let limit = match self.limit {
+            Some(0) => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid `limit`: 0 (expected 1..={MAX_LIMIT})"),
+                ))
+            }
+            Some(n) => n.min(MAX_LIMIT),
+            None => default_limit,
+        };
+        let max_payload_chars = match self.max_payload_chars {
+            Some(0) => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid `max_payload_chars`: 0 (expected 1..={MAX_PAYLOAD_CHARS})"),
+                ))
+            }
+            Some(n) => n.min(MAX_PAYLOAD_CHARS),
+            None => DEFAULT_MAX_PAYLOAD_CHARS,
+        };
         Ok(Query::new(self.build_filter()?)
-            .with_limit(self.limit.unwrap_or(default_limit).clamp(1, MAX_LIMIT))
+            .with_limit(limit)
             .with_cursor(self.cursor)
-            .with_max_payload_chars(
-                self.max_payload_chars
-                    .unwrap_or(DEFAULT_MAX_PAYLOAD_CHARS)
-                    .clamp(1, MAX_PAYLOAD_CHARS),
-            ))
+            .with_max_payload_chars(max_payload_chars))
+    }
+
+    /// Trailing context lines per error group.
+    ///
+    /// Unlike `limit`, a reduced value here is invisible in the response — a
+    /// group carrying 50 of the 200 requested stack frames looks exactly like a
+    /// 50-frame stack trace. What cannot be announced must be refused.
+    fn context_lines(&self) -> Result<usize, ApiError> {
+        match self.context_lines {
+            Some(n) if n > MAX_CONTEXT_LINES => Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid `context_lines`: {n} (expected 0..={MAX_CONTEXT_LINES})"),
+            )),
+            Some(n) => Ok(n),
+            None => Ok(DEFAULT_CONTEXT_LINES),
+        }
     }
 }
 
 /// Raw records, newest-last, with a cursor for incremental follow-up reads.
 async fn query_handler(
     State(state): State<Arc<AppState>>,
-    AxumQuery(params): AxumQuery<AgentParams>,
+    AgentQuery(params): AgentQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let q = params.build_query(100)?;
     Ok(Json(
@@ -253,14 +321,11 @@ async fn query_handler(
 /// should reach for first. Defaults to `level >= error`.
 async fn errors_handler(
     State(state): State<Arc<AppState>>,
-    AxumQuery(params): AxumQuery<AgentParams>,
+    AgentQuery(params): AgentQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut params = params;
     params.level.get_or_insert_with(|| "error".to_string());
-    let context_lines = params
-        .context_lines
-        .unwrap_or(DEFAULT_CONTEXT_LINES)
-        .min(MAX_CONTEXT_LINES);
+    let context_lines = params.context_lines()?;
     let q = params.build_query(20)?;
     let summary = state.store.summarize(&q, context_lines);
     Ok(Json(serde_json::to_value(summary).map_err(|e| {
@@ -284,7 +349,7 @@ async fn sources_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// failure or too long to be worth waiting for.
 async fn wait_handler(
     State(state): State<Arc<AppState>>,
-    AxumQuery(params): AxumQuery<AgentParams>,
+    AgentQuery(params): AgentQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeout_ms = params.timeout_ms.unwrap_or(30_000).min(MAX_TIMEOUT_MS);
     let q = params.build_query(100)?;
@@ -295,11 +360,25 @@ async fn wait_handler(
     let mut rx = state.tx.subscribe();
 
     let snapshot = state.store.cursor();
-    if let Some(anchor) = state.store.latest_matching_seq(&q) {
+
+    // `require_new` turns the wait into a strictly forward-looking one. It is the
+    // answer to "did my change cause this?" when the caller holds no baseline
+    // cursor and cannot guess a `since` window: the buffer is not consulted at
+    // all, so a pre-existing match cannot end the wait early.
+    let require_new = params.require_new.unwrap_or(false);
+    if let Some(anchor) = (!require_new)
+        .then(|| state.store.latest_matching_seq(&q))
+        .flatten()
+    {
+        // This match was already in the buffer before the call — it is the
+        // previous build's "compiled successfully", not this one's, unless the
+        // caller scoped the search with `cursor` or `since`. Answering it is
+        // right (the event the caller waited for may genuinely have landed
+        // first), but reporting it as a fresh match is not.
         let result = state
             .store
             .records_from(anchor, q.limit, q.max_payload_chars);
-        return Ok(Json(wait_result(true, result, 0)));
+        return Ok(Json(wait_result(result, 0, true)));
     }
 
     let deadline = Duration::from_millis(timeout_ms);
@@ -316,7 +395,11 @@ async fn wait_handler(
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "wait subscriber lagged");
-                    if let Some(anchor) = state.store.latest_matching_seq(&q) {
+                    // Recover from the store, but only forward of the snapshot:
+                    // `latest_matching_seq` would happily anchor to a record that
+                    // predates the call, which is the one thing a wait must not
+                    // report as a new event.
+                    if let Some(anchor) = state.store.first_matching_seq_after(&q, snapshot) {
                         return Some(anchor);
                     }
                     continue;
@@ -332,6 +415,7 @@ async fn wait_handler(
         let horizon = state.store.records(&q);
         return Ok(Json(serde_json::json!({
             "matched": false,
+            "matched_from_buffer": false,
             "records": [],
             "total_matching": 0,
             "truncated": false,
@@ -351,19 +435,23 @@ async fn wait_handler(
         .store
         .records_from(anchor, q.limit, q.max_payload_chars);
     Ok(Json(wait_result(
-        true,
         result,
         started.elapsed().as_millis() as u64,
+        false,
     )))
 }
 
+/// `from_buffer` separates "this happened while you waited" from "this was
+/// already here when you asked". Both are `matched: true`, and only one of them
+/// is evidence about the change the caller just made.
 fn wait_result(
-    matched: bool,
     result: tailflow_core::query::QueryResult,
     waited_ms: u64,
+    from_buffer: bool,
 ) -> serde_json::Value {
     serde_json::json!({
-        "matched": matched,
+        "matched": true,
+        "matched_from_buffer": from_buffer,
         "records": result.records,
         "total_matching": result.total_matching,
         "truncated": result.truncated,
@@ -512,6 +600,119 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("since"));
     }
 
+    #[tokio::test]
+    async fn malformed_numeric_param_is_a_json_error_not_plain_text() {
+        // Axum's own rejection is a plain-text body. A caller that reads `error`
+        // finds nothing there — the same nothing a clean run produces.
+        let (status, body) = get(flood(), "/api/query?limit=abc").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "rejection must use the same {{\"error\": ...}} shape: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_agent_endpoint_reports_a_bad_filter_the_same_way() {
+        for path in ["/api/query", "/api/errors", "/api/wait"] {
+            let (status, body) = get(flood(), &format!("{path}?grep=%5B%5B%5Bbad")).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} accepted a bad regex"
+            );
+            assert!(body["error"].as_str().unwrap().contains("grep"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_rejects_a_bad_filter_instead_of_waiting_out_the_timeout() {
+        // Waiting the full timeout and answering "nothing matched" would be the
+        // worst possible answer: a confident negative from a filter that never ran.
+        let (status, body) = get(flood(), "/api/wait?level=loud&timeout_ms=120000").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("level"));
+    }
+
+    #[tokio::test]
+    async fn zero_valued_bounds_are_rejected_not_silently_raised() {
+        // There is no "0 records, truncated" to report, so a 0 quietly raised to 1
+        // would return one record and look like a deliberate answer.
+        let (status, body) = get(flood(), "/api/query?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("limit"));
+
+        let (status, body) = get(flood(), "/api/query?max_payload_chars=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("max_payload_chars"));
+    }
+
+    #[tokio::test]
+    async fn over_max_context_lines_is_rejected_because_the_cut_is_invisible() {
+        // A group holding 50 of the 200 frames asked for is indistinguishable from
+        // a 50-frame stack trace, so this bound is refused rather than clamped.
+        let (status, body) = get(flood(), "/api/errors?context_lines=200").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("context_lines"), "{message}");
+        assert!(
+            message.contains(&MAX_CONTEXT_LINES.to_string()),
+            "must state the bound: {message}"
+        );
+
+        let (status, _) = get(
+            flood(),
+            &format!("/api/errors?context_lines={MAX_CONTEXT_LINES}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the maximum itself must be allowed");
+    }
+
+    #[tokio::test]
+    async fn errors_reports_group_truncation_rather_than_implying_completeness() {
+        // Distinct *words*, not distinct numbers: fingerprinting normalises
+        // numbers away on purpose, so numbered payloads would collapse to one
+        // group and prove nothing about the group limit.
+        let payloads: Vec<String> = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee",
+        ]
+        .iter()
+        .map(|name| format!("ERROR the {name} handler refused to start"))
+        .collect();
+        let records: Vec<_> = payloads
+            .iter()
+            .map(|payload| ("api", LogLevel::Error, payload.as_str()))
+            .collect();
+        let (status, body) = get(state_with(records), "/api/errors").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["distinct"], 25, "all distinct failures are counted");
+        assert_eq!(
+            body["groups"].as_array().unwrap().len(),
+            20,
+            "default limit caps the groups returned"
+        );
+        assert_eq!(body["truncated"], true, "and the response says so");
+    }
+
+    #[tokio::test]
+    async fn every_bound_that_is_clamped_is_visible_in_the_response() {
+        // The rule: a bound may be silently reduced only when the response
+        // announces the reduction. `limit` announces via `truncated`, and
+        // `max_payload_chars` via `payload_truncated_from`.
+        let (_, body) = get(flood(), "/api/query?level=error&limit=99999999").await;
+        assert_eq!(body["total_matching"], 30);
+        assert!(body["truncated"].is_boolean());
+
+        let state = state_with(vec![("api", LogLevel::Info, &"x".repeat(20_000))]);
+        let (_, body) = get(state, "/api/query?max_payload_chars=99999999").await;
+        assert_eq!(body["records"][0]["payload_truncated_from"], 20_000);
+    }
+
     // ── /api/query ────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -595,6 +796,126 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["matched"], true);
         assert_eq!(body["waited_ms"], 0, "must not block on an existing match");
+    }
+
+    #[tokio::test]
+    async fn wait_marks_a_pre_existing_match_as_coming_from_the_buffer() {
+        // The dangerous case: the buffer holds the *previous* build's success
+        // line. Answering it is fine; presenting it as a fresh event is not.
+        let (_, body) = get(flood(), "/api/wait?grep=compiled&timeout_ms=60000").await;
+        assert_eq!(body["matched"], true);
+        assert_eq!(body["waited_ms"], 0);
+        assert_eq!(
+            body["matched_from_buffer"], true,
+            "a match older than the call must say so"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_marks_a_live_match_as_not_from_the_buffer() {
+        let state = state_with(vec![]);
+        let publisher = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let record = publisher.store.push(LogRecord {
+                timestamp: Utc::now(),
+                source: "web".into(),
+                level: LogLevel::Info,
+                payload: "compiled successfully".into(),
+            });
+            let _ = publisher.tx.send(record);
+        });
+        let (_, body) = get(state, "/api/wait?grep=compiled&timeout_ms=5000").await;
+        assert_eq!(body["matched"], true);
+        assert_eq!(body["matched_from_buffer"], false);
+    }
+
+    #[tokio::test]
+    async fn wait_since_excludes_a_stale_buffer_match() {
+        // `since` is what lets a caller demand a *new* event rather than accept
+        // whatever the buffer already held.
+        let state = state_with(vec![]);
+        state.store.push(LogRecord {
+            timestamp: Utc::now() - chrono::Duration::minutes(30),
+            source: "web".into(),
+            level: LogLevel::Info,
+            payload: "compiled successfully".into(),
+        });
+
+        let (_, body) = get(state.clone(), "/api/wait?grep=compiled&timeout_ms=100").await;
+        assert_eq!(body["matched"], true, "unbounded wait accepts the old line");
+
+        let (status, body) = get(state, "/api/wait?grep=compiled&since=5m&timeout_ms=100").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["matched"], false,
+            "a 30-minute-old line must not satisfy `since=5m`"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_new_refuses_to_answer_from_the_buffer() {
+        // Without it, the previous build's line ends the wait instantly.
+        let (_, body) = get(flood(), "/api/wait?grep=compiled&timeout_ms=100").await;
+        assert_eq!(body["matched"], true);
+        assert_eq!(body["matched_from_buffer"], true);
+
+        let (status, body) = get(
+            flood(),
+            "/api/wait?grep=compiled&require_new=true&timeout_ms=100",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["matched"], false,
+            "a line older than the call is not a new event"
+        );
+        assert!(
+            body["waited_ms"].as_u64().unwrap() >= 100,
+            "must actually wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_new_still_matches_a_line_that_arrives_during_the_wait() {
+        let state = flood(); // already holds a matching "compiled successfully"
+        let publisher = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let record = publisher.store.push(LogRecord {
+                timestamp: Utc::now(),
+                source: "web".into(),
+                level: LogLevel::Info,
+                payload: "compiled successfully in 412ms".into(),
+            });
+            let _ = publisher.tx.send(record);
+        });
+
+        let (_, body) = get(
+            state,
+            "/api/wait?grep=compiled&require_new=true&timeout_ms=5000",
+        )
+        .await;
+        assert_eq!(body["matched"], true);
+        assert_eq!(body["matched_from_buffer"], false);
+        assert!(body["records"][0]["payload"]
+            .as_str()
+            .unwrap()
+            .contains("412ms"));
+    }
+
+    #[tokio::test]
+    async fn require_new_rejects_a_non_boolean_value() {
+        let (status, body) = get(flood(), "/api/wait?require_new=yes%20please").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_is_never_reported_as_a_buffer_match() {
+        let (_, body) = get(flood(), "/api/wait?grep=never-appears&timeout_ms=100").await;
+        assert_eq!(body["matched"], false);
+        assert_eq!(body["matched_from_buffer"], false);
     }
 
     #[tokio::test]
