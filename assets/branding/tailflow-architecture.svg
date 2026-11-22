@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="t d">
+<title id="t">TailFlow architecture</title>
+<desc id="d">Sources (dev processes, Docker containers, log files, piped stdin) flow into tailflow-daemon, a Rust process on 127.0.0.1 that detects severity, groups errors, redacts secrets, and keeps a live in-memory buffer plus local SQLite history. The daemon serves a web dashboard, an HTTP and SSE API, the tailflow-mcp server for MCP clients such as Claude Code, and the tailflow-logs shell CLI. Agent activity collectors are planned and not yet available.</desc>
+<defs>
+<marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0 1L9 5L0 9z" fill="#9ca3af"/></marker>
+</defs>
+<rect width="1600" height="720" rx="28" fill="#0d0d0d"/>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Helvetica,Arial,sans-serif">
+<g fill="#9ca3af" font-size="17" font-weight="600" letter-spacing="2">
+<text x="72" y="76">SOURCES</text>
+<text x="600" y="76">COLLECT · PROCESS · STORE</text>
+<text x="1136" y="76">USE IT FROM</text>
+</g>
+<rect x="600" y="100" width="400" height="492" rx="16" fill="#111" stroke="#22d3ee" stroke-width="2"/>
+<g fill="#161616" stroke="#9ca3af" stroke-opacity=".3" stroke-width="1.5">
+<rect x="72" y="100" width="392" height="76" rx="12"/>
+<rect x="72" y="192" width="392" height="76" rx="12"/>
+<rect x="72" y="284" width="392" height="76" rx="12"/>
+<rect x="72" y="376" width="392" height="76" rx="12"/>
+<rect x="1136" y="100" width="392" height="76" rx="12"/>
+<rect x="1136" y="192" width="392" height="76" rx="12"/>
+<rect x="1136" y="284" width="392" height="76" rx="12"/>
+<rect x="1136" y="376" width="392" height="76" rx="12"/>
+<rect x="632" y="200" width="336" height="64" rx="10"/>
+<rect x="632" y="280" width="336" height="64" rx="10"/>
+<rect x="632" y="360" width="160" height="112" rx="10"/>
+<rect x="808" y="360" width="160" height="112" rx="10"/>
+</g>
+<rect x="72" y="496" width="392" height="96" rx="12" fill="none" stroke="#9ca3af" stroke-opacity=".5" stroke-width="1.5" stroke-dasharray="6 6"/>
+<g fill="#9ca3af" stroke="#9ca3af" stroke-width="2">
+<path d="M464 138H532M464 230H532M464 322H532M464 414H532M532 138V414" fill="none" stroke-opacity=".6"/>
+<path d="M532 322H596" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M464 544H596" stroke-dasharray="6 6" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M1000 322H1068M1068 138V414" fill="none" stroke-opacity=".6"/>
+<path d="M1068 138H1132" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M1068 230H1132" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M1068 322H1132" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M1068 414H1132" marker-end="url(#a)" stroke-opacity=".6"/>
+<path d="M800 264V276M800 344V356" stroke-opacity=".6"/>
+</g>
+<g fill="#f5f5f5" font-size="24" font-weight="600">
+<text x="96" y="134">Dev processes</text>
+<text x="96" y="226">Docker containers</text>
+<text x="96" y="318">Log files</text>
+<text x="96" y="410">Piped stdin</text>
+<text x="96" y="530" fill="#9ca3af">Agent activity</text>
+<text x="1160" y="134">Web dashboard</text>
+<text x="1160" y="226">HTTP API + SSE</text>
+<text x="652" y="228" font-size="21">Detect level, group errors</text>
+<text x="652" y="308" font-size="21">Redact secrets</text>
+<text x="652" y="390" font-size="21">Live buffer</text>
+<text x="828" y="390" font-size="21">History</text>
+</g>
+<text x="270" y="530" fill="#22d3ee" font-size="15" font-weight="700" letter-spacing="1.5">PLANNED</text>
+<g fill="#9ca3af" font-size="18">
+<text x="96" y="160">stdout + stderr of commands it runs</text>
+<text x="96" y="252">every container on the local daemon</text>
+<text x="96" y="344">appended lines, survives rotation</text>
+<text x="96" y="436">pipe any command's output in</text>
+<text x="96" y="556">sessions, tool calls,</text>
+<text x="96" y="578">file edits, commands</text>
+<text x="1160" y="160">http://127.0.0.1:7878</text>
+<text x="1160" y="252">/api/* live · /api/v1/* history</text>
+<text x="1160" y="344">MCP stdio → Claude Code, MCP clients</text>
+<text x="1160" y="436">shell CLI → agents and scripts</text>
+<text x="632" y="176">Rust · listens on 127.0.0.1 only</text>
+<text x="652" y="252" font-size="16">severity · error fingerprints</text>
+<text x="652" y="332" font-size="16">before display and storage</text>
+<text x="652" y="414" font-size="16">bounded ring</text>
+<text x="652" y="434" font-size="16">in memory</text>
+<text x="828" y="414" font-size="16">SQLite on disk</text>
+<text x="828" y="434" font-size="16">30-day default,</text>
+<text x="828" y="454" font-size="16">2 GB cap</text>
+<text x="632" y="516" font-size="16">Runs on your machine. History is one</text>
+<text x="632" y="538" font-size="16">events.db in your user data directory;</text>
+<text x="632" y="560" font-size="16">nothing is uploaded.</text>
+<text x="72" y="660" font-size="17">Solid boxes are implemented; dashed boxes are planned. The tailflow TUI reads sources directly and keeps no history.</text>
+</g>
+</g>
+<g font-family="ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="700" fill="#f5f5f5">
+<text x="632" y="148" font-size="28">tailflow-daemon</text>
+<text x="1160" y="318" font-size="23">tailflow-mcp</text>
+<text x="1160" y="410" font-size="23">tailflow-logs</text>
+</g>
+</svg>
