@@ -238,11 +238,40 @@ underlying evidence should not.
 3. TailFlow reconciles the new container ID and begins following its output.
 4. Verify the new startup event rather than assuming replacement implies health.
 
+## 7. Keep history that survives restarts
+
+### Problem
+
+An agent that restarts the daemon, or comes back the next morning, loses every
+log line held only in memory — and cannot tell a quiet night from a crash.
+
+### Capability
+
+- Local SQLite history of runtime logs and collector lifecycle, 30 days and
+  2 GB by default, queryable through `/api/v1/events` by type, source, severity,
+  time, path, and full text.
+- Persistent cursors that keep increasing across restarts.
+- Redaction of common credential formats before display or storage, with
+  `metadata`, `redacted`, and `full` capture modes.
+- A `completeness` verdict on every history response, driven by recorded gaps
+  (bus lag, queue overflow, write failures, unclean shutdowns, deletions).
+- Storage and collector health in `/api/v1/storage/status`,
+  `/api/v1/collectors/status`, and the dashboard diagnostics panel.
+
+### What this proves
+
+That an event was received and committed — or, when `complete` is `false`,
+exactly that the record is known to be incomplete. History does not prove what
+happened while no daemon was running. See [durable history](storage.md).
+
 ## Feature boundaries
 
 TailFlow observes text emitted by local software. It does not collect metrics,
-traces, profiles, internal application state, or durable production history.
-Classification and grouping are heuristics, and all retained evidence is bounded.
+traces, profiles, internal application state, or production history, and it
+does not yet collect coding-agent activity (sessions, tool calls, file edits,
+commands) — the event schema for those exists, the collectors do not.
+Classification, grouping, and redaction are heuristics, and all retained
+evidence is bounded.
 
 Read [limitations and operational boundaries](limitations.md) for the complete
 security, retention, platform, and inference model.

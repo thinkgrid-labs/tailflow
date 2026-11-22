@@ -9,6 +9,71 @@ crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
 ## [Unreleased]
 
+Milestone M1: durable event engine and observability foundation. TailFlow now
+keeps a local, private, queryable history and states explicitly when that
+history is incomplete.
+
+### Added
+
+- **Durable local history.** `tailflow-daemon` records runtime logs and
+  collector lifecycle in a local SQLite database (WAL, bundled SQLite 3.53,
+  FTS5) in the user data directory. Defaults: 30-day retention, 2 GB size cap,
+  7-day retention for optional payload bodies. New `tailflow-storage` crate.
+- **Versioned event model** (`ObservabilityEvent`, schema v1) with provenance
+  (`agent_reported`, `filesystem_observed`, `runtime_observed`,
+  `system_observed`), an event-type catalog covering runtime, agent, file,
+  command, git, and system events, strict validation, and replay-safe
+  deduplication for producers with stable ids. Agent, file, command, and git
+  collectors are **not** part of this release; the types are schema only.
+- **`/api/v1` read API:** `events` (filters by type or family, source, session,
+  agent, project, severity, status, path glob or prefix, command, full text,
+  and time; seq cursors in both directions), `events/{seq}` (`404` vs `410`
+  expired), `storage/status`, `storage/retention`, `collectors/status`,
+  `schema`, and `privacy`. Unknown parameters are `400`s.
+- **Completeness on every history response:** recorded gaps for ingestion-bus
+  lag, storage-queue overflow, failed commits, unclean shutdowns (unknown
+  count), and deleted sessions, plus retention horizons. Responses are never
+  marked complete after detected loss in the scanned range.
+- **Privacy controls:** `[privacy]` capture modes `metadata` (default),
+  `redacted`, and `full`; built-in redaction of common credential formats with
+  multi-line private-key handling; custom rules and rule exclusions; event-type,
+  agent, path-glob, and project-directory collection boundaries.
+- **`tailflow-daemon storage path|status|check|purge`.** Purge (all, before a
+  time, or one session) requires `--yes` and is safe while a daemon runs.
+- `--no-storage` and `--db PATH` daemon flags; `[storage]` and `[privacy]`
+  config sections (strict: unknown keys are errors).
+- Dashboard **diagnostics** panel and a banner when the live view missed
+  records.
+- `Source::kind()` (default method) so persisted events record their collector
+  family.
+
+### Changed
+
+- **Live output is redacted by default.** Redaction runs once at ingestion, so
+  the dashboard, SSE, `/api/records`, `/api/query`, `/api/errors`, MCP, and the
+  database all see `[REDACTED:<rule>]` in place of matched secrets. Set
+  `capture = "full"` to restore verbatim output.
+- Ingestion-bus overflow, previously only a log line on the daemon's stderr, is
+  now counted and surfaced: `ingest_dropped` on `/health`, `/api/sources`,
+  `/api/query`, `/api/errors`, and `/api/wait` (additive field), a
+  `[tailflow] N log records were dropped` warning in the live stream, and a
+  durable gap.
+- SSE subscribers that fall behind receive a named `gap` event; clients that
+  listen only for `message` events are unaffected.
+- `tailflow-mcp` and `tailflow-logs` warn when the daemon dropped records, and a
+  wait timeout after loss no longer claims the condition "did not occur".
+- The daemon handles `SIGTERM` like Ctrl-C and drains durable storage before
+  exiting.
+- The daemon applies `--grep`/`--source` in its single ingestion task instead
+  of a second broadcast hop, removing one point where records could be lost.
+
+### Security
+
+- Browser requests with a non-loopback `Origin`, and cross-site requests other
+  than top-level navigation (`Sec-Fetch-Site`), are refused with `403`. Request
+  targets over 8 KiB are refused with `414`. No HTTP endpoint mutates or deletes
+  data.
+
 ## [0.3.3] - 2026-08-19
 
 Correctness release for the agent contract. Every change here closes a path

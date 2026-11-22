@@ -9,6 +9,27 @@ sources.
 ## System overview
 
 ```text
+Docker / Process / File / Stdin
+            │ LogRecord
+            ▼
+   broadcast bus (4,096) ── Lagged(n) → counted, gap recorded, warn record
+            │
+            ▼
+   daemon fan-out (one task): filter → redact → ring push → SSE broadcast
+            │                                      │
+            │ try_send (never blocks)              └─► /api/query, /errors, /wait, MCP
+            ▼
+   bounded queue ── full → counted, gap recorded
+            │
+            ▼
+   writer thread: batch (≤512 / 100 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL)
+            │                                                        ▲
+            └─ retention, heartbeats, gap rows          reader pool ─┘ /api/v1/*
+```
+
+The pre-M1 view of the same system:
+
+```text
 ┌────────────────────────── tailflow-core ──────────────────────────┐
 │ Docker ─┐                                                         │
 │ Process ┼──► broadcast channel of LogRecord ──┬──► bounded store  │
@@ -39,6 +60,14 @@ depend on a UI.
 Each source implements the same asynchronous lifecycle and receives a
 cancellation token. That lets the TUI and daemon shut down file watchers,
 container streams, and spawned process trees consistently.
+
+### `tailflow-storage`
+
+The durable event store: one writer thread owning a read-write SQLite
+connection, a small pool of read-only connections for queries, transactional
+schema migrations, FTS5 full-text search, chunked retention, durable gap rows,
+and run tracking for unclean-shutdown detection. It depends on `tailflow-core`
+for the event model and privacy policy and is used only by the daemon.
 
 ### `tailflow-daemon`
 
@@ -95,7 +124,41 @@ addresses, UUIDs, and quoted values—to build a bounded fingerprint. The origin
 sample remains available, while repeated fingerprints collapse into one group
 with first/last timestamps and an occurrence count.
 
+## Event model
+
+`ObservabilityEvent` (schema version 1) is the envelope for everything stored:
+`event_id`, `timestamp` (source time) and `observed_at` (receive time),
+`event_type` from a fixed catalog, `provenance`, `source_type`/`source_id`,
+optional `project_id`, `session_id`, `operation_id`, `parent_operation_id`,
+`agent_name`, `severity`, `status`, `duration_ms`, `path`, `message`,
+`attributes`, `payload`, and `redaction` metadata. Unknown types and unknown
+envelope fields are rejected. Runtime lines are converted with
+`ObservabilityEvent::from_log_record`; the live path keeps using `LogRecord`.
+
+The persistent cursor is SQLite's `AUTOINCREMENT` `seq`, which never repeats
+even after deletes. The writer keeps `observed_at` non-decreasing in `seq`
+order and clamps future source timestamps, so a `since` bound translates into
+an exact seq bound. See [durable history](storage.md) for the full contract.
+
 ## Design invariants
+
+### Loss is never silent
+
+Every lossy hop is counted and recorded: source-bus lag, storage-queue
+overflow, failed commits, and unclean shutdowns. Persisted history carries gap
+rows in the same transaction as the next batch, and responses derive
+`completeness` from them.
+
+### Persistence never blocks live logs
+
+Ingestion offers events to storage with `try_send`. A slow disk can cost
+durable history (visibly) but cannot stall SSE, the ring, or agents.
+
+### One redaction point
+
+Redaction runs once in the daemon fan-out, before the ring, SSE, legacy
+endpoints, MCP, and storage; storage re-applies the stateless rules as defense
+in depth.
 
 ### Bounded output
 
@@ -124,8 +187,11 @@ Windows so development servers are not left behind.
 ### Local security boundary
 
 The daemon is intentionally loopback-only, has no permissive CORS layer, and
-rejects nonlocal Host headers. Remote access would require a separate security
-model rather than an accidental bind-address change.
+rejects nonlocal Host headers. Browser requests carrying a non-loopback
+`Origin`, and cross-site requests other than top-level navigation, are refused.
+No HTTP endpoint mutates or deletes data; purging is a local CLI command.
+Remote access would require a separate security model rather than an
+accidental bind-address change.
 
 ## Repository layout
 
@@ -134,6 +200,7 @@ tailflow/
 ├── crates/
 │   ├── tailflow-core/      ingestion, processing, query store
 │   ├── tailflow-tui/       interactive terminal UI
+│   ├── tailflow-storage/   SQLite event store, retention, queries
 │   ├── tailflow-daemon/    HTTP/SSE server and embedded web UI
 │   └── tailflow-agent/     MCP and shell clients
 ├── web/                    Preact dashboard
@@ -154,6 +221,7 @@ tailflow/
 | File watching | notify |
 | Terminal UI | Ratatui and Crossterm |
 | HTTP server | Axum |
+| Durable storage | SQLite 3.53 (bundled via rusqlite 0.40), WAL, FTS5 |
 | Web UI | Preact and Vite, embedded with rust-embed |
 | Agent protocol | JSON-RPC 2.0 and MCP over stdio |
 | Distribution | npm platform packages and GitHub release binaries |

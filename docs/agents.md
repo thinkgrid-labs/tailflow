@@ -342,8 +342,20 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.3.3", "buffered": 125, "cursor": 125 }
+{ "ok": true, "version": "0.3.3", "buffered": 125, "cursor": 125,
+  "ingest_dropped": 0, "storage": { "state": "ok", "loss_detected": false } }
 ```
+
+`ok` means the daemon is serving. `ingest_dropped` (also present on
+`/api/query`, `/api/errors`, `/api/wait`, and `/api/sources`) counts records the
+daemon lost at ingestion in this run; when it is non-zero, an empty result is
+not evidence that nothing happened.
+
+### Durable history: `/api/v1/*`
+
+History that survives restarts, with persistent cursors and a `completeness`
+verdict, is served under `/api/v1/events`. See
+[durable history](storage.md#http-api-v1) for parameters and guarantees.
 
 ---
 

@@ -12,6 +12,7 @@ Use this page to find the shortest path to the information you need.
 | Learn the MCP tools | [TailFlow for agents](agents.md#mcp-tools) |
 | Use TailFlow from a shell or script | [TailFlow for agents: shell client](agents.md#shell-client) |
 | Call the HTTP API | [TailFlow for agents: HTTP API](agents.md#http-api) |
+| Keep history, set retention, or control what is recorded | [Durable history](storage.md) |
 | Understand the internals | [Architecture](architecture.md) |
 | Evaluate production or automation use | [Limitations](limitations.md) |
 | See planned work | [Roadmap](roadmap.md) |
@@ -34,6 +35,12 @@ interface availability, and the evidence each feature can and cannot provide.
 Reference for the four MCP tools, reliable agent workflow patterns, the
 `tailflow-logs` CLI, cursor behavior, and HTTP response shapes.
 
+### [Durable history, retention, and privacy](storage.md)
+
+Where history is stored, durability and completeness guarantees, retention and
+size caps, capture modes and redaction, health inspection, purging, and the
+`/api/v1` endpoints.
+
 ### [Architecture](architecture.md)
 
 How ingestion, buffering, presentation, and packaging fit together, including
@@ -41,7 +48,7 @@ the repository layout and important design invariants.
 
 ### [Limitations](limitations.md)
 
-The local-only security model, memory retention, heuristic classification,
+The local-only security model, retention, heuristic classification and redaction,
 supported sources and platforms, and what TailFlow deliberately does not do.
 
 ### [Roadmap](roadmap.md)
