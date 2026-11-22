@@ -55,8 +55,20 @@ agent edits → waits for runtime output → reads the failure → fixes and ver
 See the [feature guide](docs/features.md) for use cases, interface mapping, and
 the boundary of each capability.
 
-TailFlow is deliberately a **local runtime-verification layer**. It is not a
-hosted log platform, an APM product, or a replacement for production monitoring.
+TailFlow is deliberately **local-first**. It is not a hosted log platform, an
+APM product, or a replacement for production monitoring.
+
+### Durable local history
+
+The daemon records what it collects in a local SQLite database (30-day
+retention and a 2 GB cap by default), so evidence survives a restart and can be
+queried by time, source, event type, and full text through `/api/v1/events`.
+Secrets matching common credential formats are redacted before anything is
+displayed or written, and every history response says whether it is complete —
+dropped events, crashes, and deletions are reported, never papered over.
+TailFlow's direction is local observability for coding agents: see what your
+agents actually do. Agent activity collectors are not part of this release.
+See [durable history, retention, and privacy](docs/storage.md).
 
 ## Quick start
 
@@ -187,13 +199,14 @@ requests, wait timeouts, and an unavailable daemon.
 
 `tailflow-daemon` serves an embedded dashboard at
 <http://127.0.0.1:7878> with source counts, severity filters, regex search, and
-scroll-aware live following.
+scroll-aware live following. Its **diagnostics** panel shows storage size,
+retention, the oldest retained event, collector health, and any detected loss.
 
 ## Choose the right entry point
 
 | Command | Purpose | Runs for |
 |---|---|---|
-| `tailflow-daemon` | Collect logs, retain the buffer, serve HTTP/SSE and the dashboard | Your development session |
+| `tailflow-daemon` | Collect logs, keep the live buffer and durable history, serve HTTP/SSE and the dashboard | Your development session |
 | `tailflow-mcp` | Bridge one MCP client to the daemon over stdio | The MCP client session |
 | `tailflow-logs` | Make one query from a shell or script | One command |
 | `tailflow` | View configured sources in an interactive terminal | Your TUI session |
@@ -228,8 +241,11 @@ The important boundaries are:
 
 - TailFlow listens on loopback and has no authentication or TLS. It is intended
   for one developer machine, not a shared or internet-facing server.
-- The log buffer is memory-only and bounded. History is lost when the daemon
-  restarts, and very active stacks can evict older records.
+- The live buffer used by the MCP tools is bounded and per-process. Durable
+  history lives in local SQLite under a retention window and size cap; events
+  in flight when the daemon is killed are lost (and reported as a gap).
+- Redaction of secrets is heuristic. It catches common credential formats, not
+  every secret.
 - Severity detection and error fingerprinting are heuristics. Unusual log
   formats may be classified or grouped imperfectly.
 - Docker support follows all running containers from the local Docker daemon;
@@ -249,6 +265,7 @@ TailFlow in automation or with sensitive logs.
 | [Features](docs/features.md) | Capabilities organized by the problem and outcome |
 | [TailFlow for agents](docs/agents.md) | MCP tools, shell client, workflow patterns, and HTTP API |
 | [Architecture](docs/architecture.md) | Components, data flow, invariants, and repository layout |
+| [Durable history](docs/storage.md) | SQLite history, retention, privacy, health, and the v1 API |
 | [Limitations](docs/limitations.md) | Security, retention, inference, and source boundaries |
 | [Roadmap](docs/roadmap.md) | Planned directions and explicit non-goals |
 | [Contributing](CONTRIBUTING.md) | Development environment and pull requests |

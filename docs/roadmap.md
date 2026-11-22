@@ -52,12 +52,23 @@ Roadmap work should preserve four properties:
 - Let an agent follow one operation across several services without broad text
   searches.
 
-### Durable local history
+### Durable local history (delivered in M1)
 
-- Offer an optional SQLite-backed bounded store so a short history can survive
-  daemon restarts.
-- Preserve explicit horizons and retention limits even when persistence is
-  enabled.
+- [x] SQLite event store with retention, size cap, and persistent cursors.
+- [x] Explicit horizons, gaps, and completeness on every history response.
+- [x] Redaction before display and storage; capture modes.
+
+### Agent observability (next)
+
+TailFlow's direction is local observability for coding agents — what an agent
+did, which files and commands it touched, and whether the result was verified
+against the running application.
+
+- M2: opt-in agent collectors (sessions, tool calls, file and command events)
+  writing the existing event schema, with explicit provenance.
+- M3: an agent-activity dashboard built on the v1 query API.
+- A human-readable query language (`agent:claude type:file.modified since:24h`)
+  compiling to the existing structured filters.
 
 ### Additional interfaces
 

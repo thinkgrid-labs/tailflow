@@ -4,6 +4,7 @@ members = [
     "crates/tailflow-tui",
     "crates/tailflow-daemon",
     "crates/tailflow-agent",
+    "crates/tailflow-storage",
 ]
 resolver = "2"
 

@@ -114,6 +114,10 @@ impl ProcessSource {
 
 #[async_trait::async_trait]
 impl Source for ProcessSource {
+    fn kind(&self) -> &'static str {
+        "process"
+    }
+
     fn name(&self) -> &str {
         &self.label
     }

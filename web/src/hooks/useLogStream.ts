@@ -6,6 +6,9 @@ const MAX_RECORDS = 5_000
 export function useLogStream() {
   const [records, setRecords] = useState<LogRecord[]>([])
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
+  // Records this dashboard's stream missed because it fell behind. Never
+  // reset by `clear`: missing records are a fact about the session.
+  const [missed, setMissed] = useState(0)
 
   // Batch incoming records to requestAnimationFrame cadence (~60fps max)
   // so a high-velocity log stream doesn't thrash the render loop.
@@ -61,6 +64,16 @@ export function useLogStream() {
       }
     }
 
+    // The daemon sends a named `gap` event when this subscriber lagged. Count
+    // it and rehydrate from the ring so nothing is silently absent.
+    es.addEventListener('gap', (e: MessageEvent) => {
+      try {
+        const { dropped } = JSON.parse(e.data) as { dropped?: number }
+        if (typeof dropped === 'number') setMissed(m => m + dropped)
+      } catch { /* malformed gap event: still rehydrate */ }
+      hydrate()
+    })
+
     es.onerror = () => {
       // EventSource reconnects automatically after transient daemon restarts.
       setStatus(es.readyState === EventSource.CLOSED ? 'disconnected' : 'connecting')
@@ -85,5 +98,5 @@ export function useLogStream() {
     setRecords([])
   }, [])
 
-  return { records, status, clear }
+  return { records, status, clear, missed }
 }

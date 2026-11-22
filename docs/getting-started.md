@@ -212,6 +212,15 @@ See [`tailflow.example.toml`](../tailflow.example.toml) for a copyable template.
 | `[[sources.process]]` | `cmd` | Yes | Command passed to the platform shell |
 | `[[sources.process]]` | `restart` | No | `never`, `on-failure`, or `always`; default `never` |
 | `[[sources.process]]` | `restart_delay_ms` | No | Initial backoff; default 1,000 ms, doubling to a 30-second cap |
+| `[storage]` | `enabled` | No | Durable SQLite history; default `true` |
+| `[storage]` | `retention_days` | No | `1`–`36500` or `"unlimited"`; default `30` |
+| `[storage]` | `max_size_mb` | No | Size cap, always enforced; default `2048` |
+| `[storage]` | `path` | No | Database file; default in the user data directory |
+| `[privacy]` | `capture` | No | `metadata` (default), `redacted`, or `full` |
+
+The `[storage]` and `[privacy]` sections accept more settings; see
+[durable history, retention, and privacy](storage.md). Unknown keys in those two
+sections are errors, so a typo cannot silently change retention or redaction.
 
 ## Start and verify the daemon
 
@@ -365,13 +374,37 @@ error line.
 
 ### Expected older logs are missing
 
-The buffer is memory-only and bounded. Increase `--buffer` for a longer horizon.
-History is not retained across daemon restarts. Cursor-aware responses explicitly
-report when an incremental request has fallen behind the buffer.
+The MCP tools and `/api/query` read the bounded in-memory buffer of the current
+daemon run; increase `--buffer` for a longer live horizon. Older and
+pre-restart history is in the durable store:
+
+```bash
+curl -s 'localhost:7878/api/v1/events?since=2h&order=desc'
+tailflow-daemon storage status
+```
+
+If `completeness.complete` is `false`, events were lost (the `gaps` list says
+why). If `retention_truncated` is `true`, the range reaches past the retention
+window.
+
+### The daemon says durable history is unavailable
+
+The database could not be opened — commonly a file that is not a TailFlow
+database, a schema from a newer TailFlow, or an unwritable directory. The
+daemon leaves the file untouched and runs memory-only. Point `--db` at a new
+path, or move the file aside after inspecting it with
+`tailflow-daemon storage check`.
+
+### Secrets appear as `[REDACTED:…]`
+
+Redaction is on by default for every interface. Set `capture = "full"` under
+`[privacy]` to see verbatim output, or disable one rule with
+`disabled_rules = ["rule_name"]`.
 
 ## Next steps
 
 - Understand the capability model in [Features](features.md).
 - Learn reliable agent workflows in [TailFlow for agents](agents.md).
 - Review the [limitations](limitations.md) before automating decisions.
+- Configure history and privacy in [Durable history](storage.md).
 - Read the [architecture](architecture.md) if you want to contribute.

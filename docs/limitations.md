@@ -10,7 +10,10 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 | Area | Current boundary | Practical implication |
 |---|---|---|
 | Network | Loopback-only HTTP, no auth or TLS | Do not expose the daemon directly to a network |
-| Retention | Bounded in-memory ring | History disappears on restart and can be evicted |
+| Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
+| Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
+| Redaction | Heuristic credential patterns | Not every secret is detected |
+| Agent activity | Schema only | No agent, file, command, or git collectors yet |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
@@ -32,8 +35,17 @@ That is appropriate for one developer machine. It is not sufficient for:
 - multi-tenant log access.
 
 Logs can contain credentials, tokens, personal data, and customer content.
-TailFlow does not redact payloads. Configure sources carefully and remember that
-any local process able to connect to the daemon can query its buffer.
+TailFlow redacts common credential formats (API keys, bearer tokens, URL
+passwords, private keys, `password=` assignments) before display and before
+storage, unless `capture = "full"`. That is a heuristic: personal data,
+customer content, and secrets in unrecognized formats pass through.
+
+Any local process running as any user able to connect to `127.0.0.1` can read
+the live buffer and durable history over HTTP; there is no per-client
+authentication. Browser pages from other origins are refused (`Origin` and
+`Sec-Fetch-Site` checks plus the Host allowlist), and no HTTP endpoint can
+delete or change data. The database file is protected only by filesystem
+permissions (a user-only directory on Unix) and is not encrypted at rest.
 
 If remote access is required, place an authenticated, encrypted proxy in front
 of TailFlow and evaluate the exposure deliberately. Remote operation is not a
@@ -41,9 +53,20 @@ tested first-class workflow.
 
 ## Retention and completeness
 
-The daemon retains the newest `--buffer` records, defaulting to 5,000. It does
-not persist them to disk. A restart starts a new cursor lifetime with no earlier
-history.
+The live ring retains the newest `--buffer` records, defaulting to 5,000, and
+restarts its cursor at each daemon start. Durable history is separate: SQLite,
+30-day retention, 2 GB cap, persistent cursors. See
+[durable history](storage.md) for its guarantees. In particular:
+
+- an event counts as persisted only after its batch commits; with the default
+  `synchronous = "normal"` the newest commits can be lost on power failure;
+- the size cap applies to live database pages; the WAL and not-yet-reclaimed
+  free pages can briefly add to the file size;
+- the TUI does not write history;
+- one database is shared by all your daemons by default, so history from
+  other projects (recorded under their own privacy settings) is visible unless
+  you filter by `project` or give each project its own `[storage] path`; and
+- time during which no daemon ran is not recorded as a gap.
 
 Responses expose `buffer_start_cursor`, `next_cursor`, `buffer_starts_at`, and
 `cursor_gap` where relevant. Callers should treat `cursor_gap: true` or a short

@@ -1,6 +1,9 @@
 use crate::state::AppState;
 use axum::{
-    extract::{rejection::QueryRejection, FromRequestParts, Query as AxumQuery, Request, State},
+    extract::{
+        rejection::QueryRejection, DefaultBodyLimit, FromRequestParts, Query as AxumQuery, Request,
+        State,
+    },
     http::{header, request::Parts, StatusCode, Uri},
     middleware::{self, Next},
     response::{
@@ -38,10 +41,77 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sources", get(sources_handler))
         .route("/api/wait", get(wait_handler))
         .route("/health", get(health_handler))
+        .merge(crate::api_v1::router())
         // Everything else → embedded web UI
         .fallback(static_handler)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(guard_browser_origin))
         .layer(middleware::from_fn(validate_local_host))
         .with_state(state)
+}
+
+/// No endpoint accepts a body; anything larger than this is refused unread.
+const MAX_BODY_BYTES: usize = 16 * 1024;
+/// Longest accepted request target. Query strings beyond this are not a
+/// legitimate filter.
+const MAX_URI_BYTES: usize = 8 * 1024;
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host, port) = match authority.strip_prefix("[::1]") {
+        Some(rest) => ("[::1]", rest),
+        None => authority
+            .find(':')
+            .map_or((authority, ""), |i| authority.split_at(i)),
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// Browser-facing protections, layered on the Host check:
+///
+/// - A request carrying an `Origin` that is not this machine's loopback is
+///   refused (403). Browsers attach `Origin` to cross-origin fetches, so a web
+///   page cannot use a visitor's browser to query local logs.
+/// - `Sec-Fetch-Site: cross-site` is refused for anything except a top-level
+///   navigation (a user clicking a link to the dashboard).
+/// - Oversized request targets are refused (414).
+///
+/// Non-browser clients (curl, `tailflow-mcp`) send neither header and are
+/// unaffected.
+async fn guard_browser_origin(request: Request, next: Next) -> Response {
+    if request.uri().to_string().len() > MAX_URI_BYTES {
+        return (StatusCode::URI_TOO_LONG, "request target too long").into_response();
+    }
+    let headers = request.headers();
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let ok = origin.to_str().is_ok_and(is_loopback_origin);
+        if !ok {
+            return (
+                StatusCode::FORBIDDEN,
+                "TailFlow accepts browser requests from loopback origins only",
+            )
+                .into_response();
+        }
+    }
+    let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    let mode = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok());
+    if site == Some("cross-site") && mode != Some("navigate") {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-site browser requests are not accepted",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn validate_local_host(request: Request, next: Next) -> Response {
@@ -107,6 +177,7 @@ async fn sse_handler(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, axum::Error>>> {
     let filter = params.into_filter();
     let rx = state.tx.subscribe();
+    let ingest = state.ingest.clone();
     let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
         Ok(record) if filter.matches_seq(&record) => match serde_json::to_string(&record) {
             Ok(data) => Some(Ok(Event::default().data(data))),
@@ -118,7 +189,14 @@ async fn sse_handler(
         Ok(_) => None,
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
             tracing::warn!(dropped = n, "SSE client lagged");
-            None
+            ingest
+                .sse_lagged
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            // A named event: clients that only listen to `message` (older
+            // dashboards) ignore it; current ones rehydrate from the ring.
+            Some(Ok(Event::default()
+                .event("gap")
+                .data(serde_json::json!({ "dropped": n }).to_string())))
         }
     });
 
@@ -139,15 +217,53 @@ async fn records_handler(
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ingest = state.ingest.view();
+    let storage = match &state.storage {
+        crate::state::StorageSlot::Enabled(s) => {
+            let h = s.health();
+            serde_json::json!({
+                "state": h.writer_state,
+                "loss_detected": h.loss_detected,
+                "events_persisted": h.events_persisted,
+                "events_dropped": h.events_dropped_total,
+            })
+        }
+        crate::state::StorageSlot::Disabled => serde_json::json!({ "state": "disabled" }),
+        crate::state::StorageSlot::Unavailable { kind, .. } => {
+            serde_json::json!({ "state": "unavailable", "kind": kind })
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            // `ok` means the daemon is serving. Check `ingest_dropped` and
+            // `storage.loss_detected` before treating history as complete.
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "buffered": state.store.len(),
             "cursor": state.store.cursor(),
+            "ingest_dropped": ingest.records_dropped,
+            "storage": storage,
         })),
     )
+}
+
+/// Add the live-ingestion loss counter to a legacy response. Additive: older
+/// clients ignore the field; agents use it to avoid reading an incomplete
+/// buffer as "nothing happened".
+fn with_ingest_loss(state: &AppState, mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "ingest_dropped".into(),
+            serde_json::Value::from(
+                state
+                    .ingest
+                    .dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
+    }
+    v
 }
 
 // ── Agent read path ───────────────────────────────────────────────────────────
@@ -311,10 +427,9 @@ async fn query_handler(
     AgentQuery(params): AgentQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let q = params.build_query(100)?;
-    Ok(Json(
-        serde_json::to_value(state.store.records(&q))
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-    ))
+    let v = serde_json::to_value(state.store.records(&q))
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(with_ingest_loss(&state, v)))
 }
 
 /// Distinct failures rather than every occurrence — the endpoint an agent
@@ -328,9 +443,9 @@ async fn errors_handler(
     let context_lines = params.context_lines()?;
     let q = params.build_query(20)?;
     let summary = state.store.summarize(&q, context_lines);
-    Ok(Json(serde_json::to_value(summary).map_err(|e| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?))
+    let v = serde_json::to_value(summary)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(with_ingest_loss(&state, v)))
 }
 
 async fn sources_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -338,6 +453,7 @@ async fn sources_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "sources": state.source_views(),
         "buffered": state.store.len(),
         "cursor": state.store.cursor(),
+        "ingest_dropped": state.ingest.dropped.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 
@@ -378,7 +494,7 @@ async fn wait_handler(
         let result = state
             .store
             .records_from(anchor, q.limit, q.max_payload_chars);
-        return Ok(Json(wait_result(result, 0, true)));
+        return Ok(Json(with_ingest_loss(&state, wait_result(result, 0, true))));
     }
 
     let deadline = Duration::from_millis(timeout_ms);
@@ -413,17 +529,20 @@ async fn wait_handler(
 
     let Some(anchor) = matched_seq else {
         let horizon = state.store.records(&q);
-        return Ok(Json(serde_json::json!({
-            "matched": false,
-            "matched_from_buffer": false,
-            "records": [],
-            "total_matching": 0,
-            "truncated": false,
-            "next_cursor": horizon.next_cursor,
-            "buffer_start_cursor": horizon.buffer_start_cursor,
-            "cursor_gap": horizon.cursor_gap,
-            "waited_ms": started.elapsed().as_millis() as u64,
-        })));
+        return Ok(Json(with_ingest_loss(
+            &state,
+            serde_json::json!({
+                "matched": false,
+                "matched_from_buffer": false,
+                "records": [],
+                "total_matching": 0,
+                "truncated": false,
+                "next_cursor": horizon.next_cursor,
+                "buffer_start_cursor": horizon.buffer_start_cursor,
+                "cursor_gap": horizon.cursor_gap,
+                "waited_ms": started.elapsed().as_millis() as u64,
+            }),
+        )));
     };
 
     // A failure rarely arrives as one line. Let the rest of the burst — the
@@ -434,10 +553,9 @@ async fn wait_handler(
     let result = state
         .store
         .records_from(anchor, q.limit, q.max_payload_chars);
-    Ok(Json(wait_result(
-        result,
-        started.elapsed().as_millis() as u64,
-        false,
+    Ok(Json(with_ingest_loss(
+        &state,
+        wait_result(result, started.elapsed().as_millis() as u64, false),
     )))
 }
 

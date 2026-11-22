@@ -73,6 +73,10 @@ impl DockerSource {
 
 #[async_trait::async_trait]
 impl Source for DockerSource {
+    fn kind(&self) -> &'static str {
+        "docker"
+    }
+
     fn name(&self) -> &str {
         &self.container_name
     }
@@ -128,6 +132,10 @@ impl Source for DockerSource {
 
 #[async_trait::async_trait]
 impl Source for DockerAllSource {
+    fn kind(&self) -> &'static str {
+        "docker"
+    }
+
     fn name(&self) -> &str {
         "docker"
     }

@@ -211,6 +211,7 @@ pub fn sources(v: &Value) -> String {
         list.len(),
         plural(list.len() as u64)
     );
+    out.push_str(&ingest_loss_note(v));
 
     let width = list
         .iter()
@@ -249,8 +250,15 @@ pub fn wait(v: &Value) -> String {
     let matched = v.get("matched").and_then(Value::as_bool).unwrap_or(false);
     let waited = n(v, "waited_ms");
     if !matched {
+        let loss = ingest_loss_note(v);
+        let verdict = if loss.is_empty() {
+            "the condition did not occur"
+        } else {
+            "no matching line was captured"
+        };
         return format!(
-            "Nothing matched within {waited}ms — the condition did not occur.\ncursor {}",
+            "Nothing matched within {waited}ms — {verdict}.\n{}cursor {}",
+            cursor_gap_note(v),
             n(v, "next_cursor")
         );
     }
@@ -286,12 +294,28 @@ fn plural(n: u64) -> &'static str {
 }
 
 fn cursor_gap_note(v: &Value) -> String {
-    if v.get("cursor_gap").and_then(Value::as_bool) == Some(true) {
+    let mut out = if v.get("cursor_gap").and_then(Value::as_bool) == Some(true) {
         let start = n(v, "buffer_start_cursor");
         format!("WARNING: cursor history has a gap; oldest retained cursor is {start}.\n")
     } else {
         String::new()
+    };
+    out.push_str(&ingest_loss_note(v));
+    out
+}
+
+/// Present when the daemon lost records during ingestion. An absence of
+/// matches after loss is not evidence that nothing happened.
+fn ingest_loss_note(v: &Value) -> String {
+    let dropped = n(v, "ingest_dropped");
+    if dropped == 0 {
+        return String::new();
     }
+    format!(
+        "WARNING: the daemon dropped {dropped} log record{} during ingestion; \
+         this view is incomplete and a missing match is not proof of absence.\n",
+        plural(dropped)
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -300,6 +324,31 @@ fn truncate(s: &str, max: usize) -> String {
         clean
     } else {
         clean.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ingest_loss_is_surfaced_and_weakens_negative_answers() {
+        let v = json!({"matched": false, "waited_ms": 100, "next_cursor": 5, "ingest_dropped": 12});
+        let out = wait(&v);
+        assert!(out.contains("dropped 12 log records"), "{out}");
+        assert!(
+            !out.contains("did not occur"),
+            "must not claim absence after loss: {out}"
+        );
+
+        let v = json!({"groups": [], "distinct": 0, "total_matching": 0, "next_cursor": 1, "ingest_dropped": 1});
+        assert!(errors(&v).contains("dropped 1 log record during ingestion"));
+
+        let clean =
+            json!({"matched": false, "waited_ms": 100, "next_cursor": 5, "ingest_dropped": 0});
+        assert!(wait(&clean).contains("did not occur"));
+        assert!(!wait(&clean).contains("WARNING"));
     }
 }
 

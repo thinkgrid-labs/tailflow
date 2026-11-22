@@ -20,6 +20,10 @@ impl StdinSource {
 
 #[async_trait::async_trait]
 impl Source for StdinSource {
+    fn kind(&self) -> &'static str {
+        "stdin"
+    }
+
     fn name(&self) -> &str {
         &self.label
     }

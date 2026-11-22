@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tailflow-core = { path = "../tailflow-core" }
+tailflow-storage = { path = "../tailflow-storage" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -39,4 +40,5 @@ mime_guess = "2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
 chrono = { workspace = true }
