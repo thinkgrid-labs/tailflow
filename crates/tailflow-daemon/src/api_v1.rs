@@ -252,15 +252,13 @@ impl EventParams {
 async fn list_events(
     State(state): State<Arc<AppState>>,
     V1Query(params): V1Query,
-) -> Result<Json<serde_json::Value>, V1Error> {
+) -> Result<Json<tailflow_storage::EventPage>, V1Error> {
     let q = params.into_query()?;
     let storage = storage_of(&state)?.clone();
+    // Serialized straight into the response body: no intermediate `Value`
+    // copy of a page that may approach the 8 MiB page budget.
     let page = blocking(move || storage.query(&q).map_err(V1Error::from)).await?;
-    serde_json::to_value(page).map(Json).map_err(|_| V1Error {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        kind: "internal",
-        message: "failed to serialize response".into(),
-    })
+    Ok(Json(page))
 }
 
 #[derive(Debug, Deserialize, Default)]

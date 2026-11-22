@@ -142,6 +142,10 @@ pub(crate) fn open_writer_with(
             detail: "path is a directory".into(),
         });
     }
+    create_private_file(path).map_err(|e| StorageError::CannotOpen {
+        path: path.into(),
+        detail: e.to_string(),
+    })?;
     let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -211,12 +215,44 @@ pub(crate) fn open_writer_with(
     Ok(conn)
 }
 
+/// Create a new database file readable only by its owner, so a custom path
+/// in a shared directory is not world-readable under a 022 umask. SQLite
+/// gives the `-wal` and `-shm` files the main file's permissions. Existing
+/// files are left exactly as they are.
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Apply every migration newer than the database's `user_version`.
+///
+/// The version is re-read inside each migration's write transaction, so two
+/// daemons opening a fresh shared database at the same moment cannot both
+/// apply the same migration.
 pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<i32> {
-    let start: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let mut current = start;
-    for m in migrations.iter().filter(|m| m.version > start) {
+    let mut current: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for m in migrations {
+        if m.version <= current {
+            continue;
+        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if now >= m.version {
+            // Another process applied it while we waited for the lock.
+            tx.commit()?;
+            current = now;
+            continue;
+        }
         tx.execute_batch(m.sql).map_err(|e| {
             StorageError::Config(format!(
                 "migration {} ({}) failed and was rolled back: {e}",
@@ -453,6 +489,32 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_first_open_applies_the_migration_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || open_writer(&p, SyncMode::Normal).map(drop))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("every concurrent opener succeeds");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_database_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        drop(open_writer(&path, SyncMode::Normal).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

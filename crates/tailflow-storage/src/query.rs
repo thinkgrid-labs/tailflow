@@ -44,6 +44,11 @@ pub const SCAN_BUDGET_INDEXED: i64 = 1 << 24;
 pub const QUERY_TIME_BUDGET: Duration = Duration::from_secs(3);
 /// Gaps listed in one response (the total is always reported).
 pub const MAX_GAPS_LISTED: usize = 50;
+/// `limit` cap when payload bodies are requested (each may be 256 KiB).
+pub const MAX_LIMIT_WITH_PAYLOAD: usize = 100;
+/// Approximate response budget: a page stops early (with `has_more`) once
+/// the text it holds passes this, so no request can build a huge response.
+pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -117,6 +122,11 @@ impl EventQuery {
     pub fn validate(&self) -> Result<()> {
         if self.limit == 0 || self.limit > MAX_LIMIT {
             return Err(invalid(format!("`limit` must be 1..={MAX_LIMIT}")));
+        }
+        if self.include_payload && self.limit > MAX_LIMIT_WITH_PAYLOAD {
+            return Err(invalid(format!(
+                "`limit` must be 1..={MAX_LIMIT_WITH_PAYLOAD} with `include_payload`"
+            )));
         }
         for (name, list) in [
             ("type", &self.event_types),
@@ -530,10 +540,21 @@ pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> 
     }
     let _fn_guard = glob.as_ref().map(|_| FunctionGuard(conn));
 
-    let (min_seq, max_seq): (Option<i64>, Option<i64>) =
-        conn.query_row("SELECT min(seq), max(seq) FROM events", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    // Two single-aggregate lookups: SQLite optimizes `min(rowid)` or
+    // `max(rowid)` alone to one b-tree probe, but `SELECT min(seq), max(seq)`
+    // scans the whole table (~0.9 s at 3M rows, found by the M1 benchmark).
+    let min_seq: Option<i64> = conn
+        .query_row("SELECT seq FROM events ORDER BY seq ASC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let max_seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
 
     let mut page = EventPage {
         events: Vec::new(),
@@ -569,7 +590,10 @@ pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> 
         }
     }
     if lo > hi {
-        finish_completeness(conn, q, ctx, &mut page, None)?;
+        // Nothing to scan. Only a gap at the edge we would have resumed from
+        // is relevant — not every gap ever recorded.
+        let edge = lo.saturating_sub(1).min(max_seq);
+        finish_completeness(conn, q, ctx, &mut page, Some(((edge + 1, edge), true)))?;
         // Nothing to scan; a tailing client should resume from the edge.
         page.next_cursor = match q.order {
             Order::Asc => u64::try_from(hi.max(lo.saturating_sub(1))).ok(),
@@ -597,6 +621,7 @@ pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> 
     };
 
     let mut scanned: i64 = 0;
+    let mut page_bytes = 0usize;
     let mut cursor = match q.order {
         Order::Asc => lo,
         Order::Desc => hi,
@@ -612,14 +637,35 @@ pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> 
         let remaining = q.limit + 1 - page.events.len();
         let mut rows = stmt.query(params_from_iter(params.iter()))?;
         let mut taken = 0usize;
+        let mut over_budget = false;
         while let Some(row) = rows.next()? {
             if taken == remaining {
                 break;
             }
-            page.events.push(row_to_event(row)?);
+            let event = row_to_event(row)?;
+            page_bytes = page_bytes.saturating_add(approx_bytes(&event));
+            page.events.push(event);
             taken += 1;
+            if page_bytes > MAX_PAGE_BYTES && page.events.len() <= q.limit {
+                over_budget = true;
+                break;
+            }
         }
         drop(rows);
+        if over_budget {
+            // Byte budget reached before `limit`: stop at the last event.
+            page.has_more = true;
+            let last = page
+                .events
+                .last()
+                .map_or(cursor, |e| i64::try_from(e.seq).unwrap_or(cursor));
+            span = Some(match q.order {
+                Order::Asc => (lo, last),
+                Order::Desc => (last, hi),
+            });
+            page.next_cursor = u64::try_from(last).ok();
+            break;
+        }
         scanned = scanned.saturating_add(whi - wlo + 1);
 
         if page.events.len() > q.limit {
@@ -677,6 +723,18 @@ pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> 
     let reached_tail = span.is_some_and(|(_, b)| b >= max_seq);
     finish_completeness(conn, q, ctx, &mut page, span.map(|s| (s, reached_tail)))?;
     Ok(page)
+}
+
+fn approx_bytes(e: &StoredEvent) -> usize {
+    let ev = &e.event;
+    256 + ev.message.as_ref().map_or(0, String::len)
+        + ev.payload.as_ref().map_or(0, String::len)
+        + ev.path.as_ref().map_or(0, String::len)
+        + if ev.attributes.is_empty() {
+            0
+        } else {
+            serde_json::to_vec(&ev.attributes).map_or(0, |v| v.len())
+        }
 }
 
 fn base_completeness(conn: &Connection, ctx: &QueryContext) -> Result<Completeness> {

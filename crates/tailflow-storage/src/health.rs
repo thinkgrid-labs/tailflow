@@ -29,6 +29,8 @@ pub enum LossReason {
     UncleanShutdown,
     /// Rows deliberately removed for one session.
     SessionDeleted,
+    /// Failed schema validation after sanitizing (e.g. an oversized id).
+    InvalidEvent,
 }
 
 impl LossReason {
@@ -40,6 +42,7 @@ impl LossReason {
             LossReason::WriterStopped => "writer_stopped",
             LossReason::UncleanShutdown => "unclean_shutdown",
             LossReason::SessionDeleted => "session_deleted",
+            LossReason::InvalidEvent => "invalid_event",
         }
     }
 }
@@ -179,6 +182,7 @@ impl Health {
             queue_full: load(&self.dropped_queue_full),
             storage_error: load(&self.dropped_storage_error),
             writer_stopped: load(&self.dropped_writer_stopped),
+            invalid: load(&self.invalid),
         };
         let last_error = self
             .last_error
@@ -221,6 +225,7 @@ pub struct DroppedCounts {
     pub queue_full: u64,
     pub storage_error: u64,
     pub writer_stopped: u64,
+    pub invalid: u64,
 }
 
 impl DroppedCounts {
@@ -229,6 +234,7 @@ impl DroppedCounts {
             .saturating_add(self.queue_full)
             .saturating_add(self.storage_error)
             .saturating_add(self.writer_stopped)
+            .saturating_add(self.invalid)
     }
 }
 

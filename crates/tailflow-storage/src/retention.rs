@@ -22,16 +22,21 @@ use serde::Serialize;
 use std::time::{Duration, Instant};
 
 /// Rows per delete transaction.
-pub const CHUNK: i64 = 5_000;
+pub const CHUNK: i64 = 2_000;
 
 /// Fraction of `max_bytes` that size eviction brings usage back down to, so a
 /// database at the cap does not evict on every batch.
 const SIZE_TARGET_NUM: u64 = 9;
 const SIZE_TARGET_DEN: u64 = 10;
 
-/// Free pages returned to the OS per maintenance pass (4 KiB pages → 16 MiB),
-/// bounding write amplification.
-const VACUUM_PAGES_PER_PASS: i64 = 4_096;
+/// Free pages returned to the OS per maintenance pass (4 KiB pages → 4 MiB),
+/// bounding write amplification and writer pause.
+const VACUUM_PAGES_PER_PASS: u64 = 1_024;
+
+/// Reclaim only once free pages exceed this many, or 5 % of the file. Under
+/// ingestion FTS5 merges free pages continuously; chasing a zero freelist
+/// would keep retention running forever (found by the M1 benchmark).
+const VACUUM_MIN_FREE_PAGES: u64 = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RetentionPolicy {
@@ -48,9 +53,14 @@ pub struct RetentionReport {
     pub payloads_cleared: u64,
     pub vacuumed_pages: u64,
     pub duration_ms: f64,
-    /// The time budget ran out with work remaining; run again soon.
+    /// The time budget ran out with deletion work remaining; run again soon.
+    /// Free-page reclamation never sets this.
     pub more_work: bool,
     pub used_bytes_after: u64,
+    pub age_ms: f64,
+    pub payload_ms: f64,
+    pub size_ms: f64,
+    pub vacuum_ms: f64,
 }
 
 /// Page accounting for the main database file.
@@ -163,7 +173,9 @@ pub(crate) fn delete_seq_range(c: &Connection, lo: i64, hi: i64) -> Result<u64> 
     meta_add(c, "event_count", -n)?;
     meta_max(c, "evicted_through_seq", hi)?;
     meta_max(c, "payload_expired_through_seq", hi)?;
-    c.execute("DELETE FROM gaps WHERE to_seq <= ?1", [hi])?;
+    // Strictly below `hi`: a loss anchored *at* the last deleted seq
+    // describes events that would follow it, which may still be retained.
+    c.execute("DELETE FROM gaps WHERE to_seq < ?1", [hi])?;
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
@@ -185,6 +197,7 @@ pub fn run(
         }
     };
 
+    let phase = Instant::now();
     // 1. Age.
     if let Some(days) = policy.max_age_days {
         let cutoff = now_us.saturating_sub(i64::from(days).saturating_mul(86_400_000_000));
@@ -202,6 +215,8 @@ pub fn run(
         }
     }
 
+    report.age_ms = phase.elapsed().as_secs_f64() * 1000.0;
+    let phase = Instant::now();
     // 2. Payload age.
     if !report.more_work {
         let days = i64::from(policy.payload_max_age_days);
@@ -230,10 +245,16 @@ pub fn run(
         }
     }
 
-    // 3. Size cap.
+    report.payload_ms = phase.elapsed().as_secs_f64() * 1000.0;
+    let phase = Instant::now();
+    // 3. Size cap. Once over the cap, evict down to the 90 % target even if
+    // that takes several passes (`size_evicting` remembers it across them).
     if !report.more_work {
         let target = policy.max_bytes / SIZE_TARGET_DEN * SIZE_TARGET_NUM;
-        if page_stats(conn)?.used_bytes() > policy.max_bytes {
+        let used = page_stats(conn)?.used_bytes();
+        let resuming = crate::schema::meta_get_i64(conn, "size_evicting")? == 1;
+        if used > policy.max_bytes || (resuming && used > target) {
+            crate::schema::meta_set(conn, "size_evicting", "1")?;
             loop {
                 let used = page_stats(conn)?.used_bytes();
                 if used <= target || out_of_time(&mut report) {
@@ -253,33 +274,91 @@ pub fn run(
                 }
                 report.evicted_by_size = report.evicted_by_size.saturating_add(n);
             }
+            if !report.more_work {
+                crate::schema::meta_set(conn, "size_evicting", "0")?;
+            }
+        } else if resuming {
+            crate::schema::meta_set(conn, "size_evicting", "0")?;
         }
     }
+    report.size_ms = phase.elapsed().as_secs_f64() * 1000.0;
+    let phase = Instant::now();
 
     // 4. Return a bounded number of free pages to the filesystem.
-    let before = page_stats(conn)?.freelist_count;
-    if before > 0 {
-        conn.execute_batch(&format!(
-            "PRAGMA incremental_vacuum({VACUUM_PAGES_PER_PASS})"
-        ))?;
+    let stats = page_stats(conn)?;
+    let threshold = VACUUM_MIN_FREE_PAGES.max(stats.page_count / 20);
+    if stats.freelist_count > threshold {
+        let pages = VACUUM_PAGES_PER_PASS.min(stats.freelist_count);
+        conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages})"))?;
         let after = page_stats(conn)?.freelist_count;
-        report.vacuumed_pages = before.saturating_sub(after);
-        if after > 0 {
-            report.more_work = true;
-        }
+        report.vacuumed_pages = stats.freelist_count.saturating_sub(after);
     }
     if report.expired_by_age + report.evicted_by_size + report.payloads_cleared > 0
         || report.vacuumed_pages > 0
     {
-        // Fold the deletes into the main file and shrink the WAL. Fails
-        // harmlessly (busy) when a reader holds an old snapshot.
+        // PASSIVE never waits on readers or blocks other writers. TRUNCATE
+        // would invoke the busy handler for up to 5 s on the writer thread
+        // and stall ingestion (found by the M1 benchmark); the WAL is still
+        // trimmed to `journal_size_limit` when it next resets.
         let _checkpoint: rusqlite::Result<(i64, i64, i64)> =
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             });
     }
+    report.vacuum_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
     report.used_bytes_after = page_stats(conn)?.used_bytes();
     report.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::open_writer;
+    use tailflow_core::config::SyncMode;
+
+    #[test]
+    fn review_r3_gap_at_the_deletion_boundary_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_writer(&dir.path().join("e.db"), SyncMode::Normal).unwrap();
+        for i in 1..=4 {
+            c.execute(
+                "INSERT INTO events (event_id, schema_version, ts, observed_at, event_type, provenance,
+                 source_type, source_id, severity, run_id)
+                 VALUES (?1, 1, ?2, ?2, 'runtime.log', 'runtime_observed', 'p', 's', 0, 1)",
+                rusqlite::params![format!("e{i}"), i],
+            )
+            .unwrap();
+        }
+        // Loss detected right after seq 2 (lost events would follow it).
+        c.execute(
+            "INSERT INTO gaps (reason, count, first_at, last_at, from_seq, to_seq) VALUES ('queue_full', 3, 0, 0, 2, 2)",
+            [],
+        )
+        .unwrap();
+        immediate(&c, |c| delete_seq_range(c, 1, 2)).unwrap();
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM gaps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "seq 3.. is retained, so the gap still describes it");
+        immediate(&c, |c| delete_seq_range(c, 3, 3)).unwrap();
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM gaps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "once history past it expires, the gap goes too");
+    }
+
+    #[test]
+    fn freelist_alone_never_keeps_retention_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_writer(&dir.path().join("e.db"), SyncMode::Normal).unwrap();
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            payload_max_age_days: 7,
+            max_bytes: u64::MAX,
+        };
+        let r = run(&c, &policy, 0, Duration::from_secs(1)).unwrap();
+        assert!(!r.more_work);
+    }
 }

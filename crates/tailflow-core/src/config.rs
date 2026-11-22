@@ -420,6 +420,14 @@ excluded_event_types = ["git.*"]
     }
 
     #[test]
+    fn shipped_example_config_is_valid() {
+        let cfg = parse(include_str!("../../../tailflow.example.toml"));
+        cfg.storage.validate().unwrap();
+        crate::privacy::CapturePolicy::from_config(&cfg.privacy).unwrap();
+        assert_eq!(cfg.storage.retention_days, Retention::Days(30));
+    }
+
+    #[test]
     fn invalid_toml_returns_error() {
         let result: Result<Config, _> = toml::from_str("[[[[invalid toml");
         assert!(result.is_err());

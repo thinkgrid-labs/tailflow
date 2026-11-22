@@ -333,3 +333,191 @@ fn shutdown_drains_everything_queued() {
         .unwrap();
     assert_eq!(clean, 1);
 }
+
+// ── Regression tests for the M1 independent review ───────────────────────────
+
+#[test]
+fn review_r1_invalid_events_are_loss_not_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&db_path(&dir));
+    let mut e = log_event(1, "api", LogLevel::Info, "x");
+    e.source_id = "s".repeat(10_000); // fails validation
+    assert_eq!(s.submit(e), Submitted::Invalid);
+    let _ = s.submit(log_event(2, "api", LogLevel::Info, "ok"));
+    s.flush(T).unwrap();
+    let h = s.health();
+    assert!(h.loss_detected, "{h:?}");
+    assert_eq!(h.events_dropped.invalid, 1);
+    let p = s.query(&EventQuery::default()).unwrap();
+    assert!(!p.completeness.complete);
+    assert!(p
+        .completeness
+        .gaps
+        .iter()
+        .any(|g| g.reason == "invalid_event"));
+}
+
+#[test]
+fn review_r1_overlong_project_path_still_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(&PrivacyConfig::default());
+    o.project_id = Some(format!("/{}", "deep/".repeat(200)));
+    let s = Storage::open(&config(&db_path(&dir)), o).unwrap();
+    assert_eq!(
+        s.submit(log_event(1, "api", LogLevel::Info, "x")),
+        Submitted::Enqueued
+    );
+    s.flush(T).unwrap();
+    assert_eq!(s.health().events_persisted, 1);
+}
+
+#[test]
+fn review_r2_loss_during_the_final_commit_is_never_marked_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    // A short busy timeout makes the writer's final commit fail fast while
+    // another connection holds the write lock through shutdown.
+    let s = Storage::open_with_writer_hook(&config(&path), opts(&PrivacyConfig::default()), |c| {
+        c.busy_timeout(Duration::from_millis(50))?;
+        Ok(())
+    })
+    .unwrap();
+    let _ = s.submit(log_event(0, "api", LogLevel::Info, "warm"));
+    s.flush(T).unwrap();
+    let lock = hold_write_lock(&path, Duration::from_millis(1_500));
+    for i in 1..=50 {
+        let _ = s.submit(log_event(i, "api", LogLevel::Info, "in flight at shutdown"));
+    }
+    s.shutdown(T).unwrap();
+    lock.join().unwrap();
+    assert!(s.health().events_dropped.storage_error >= 50);
+    drop(s);
+    let c = Connection::open(&path).unwrap();
+    let clean: i64 = c
+        .query_row("SELECT clean FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(clean, 0, "a run that lost events is never marked clean");
+    drop(c);
+    let s = open(&path);
+    let p = s.query(&EventQuery::default()).unwrap();
+    assert!(
+        !p.completeness.complete,
+        "the loss is durable: {:?}",
+        p.completeness
+    );
+    assert!(p
+        .completeness
+        .gaps
+        .iter()
+        .any(|g| g.reason == "storage_error"));
+}
+
+#[test]
+fn review_r6_unclean_gap_covers_events_written_by_other_daemons() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let s = open(&path);
+    for i in 0..20 {
+        let _ = s.submit(log_event(i, "b", LogLevel::Info, "other daemon"));
+    }
+    s.flush(T).unwrap();
+    s.shutdown(T).unwrap();
+    drop(s);
+    {
+        // A crashed run whose last commit was seq 5, long before seq 20.
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "INSERT INTO runs (run_key, started_at, heartbeat_at, version, pid, last_seq)
+             VALUES ('dead', 1, 1, 'test', 2147483000, 5)",
+            [],
+        )
+        .unwrap();
+    }
+    let s = open(&path);
+    // A `since`-style query over the recent range must still see the gap.
+    let p = s
+        .query(&EventQuery {
+            after_seq: Some(15),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!p.completeness.complete, "{:?}", p.completeness);
+}
+
+#[test]
+fn review_r9_payload_pages_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&db_path(&dir));
+    let err = s
+        .query(&EventQuery {
+            include_payload: true,
+            limit: 500,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.kind(), "invalid_query");
+    let big = "m".repeat(15 * 1024);
+    for i in 0..1000 {
+        let _ = s.submit(log_event(i, "api", LogLevel::Info, &big));
+    }
+    s.flush(T).unwrap();
+    let p = s
+        .query(&EventQuery {
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        p.events.len() < 1000,
+        "the byte budget stops the page early"
+    );
+    assert!(p.has_more);
+    let total: usize = p
+        .events
+        .iter()
+        .map(|e| e.event.message.as_ref().unwrap().len())
+        .sum();
+    assert!(total <= 9 * 1024 * 1024, "{total}");
+    let rest = walk(&s, &EventQuery::default(), 1000);
+    assert_eq!(rest.len(), 1000, "paging still reaches every event");
+}
+
+#[test]
+fn review_r18_empty_range_does_not_report_unrelated_old_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let s = open(&path);
+    let _ = s.submit(log_event(1, "api", LogLevel::Info, "a"));
+    s.flush(T).unwrap();
+    s.shutdown(T).unwrap();
+    drop(s);
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "INSERT INTO runs (run_key, started_at, heartbeat_at, version, pid, last_seq)
+             VALUES ('dead', 1, 1, 'test', 2147483000, 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let s = open(&path); // gap near seq 1..2
+    for i in 0..10 {
+        let _ = s.submit(log_event(i, "api", LogLevel::Info, "later"));
+    }
+    s.flush(T).unwrap();
+    let newest = s.query(&EventQuery::default()).unwrap().newest_seq.unwrap();
+    let p = s
+        .query(&EventQuery {
+            after_seq: Some(newest),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(p.events.is_empty());
+    assert!(
+        p.completeness.complete,
+        "nothing new and no loss at the tail: {:?}",
+        p.completeness
+    );
+}

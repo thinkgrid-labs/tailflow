@@ -144,20 +144,32 @@ fn random_key() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether a process with `pid` exists. Errs toward "alive": declaring a
+/// live daemon dead would record a false gap, while the heartbeat-staleness
+/// rule still catches a dead one later.
 fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        // Never a real daemon pid; `kill -0 -1` would probe every process.
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
         Path::new(&format!("/proc/{pid}")).exists()
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // `kill -0` probes for existence without sending a signal.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
+        // `ps -p` succeeds for any existing process regardless of owner
+        // (unlike `kill -0`, which fails with EPERM). A probe that cannot
+        // run at all is treated as "alive".
+        match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+        {
+            Ok(status) => status.success(),
+            Err(_) => true,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -201,17 +213,21 @@ pub(crate) fn recover_dead_runs(
                 return Ok(()); // another daemon recovered it first
             }
             let first = hb.unwrap_or(now);
-            writer::record_gap(
+            // Cover everything committed since the dead run's last commit:
+            // with a shared database another daemon may have written past
+            // it, and the lost events belong somewhere in that interval.
+            let (newest_seq, mut floor) = writer::newest(c)?;
+            writer::record_gap_range(
                 c,
                 LossReason::UncleanShutdown,
                 None,
                 first,
                 now,
                 last_seq,
+                newest_seq.max(last_seq),
                 Some(id),
                 Some("previous daemon run ended without a clean shutdown; events in flight were lost"),
             )?;
-            let (_, mut floor) = writer::newest(c)?;
             let marker = writer::loss_marker(LossReason::UncleanShutdown, None, first, now);
             if writer::insert_event(c, &marker, &mut floor, id, true)?.is_some() {
                 schema::meta_add(c, "event_count", 1)?;
@@ -285,20 +301,16 @@ impl Storage {
         let conn = schema::open_writer(&path, config.synchronous)?;
 
         let recovered = recover_dead_runs(&conn, None)?;
-        if !recovered.is_empty() {
-            // Crash recovery (WAL replay) already happened on open. A quick
-            // check is O(database) so it runs only after an unclean exit.
-            let problems = schema::integrity_problems(&conn, false)?;
-            if !problems.is_empty() {
-                return Err(StorageError::Corrupt {
-                    path,
-                    detail: problems.join("; "),
-                });
-            }
-        }
 
         let started_at = Utc::now();
         let run_key = random_key();
+        // A project path longer than the id bound would otherwise make every
+        // event fail validation.
+        let mut opts = opts;
+        opts.project_id = opts
+            .project_id
+            .as_deref()
+            .map(tailflow_core::event::bounded_id);
         conn.execute(
             "INSERT INTO runs (run_key, started_at, heartbeat_at, version, pid, project_id)
              VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
@@ -343,11 +355,44 @@ impl Storage {
             // Startup cleanup happens right away, before the first interval.
             next_cleanup: Instant::now(),
             next_heartbeat: Instant::now() + HEARTBEAT,
+            resuming_cleanup: false,
         };
         let handle = std::thread::Builder::new()
             .name("tailflow-storage".into())
             .spawn(move || writer.run())
             .map_err(StorageError::Io)?;
+
+        if !recovered.is_empty() {
+            // WAL replay already happened on open. `quick_check` is
+            // O(database) — about 30 s on a 1.2 GB file — so it runs on its
+            // own read connection in the background instead of delaying
+            // startup; the result is reported in status.
+            let (check_path, check_shared) = (path.clone(), shared.clone());
+            let spawned = std::thread::Builder::new()
+                .name("tailflow-storage-check".into())
+                .spawn(move || {
+                    let result = schema::open_reader(&check_path)
+                        .and_then(|c| schema::integrity_problems(&c, false));
+                    let problems = match result {
+                        Ok(p) => p,
+                        Err(e) => vec![format!("integrity check could not run: {e}")],
+                    };
+                    if !problems.is_empty() {
+                        tracing::error!(problems = ?problems, "storage integrity check failed");
+                        check_shared.health.set_error(format!(
+                            "integrity check after unclean shutdown failed: {}",
+                            problems.join("; ")
+                        ));
+                    }
+                    *check_shared
+                        .integrity
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some((Utc::now(), problems));
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(err = %e, "could not start the background integrity check");
+            }
+        }
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -410,18 +455,33 @@ impl Storage {
             return Submitted::Excluded;
         }
         self.inner.policy.sanitize(&mut event);
+        let observed = event.observed_at;
         if event.validate().is_err() {
+            // A rejected event is still an event TailFlow saw and did not
+            // keep: count it as loss so history never looks complete.
             h.invalid.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .shared
+                .add_loss(LossReason::InvalidEvent, 1, observed, observed);
             return Submitted::Invalid;
         }
-        let observed = event.observed_at;
+        if self.inner.shared.stopping.load(Ordering::SeqCst) {
+            h.dropped_writer_stopped.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .shared
+                .add_loss(LossReason::WriterStopped, 1, observed, observed);
+            return Submitted::Dropped(LossReason::WriterStopped);
+        }
+        // Counted before the send so the writer's final drain can see that
+        // something is still in flight.
+        h.queue_depth.fetch_add(1, Ordering::SeqCst);
         match self.inner.tx.try_send(Command::Event(Box::new(event))) {
             Ok(()) => {
                 h.enqueued.fetch_add(1, Ordering::Relaxed);
-                h.queue_depth.fetch_add(1, Ordering::Relaxed);
                 Submitted::Enqueued
             }
             Err(TrySendError::Full(_)) => {
+                h.queue_depth.fetch_sub(1, Ordering::SeqCst);
                 h.dropped_queue_full.fetch_add(1, Ordering::Relaxed);
                 self.inner
                     .shared
@@ -429,6 +489,7 @@ impl Storage {
                 Submitted::Dropped(LossReason::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => {
+                h.queue_depth.fetch_sub(1, Ordering::SeqCst);
                 h.dropped_writer_stopped.fetch_add(1, Ordering::Relaxed);
                 self.inner
                     .shared
@@ -512,12 +573,68 @@ impl Storage {
         else {
             return Ok(());
         };
+        self.inner.shared.stopping.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
         let (ack, rx) = mpsc::sync_channel(1);
         self.send_control(Command::Shutdown(ack), deadline)?;
         rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| StorageError::QueryTimeout)?;
-        handle.join().map_err(|_| StorageError::WriterStopped)
+        handle.join().map_err(|_| StorageError::WriterStopped)?;
+        self.record_late_loss()
+    }
+
+    /// Loss detected after the writer's final commit (a submit racing
+    /// shutdown) must still become durable: write it directly, or — if even
+    /// that fails — reopen the run so the next start records an unclean gap.
+    fn record_late_loss(&self) -> Result<()> {
+        let late = self
+            .inner
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if late.is_empty() {
+            return Ok(());
+        }
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        let run_id = self.inner.run_id;
+        let written = retention::immediate(&conn, |c| {
+            let (at, mut floor) = writer::newest(c)?;
+            for (reason, loss) in &late {
+                writer::record_gap(
+                    c,
+                    *reason,
+                    Some(loss.count),
+                    loss.first_at,
+                    loss.last_at,
+                    at,
+                    Some(run_id),
+                    None,
+                )?;
+                let marker =
+                    writer::loss_marker(*reason, Some(loss.count), loss.first_at, loss.last_at);
+                if writer::insert_event(c, &marker, &mut floor, run_id, self.inner.fts_enabled)?
+                    .is_some()
+                {
+                    schema::meta_add(c, "event_count", 1)?;
+                }
+            }
+            Ok(())
+        });
+        if written.is_ok() {
+            // Recorded: the run is over, and honestly not clean.
+            conn.execute(
+                "UPDATE runs SET ended_at = ?1, clean = 0 WHERE id = ?2",
+                rusqlite::params![Utc::now().timestamp_micros(), run_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE runs SET ended_at = NULL, clean = 0 WHERE id = ?1",
+                [run_id],
+            )?;
+        }
+        written
     }
 
     pub fn health(&self) -> HealthSnapshot {
@@ -610,6 +727,18 @@ impl Storage {
                     tailflow_core::config::SyncMode::Full => "full",
                 },
                 recovered_unclean_runs: self.inner.recovered.len(),
+                integrity_check: self
+                    .inner
+                    .shared
+                    .integrity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .map(|(at, problems)| IntegrityView {
+                        checked_at: *at,
+                        ok: problems.is_empty(),
+                        problems: problems.clone(),
+                    }),
                 health,
             })
         })
@@ -679,7 +808,16 @@ pub struct StorageStatus {
     pub capture_enabled: bool,
     pub synchronous: &'static str,
     pub recovered_unclean_runs: usize,
+    /// Present only after an unclean shutdown triggered a background check.
+    pub integrity_check: Option<IntegrityView>,
     pub health: HealthSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntegrityView {
+    pub checked_at: DateTime<Utc>,
+    pub ok: bool,
+    pub problems: Vec<String>,
 }
 
 /// Counters and sizes, cheap enough for a status endpoint: every value is an
@@ -746,7 +884,7 @@ pub fn db_stats(c: &Connection, path: &Path) -> Result<DbStats> {
 pub mod admin {
     use super::{db_stats, retention, schema, writer, DbStats, LossReason, Result};
     use chrono::{DateTime, Utc};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
     use serde::Serialize;
     use std::path::Path;
     use tailflow_core::config::SyncMode;
@@ -792,13 +930,18 @@ pub mod admin {
         let conn = open(path)?;
         let mut report = PurgeReport::default();
         match target {
-            PurgeTarget::All => loop {
-                let n = retention::delete_oldest_chunk(&conn, i64::MAX)?;
-                if n == 0 {
-                    break;
+            PurgeTarget::All => {
+                // Only what existed when the command started: a daemon
+                // writing meanwhile keeps its new events.
+                let (upto, _) = writer::newest(&conn)?;
+                loop {
+                    let n = retention::delete_oldest_chunk(&conn, upto.saturating_add(1))?;
+                    if n == 0 {
+                        break;
+                    }
+                    report.deleted += n;
                 }
-                report.deleted += n;
-            },
+            }
             PurgeTarget::Before(t) => {
                 if let Some(upto) = retention::first_seq_at_or_after(&conn, t.timestamp_micros())? {
                     loop {
@@ -836,12 +979,42 @@ pub mod admin {
     /// Delete one session's events and record a `session_deleted` gap over
     /// the seq range they occupied, so queries over that range say so.
     pub(crate) fn delete_session(conn: &Connection, session: &str) -> Result<u64> {
-        let bounds: (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT min(seq), max(seq) FROM events WHERE session_id = ?1",
-            [session],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let (Some(lo), Some(hi)) = bounds else {
+        // The gap row is written in the same transaction as the first chunk
+        // and its count grows with each later chunk, so an interrupted purge
+        // never leaves deleted rows without a gap describing them.
+        let first = retention::immediate(conn, |c| {
+            let lo: Option<i64> = c
+                .query_row(
+                    "SELECT seq FROM events WHERE session_id = ?1 ORDER BY seq ASC LIMIT 1",
+                    [session],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let hi: Option<i64> = c
+                .query_row(
+                    "SELECT seq FROM events WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    [session],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                return Ok(None);
+            };
+            let now = Utc::now();
+            writer::record_gap_range(
+                c,
+                LossReason::SessionDeleted,
+                Some(0),
+                now,
+                now,
+                lo,
+                hi,
+                None,
+                None,
+            )?;
+            Ok(Some((c.last_insert_rowid(), hi)))
+        })?;
+        let Some((gap_id, hi)) = first else {
             return Ok(0);
         };
         let mut total = 0u64;
@@ -849,10 +1022,12 @@ pub mod admin {
             let n = retention::immediate(conn, |c| {
                 let ids: Vec<i64> = {
                     let mut stmt = c.prepare(
-                        "SELECT seq FROM events WHERE session_id = ?1 ORDER BY seq LIMIT ?2",
+                        "SELECT seq FROM events WHERE session_id = ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
                     )?;
-                    let rows =
-                        stmt.query_map(rusqlite::params![session, retention::CHUNK], |r| r.get(0))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![session, hi, retention::CHUNK], |r| {
+                            r.get(0)
+                        })?;
                     rows.collect::<rusqlite::Result<_>>()?
                 };
                 for id in &ids {
@@ -861,6 +1036,10 @@ pub mod admin {
                 }
                 let n = i64::try_from(ids.len()).unwrap_or(i64::MAX);
                 schema::meta_add(c, "event_count", -n)?;
+                c.execute(
+                    "UPDATE gaps SET count = count + ?1 WHERE id = ?2",
+                    rusqlite::params![n, gap_id],
+                )?;
                 Ok(u64::try_from(n).unwrap_or(0))
             })?;
             if n == 0 {
@@ -868,20 +1047,6 @@ pub mod admin {
             }
             total += n;
         }
-        retention::immediate(conn, |c| {
-            let now = Utc::now();
-            writer::record_gap_range(
-                c,
-                LossReason::SessionDeleted,
-                Some(total),
-                now,
-                now,
-                lo,
-                hi,
-                None,
-                None,
-            )
-        })?;
         Ok(total)
     }
 }

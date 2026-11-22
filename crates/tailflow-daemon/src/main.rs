@@ -290,11 +290,15 @@ async fn main() -> Result<()> {
     }
     // The fan-out ends once every source sender is gone; let it hand its last
     // records to storage before the writer drains.
+    let fanout_abort = fanout.abort_handle();
     if tokio::time::timeout(Duration::from_secs(3), fanout)
         .await
         .is_err()
     {
-        tracing::warn!("timed out waiting for the ingestion fan-out");
+        // Stop it so nothing is submitted after storage drains; anything it
+        // still held is counted by storage's shutdown as late loss.
+        tracing::warn!("timed out waiting for the ingestion fan-out; stopping it");
+        fanout_abort.abort();
     }
     if let Some(storage) = storage_handle {
         match tokio::task::spawn_blocking(move || storage.shutdown(Duration::from_secs(15))).await {

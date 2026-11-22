@@ -99,7 +99,7 @@ impl std::error::Error for PrivacyError {}
 pub const BUILTIN_RULES: &[(&str, &str)] = &[
     (
         "private_key",
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?P<secret>[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$))",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?P<secret>[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$))",
     ),
     (
         "aws_access_key",
@@ -141,7 +141,10 @@ pub const BUILTIN_RULES: &[(&str, &str)] = &[
     ),
     (
         "secret_assignment",
-        r#"(?i)\b[a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credentials?)["']?\s*(?:=>|[:=])\s*["']?(?P<secret>[^\s"',;&)}\[\]]+)"#,
+        // Key ends in a sensitive word, or is `pass` after a separator
+        // (`DB_PASS`, not `bypass`). `pwd` is deliberately absent: `PWD` is
+        // the shell's working directory.
+        r#"(?i)\b(?:[a-z0-9_.-]*(?:password|passwd|secret|secret[_-]?key|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credentials?)|(?:[a-z0-9_.-]*[_.-])?pass)["']?\s*(?:=>|[:=])\s*["']?(?P<secret>[^\s"',;&)}\[\]]+)"#,
     ),
 ];
 
@@ -330,7 +333,7 @@ impl<'a> LineRedactor<'a> {
     pub fn redact_line(&mut self, source: &str, line: &str) -> Option<(String, RedactionInfo)> {
         if let Some(remaining) = self.open_blocks.get_mut(source) {
             *remaining = remaining.saturating_sub(1);
-            let ends = line.contains("-----END ") && line.contains("PRIVATE KEY-----");
+            let ends = line.contains("-----END ") && line.contains("PRIVATE KEY");
             if ends || *remaining == 0 {
                 self.open_blocks.remove(source);
             }
@@ -343,7 +346,7 @@ impl<'a> LineRedactor<'a> {
             };
             return Some((text, info));
         }
-        let begins = line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----");
+        let begins = line.contains("-----BEGIN ") && line.contains("PRIVATE KEY");
         let ends_same_line = line.contains("-----END ");
         if begins && !ends_same_line {
             self.open_blocks.insert(source.to_string(), PEM_MAX_LINES);
@@ -534,12 +537,19 @@ impl CapturePolicy {
                     merge_info(&mut event.redaction, &info);
                 }
             }
-            for value in event.attributes.values_mut() {
-                if let serde_json::Value::String(s) = value {
-                    if let Some((clean, info)) = self.redactor.redact(s) {
-                        *s = clean;
-                        merge_info(&mut event.redaction, &info);
+            // Every string at any depth (attributes allow nesting up to 4).
+            let mut stack: Vec<&mut serde_json::Value> = event.attributes.values_mut().collect();
+            while let Some(value) = stack.pop() {
+                match value {
+                    serde_json::Value::String(s) => {
+                        if let Some((clean, info)) = self.redactor.redact(s) {
+                            *s = clean;
+                            merge_info(&mut event.redaction, &info);
+                        }
                     }
+                    serde_json::Value::Array(items) => stack.extend(items.iter_mut()),
+                    serde_json::Value::Object(map) => stack.extend(map.values_mut()),
+                    _ => {}
                 }
             }
         }
@@ -651,6 +661,8 @@ mod tests {
                 "dozjgNryP4J3",
             ),
             ("xoxb-123456789012-abcdefghijkl", "xoxb-1234"),
+            ("SECRET_KEY=django-insecure-abc123", "django-insecure"),
+            ("DB_PASS=correcthorse", "correcthorse"),
         ];
         for (input, secret) in cases {
             let out = r(input);
@@ -693,6 +705,8 @@ mod tests {
             "commit 4f1c2d9e8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e",
             "the password field is required",
             "warning: unused variable `secret_sauce`",
+            "bypass=true cache=warm",
+            "PWD=/Users/dev/project",
         ] {
             assert_eq!(r(line), line, "over-redacted an ordinary line");
         }
@@ -737,6 +751,33 @@ mod tests {
             .iter()
             .any(|l| l.contains("MIIEow") || l.contains("ZZZZ")));
         assert_eq!(out[4], "after the key", "state must reset after END");
+    }
+
+    #[test]
+    fn pgp_private_key_blocks_are_redacted() {
+        let redactor = Redactor::builtin();
+        let mut lines = LineRedactor::new(&redactor);
+        lines.redact_line("api", "-----BEGIN PGP PRIVATE KEY BLOCK-----");
+        let body = lines.redact_line("api", "lQOYBF0secretbody").unwrap().0;
+        assert!(!body.contains("secretbody"));
+        lines.redact_line("api", "-----END PGP PRIVATE KEY BLOCK-----");
+        assert!(lines.redact_line("api", "normal").is_none());
+    }
+
+    #[test]
+    fn nested_attribute_strings_are_redacted() {
+        let p = CapturePolicy::from_config(&PrivacyConfig::default()).unwrap();
+        let mut e = event("command.failed");
+        e.attributes.insert(
+            "env".into(),
+            serde_json::json!({"vars": ["API_KEY=zzzz1234", {"deep": "password=hunter2"}]}),
+        );
+        p.sanitize(&mut e);
+        let text = serde_json::to_string(&e.attributes).unwrap();
+        assert!(
+            !text.contains("zzzz1234") && !text.contains("hunter2"),
+            "{text}"
+        );
     }
 
     #[test]

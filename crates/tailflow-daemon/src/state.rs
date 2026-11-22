@@ -16,6 +16,11 @@ use tokio::sync::broadcast;
 /// Source name used for records TailFlow itself injects into the live stream.
 pub const SYSTEM_SOURCE: &str = "tailflow";
 
+/// Per-source collector counters kept for at most this many distinct names.
+/// Docker container names are ephemeral; beyond the cap new names are still
+/// ingested and stored, just not given their own counter row.
+const MAX_COLLECTOR_ENTRIES: usize = 1_024;
+
 /// Durable storage as this daemon run sees it.
 pub enum StorageSlot {
     Enabled(Storage),
@@ -221,13 +226,19 @@ impl AppState {
                         }
                         let kind = {
                             let mut map = collectors.lock().unwrap_or_else(|p| p.into_inner());
-                            let entry = map.entry(record.source.clone()).or_default();
-                            entry.received += 1;
-                            entry.last_event_at = Some(record.timestamp);
-                            if entry.kind.is_empty() {
-                                entry.kind = "runtime";
+                            if map.len() >= MAX_COLLECTOR_ENTRIES
+                                && !map.contains_key(&record.source)
+                            {
+                                "runtime"
+                            } else {
+                                let entry = map.entry(record.source.clone()).or_default();
+                                entry.received += 1;
+                                entry.last_event_at = Some(record.timestamp);
+                                if entry.kind.is_empty() {
+                                    entry.kind = "runtime";
+                                }
+                                entry.kind
                             }
-                            entry.kind
                         };
                         let seq_record = store.push(record);
                         if let Some(storage) = &storage {
@@ -333,7 +344,7 @@ impl AppState {
             event_type,
             Provenance::SystemObserved,
             kind,
-            name,
+            tailflow_core::event::bounded_id(name),
             Utc::now(),
         );
         event.severity = severity;
@@ -436,7 +447,9 @@ impl AppState {
 fn runtime_event(record: &SeqRecord, run_key: &str, kind: &str) -> ObservabilityEvent {
     let line = LogRecord {
         timestamp: record.timestamp,
-        source: record.source.clone(),
+        // A label longer than the id bound (or with control characters)
+        // would fail validation; keep it storable.
+        source: tailflow_core::event::bounded_id(&record.source),
         level: record.level,
         payload: record.payload.clone(),
     };

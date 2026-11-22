@@ -558,6 +558,29 @@ fn depth(value: &Value) -> usize {
     max
 }
 
+/// Make an arbitrary string a valid id: control characters become `?`, and
+/// values over [`MAX_ID_LEN`] keep their **end** (the distinguishing part of
+/// a path or label) behind a `…` marker. Empty input becomes `"-"`.
+pub fn bounded_id(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if clean.is_empty() {
+        return "-".into();
+    }
+    if clean.len() <= MAX_ID_LEN {
+        return clean;
+    }
+    let marker = "…";
+    let keep = MAX_ID_LEN - marker.len();
+    let mut start = clean.len() - keep;
+    while !clean.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &clean[start..])
+}
+
 /// Truncate `s` to at most `max` bytes on a char boundary. Returns whether
 /// anything was cut.
 pub fn truncate_utf8(s: &mut String, max: usize) -> bool {
@@ -719,6 +742,19 @@ mod tests {
         assert!(e.validate().is_err());
         e.session_id = Some(String::new());
         assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn bounded_id_always_validates() {
+        for raw in ["", "a\nb", &"é".repeat(400), &"/x".repeat(500), "ok"] {
+            let id = bounded_id(raw);
+            check_id("t", Some(&id), true).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+        }
+        let long = format!("/{}/my-project", "deep".repeat(100));
+        assert!(
+            bounded_id(&long).ends_with("/my-project"),
+            "keeps the distinguishing end"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::schema::meta_add;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +38,14 @@ pub(crate) enum Command {
 pub(crate) struct Shared {
     pub health: Arc<Health>,
     pub pending: Mutex<PendingLoss>,
+    /// Losses taken out of `pending` by a commit that has not finished yet.
+    /// Counted as pending so a query during a slow retry cannot see neither.
+    pub inflight_loss: AtomicU64,
+    /// Set when shutdown begins; later submissions are counted as loss.
+    pub stopping: AtomicBool,
     pub last_retention: Mutex<Option<(DateTime<Utc>, RetentionReport)>>,
+    /// Result of the background integrity check after an unclean exit.
+    pub integrity: Mutex<Option<(DateTime<Utc>, Vec<String>)>>,
 }
 
 impl Shared {
@@ -47,6 +54,7 @@ impl Shared {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .total()
+            .saturating_add(self.inflight_loss.load(Ordering::SeqCst))
     }
 
     pub fn add_loss(
@@ -86,6 +94,7 @@ pub(crate) struct Writer {
     pub run_id: i64,
     pub next_cleanup: Instant,
     pub next_heartbeat: Instant,
+    pub resuming_cleanup: bool,
 }
 
 struct Outcome {
@@ -155,9 +164,14 @@ impl Writer {
                         false
                     }
                 };
-                if let Err(e) = crate::recover_dead_runs(&self.conn, Some(self.run_id)) {
-                    self.note_error(&e);
+                // Liveness probes spawn a process per open run on macOS, so
+                // they run on the full interval only, not on resumed passes.
+                if !self.resuming_cleanup {
+                    if let Err(e) = crate::recover_dead_runs(&self.conn, Some(self.run_id)) {
+                        self.note_error(&e);
+                    }
                 }
+                self.resuming_cleanup = more;
                 // Unfinished work resumes after the next batch, not after a
                 // full interval, so cleanup makes progress without starving
                 // ingestion.
@@ -175,7 +189,7 @@ impl Writer {
         self.shared
             .health
             .queue_depth
-            .fetch_sub(1, Ordering::Relaxed);
+            .fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Collect more events until the batch is full or the batch delay since
@@ -217,6 +231,10 @@ impl Writer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        let inflight = losses
+            .iter()
+            .fold(0u64, |acc, (_, e)| acc.saturating_add(e.count));
+        self.shared.inflight_loss.store(inflight, Ordering::SeqCst);
         let mut attempt = 0usize;
         loop {
             let started = Instant::now();
@@ -234,6 +252,7 @@ impl Writer {
                         Ordering::Relaxed,
                     );
                     h.set_state(WriterState::Ok);
+                    self.shared.inflight_loss.store(0, Ordering::SeqCst);
                     batch.clear();
                     return;
                 }
@@ -255,6 +274,7 @@ impl Writer {
                         .unwrap_or_else(|p| p.into_inner());
                     pending.restore(losses);
                     pending.add(LossReason::StorageError, n, first, last);
+                    self.shared.inflight_loss.store(0, Ordering::SeqCst);
                     drop(pending);
                     self.shared
                         .health
@@ -312,7 +332,10 @@ impl Writer {
                 i64::try_from(inserted).unwrap_or(i64::MAX),
             )?;
             c.execute(
-                "UPDATE runs SET heartbeat_at = ?1, last_seq = max(last_seq, ?2) WHERE id = ?3",
+                // `ended_at = NULL` re-arms a run another daemon wrongly declared
+                // dead (e.g. after laptop sleep) so a later crash is detected.
+                "UPDATE runs SET heartbeat_at = ?1, last_seq = max(last_seq, ?2), ended_at = NULL
+                 WHERE id = ?3",
                 params![Utc::now().timestamp_micros(), last_seq, run_id],
             )?;
             Ok(Outcome {
@@ -324,7 +347,7 @@ impl Writer {
 
     fn heartbeat(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2",
+            "UPDATE runs SET heartbeat_at = ?1, ended_at = NULL WHERE id = ?2",
             params![Utc::now().timestamp_micros(), self.run_id],
         )?;
         Ok(())
@@ -355,6 +378,7 @@ impl Writer {
 
     /// Drain the queue, commit everything, and mark the run clean.
     fn finish(&mut self, batch: &mut Vec<ObservabilityEvent>) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
         let mut acks = Vec::new();
         loop {
             match self.rx.try_recv() {
@@ -375,14 +399,33 @@ impl Writer {
         if !batch.is_empty() || self.shared.pending_total() > 0 {
             self.commit(batch);
         }
-        let clean = self.shared.pending_total() == 0;
-        let ended = self.conn.execute(
-            "UPDATE runs SET ended_at = ?1, heartbeat_at = ?1, clean = ?2 WHERE id = ?3",
-            params![Utc::now().timestamp_micros(), i64::from(clean), self.run_id],
-        );
+        // Anything still counted in the queue raced the final drain and is
+        // lost with the receiver; unrecorded pending loss is lost too. Either
+        // way the run is left *open* (ended_at NULL) so the next start
+        // records an unclean-shutdown gap instead of trusting this run.
+        let in_queue = self.shared.health.queue_depth.load(Ordering::SeqCst);
+        let clean = self.shared.pending_total() == 0 && in_queue <= 0;
+        let ended = if clean {
+            self.conn.execute(
+                "UPDATE runs SET ended_at = ?1, heartbeat_at = ?1, clean = 1 WHERE id = ?2",
+                params![Utc::now().timestamp_micros(), self.run_id],
+            )
+        } else {
+            tracing::warn!(
+                in_queue,
+                pending = self.shared.pending_total(),
+                "storage stopped with unrecorded loss; the next start will record a gap"
+            );
+            self.conn.execute(
+                "UPDATE runs SET ended_at = NULL, clean = 0 WHERE id = ?1",
+                params![self.run_id],
+            )
+        };
         if let Err(e) = ended {
             self.note_error(&e.into());
         }
+        // Refresh planner statistics; cheap when nothing changed.
+        let _optimize_best_effort = self.conn.execute_batch("PRAGMA optimize");
         let _checkpoint_best_effort: rusqlite::Result<(i64, i64, i64)> =
             self.conn
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
