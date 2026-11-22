@@ -1,0 +1,586 @@
+//! The single writer thread.
+//!
+//! One OS thread owns the read-write connection. Ingestion hands it events
+//! through a bounded queue and never waits on it, so a slow disk can lose
+//! *persisted* history (counted, and recorded as a gap) but can never stall
+//! the live view.
+//!
+//! Durability contract: an event is **persisted** when the transaction that
+//! inserted it has committed. Only then is `events_persisted` incremented. With
+//! `synchronous = NORMAL` in WAL mode a committed transaction survives a
+//! process crash (including `kill -9`); the most recent commits may be lost on
+//! OS crash or power loss. `synchronous = FULL` closes that window.
+
+use crate::error::{Result, StorageError};
+use crate::health::{Health, LossEntry, LossReason, PendingLoss, WriterState};
+use crate::retention::{self, immediate, RetentionPolicy, RetentionReport};
+use crate::schema::meta_add;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{Map, Value};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tailflow_core::event::{ObservabilityEvent, Provenance};
+
+pub(crate) enum Command {
+    Event(Box<ObservabilityEvent>),
+    /// Ack once everything enqueued before this command is committed (or
+    /// accounted as lost).
+    Flush(SyncSender<()>),
+    RetentionNow(SyncSender<Result<RetentionReport>>),
+    Shutdown(SyncSender<()>),
+}
+
+/// State shared between the handle and the writer.
+#[derive(Default)]
+pub(crate) struct Shared {
+    pub health: Arc<Health>,
+    pub pending: Mutex<PendingLoss>,
+    pub last_retention: Mutex<Option<(DateTime<Utc>, RetentionReport)>>,
+}
+
+impl Shared {
+    pub fn pending_total(&self) -> u64 {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .total()
+    }
+
+    pub fn add_loss(
+        &self,
+        reason: LossReason,
+        count: u64,
+        first: DateTime<Utc>,
+        last: DateTime<Utc>,
+    ) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(reason, count, first, last);
+    }
+}
+
+pub(crate) struct WriterConfig {
+    pub batch_max: usize,
+    pub batch_delay: Duration,
+    pub fts: bool,
+    pub policy: RetentionPolicy,
+    pub cleanup_interval: Duration,
+    pub heartbeat_interval: Duration,
+    /// Wall-clock budget for one retention pass between batches.
+    pub retention_budget: Duration,
+}
+
+/// Backoff between commit attempts for one batch. After the last, the batch
+/// is counted as lost and recorded as a gap.
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(250)];
+
+pub(crate) struct Writer {
+    pub conn: Connection,
+    pub rx: Receiver<Command>,
+    pub shared: Arc<Shared>,
+    pub cfg: WriterConfig,
+    pub run_id: i64,
+    pub next_cleanup: Instant,
+    pub next_heartbeat: Instant,
+}
+
+struct Outcome {
+    inserted: u64,
+    duplicates: u64,
+}
+
+impl Writer {
+    pub fn run(mut self) {
+        self.shared.health.set_state(WriterState::Ok);
+        let mut batch: Vec<ObservabilityEvent> = Vec::with_capacity(self.cfg.batch_max);
+        loop {
+            let wait = self
+                .next_heartbeat
+                .min(self.next_cleanup)
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let mut control = None;
+            match self.rx.recv_timeout(wait) {
+                Ok(Command::Event(e)) => {
+                    self.received_one();
+                    batch.push(*e);
+                    control = self.gather(&mut batch);
+                }
+                Ok(other) => control = Some(other),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Every handle was dropped without an explicit shutdown:
+                    // treat it as one.
+                    self.finish(&mut batch);
+                    return;
+                }
+            }
+
+            if !batch.is_empty() || self.shared.pending_total() > 0 {
+                self.commit(&mut batch);
+            }
+
+            match control {
+                Some(Command::Flush(ack)) => {
+                    let _receiver_gone = ack.send(());
+                }
+                Some(Command::RetentionNow(ack)) => {
+                    let report = self.retention();
+                    let _receiver_gone = ack.send(report);
+                }
+                Some(Command::Shutdown(ack)) => {
+                    self.finish(&mut batch);
+                    let _receiver_gone = ack.send(());
+                    return;
+                }
+                Some(Command::Event(_)) | None => {}
+            }
+
+            let now = Instant::now();
+            if now >= self.next_heartbeat {
+                if let Err(e) = self.heartbeat() {
+                    self.note_error(&e);
+                }
+                self.next_heartbeat = now + self.cfg.heartbeat_interval;
+            }
+            if now >= self.next_cleanup {
+                let more = match self.retention() {
+                    Ok(r) => r.more_work,
+                    Err(e) => {
+                        self.note_error(&e);
+                        false
+                    }
+                };
+                if let Err(e) = crate::recover_dead_runs(&self.conn, Some(self.run_id)) {
+                    self.note_error(&e);
+                }
+                // Unfinished work resumes after the next batch, not after a
+                // full interval, so cleanup makes progress without starving
+                // ingestion.
+                self.next_cleanup = Instant::now()
+                    + if more {
+                        Duration::from_millis(50)
+                    } else {
+                        self.cfg.cleanup_interval
+                    };
+            }
+        }
+    }
+
+    fn received_one(&self) {
+        self.shared
+            .health
+            .queue_depth
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Collect more events until the batch is full or the batch delay since
+    /// the first event elapses. Returns a control command that interrupted it.
+    fn gather(&mut self, batch: &mut Vec<ObservabilityEvent>) -> Option<Command> {
+        let deadline = Instant::now() + self.cfg.batch_delay;
+        while batch.len() < self.cfg.batch_max {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(Command::Event(e)) => {
+                    self.received_one();
+                    batch.push(*e);
+                }
+                Ok(other) => return Some(other),
+                Err(_) => break,
+            }
+        }
+        None
+    }
+
+    fn note_error(&self, e: &StorageError) {
+        let h = &self.shared.health;
+        h.storage_errors.fetch_add(1, Ordering::Relaxed);
+        h.set_error(e.to_string());
+        h.set_state(WriterState::Degraded);
+        tracing::warn!(err = %e, "storage write failed");
+    }
+
+    /// Commit `batch` plus any pending loss markers, retrying transient
+    /// failures. On final failure the batch is counted as lost and becomes a
+    /// pending gap, so the loss is recorded once storage recovers.
+    fn commit(&mut self, batch: &mut Vec<ObservabilityEvent>) {
+        let losses = self
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let mut attempt = 0usize;
+        loop {
+            let started = Instant::now();
+            match self.write(batch, &losses) {
+                Ok(outcome) => {
+                    let h = &self.shared.health;
+                    h.persisted.fetch_add(outcome.inserted, Ordering::Relaxed);
+                    h.duplicates
+                        .fetch_add(outcome.duplicates, Ordering::Relaxed);
+                    h.commits.fetch_add(1, Ordering::Relaxed);
+                    h.last_commit_at_us
+                        .store(Utc::now().timestamp_micros(), Ordering::Relaxed);
+                    h.last_commit_latency_us.store(
+                        i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX),
+                        Ordering::Relaxed,
+                    );
+                    h.set_state(WriterState::Ok);
+                    batch.clear();
+                    return;
+                }
+                Err(e) => {
+                    self.note_error(&e);
+                    if let Some(delay) = RETRY_BACKOFF.get(attempt) {
+                        attempt += 1;
+                        std::thread::sleep(*delay);
+                        continue;
+                    }
+                    let n = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                    let now = Utc::now();
+                    let first = batch.iter().map(|e| e.observed_at).min().unwrap_or(now);
+                    let last = batch.iter().map(|e| e.observed_at).max().unwrap_or(now);
+                    let mut pending = self
+                        .shared
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    pending.restore(losses);
+                    pending.add(LossReason::StorageError, n, first, last);
+                    drop(pending);
+                    self.shared
+                        .health
+                        .dropped_storage_error
+                        .fetch_add(n, Ordering::Relaxed);
+                    batch.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn write(
+        &mut self,
+        batch: &[ObservabilityEvent],
+        losses: &[(LossReason, LossEntry)],
+    ) -> Result<Outcome> {
+        let run_id = self.run_id;
+        let fts = self.cfg.fts;
+        immediate(&self.conn, |c| {
+            // The newest committed row, by *any* writer: concurrent daemons
+            // share the file, and this read happens under the write lock.
+            let (mut last_seq, mut floor) = newest(c)?;
+            let mut inserted = 0u64;
+            let mut duplicates = 0u64;
+            for (reason, loss) in losses {
+                record_gap(
+                    c,
+                    *reason,
+                    Some(loss.count),
+                    loss.first_at,
+                    loss.last_at,
+                    last_seq,
+                    Some(run_id),
+                    None,
+                )?;
+                let marker = loss_marker(*reason, Some(loss.count), loss.first_at, loss.last_at);
+                if let Some(seq) = insert_event(c, &marker, &mut floor, run_id, fts)? {
+                    last_seq = seq;
+                    inserted += 1;
+                }
+            }
+            for event in batch {
+                match insert_event(c, event, &mut floor, run_id, fts)? {
+                    Some(seq) => {
+                        last_seq = seq;
+                        inserted += 1;
+                    }
+                    None => duplicates += 1,
+                }
+            }
+            meta_add(
+                c,
+                "event_count",
+                i64::try_from(inserted).unwrap_or(i64::MAX),
+            )?;
+            c.execute(
+                "UPDATE runs SET heartbeat_at = ?1, last_seq = max(last_seq, ?2) WHERE id = ?3",
+                params![Utc::now().timestamp_micros(), last_seq, run_id],
+            )?;
+            Ok(Outcome {
+                inserted,
+                duplicates,
+            })
+        })
+    }
+
+    fn heartbeat(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2",
+            params![Utc::now().timestamp_micros(), self.run_id],
+        )?;
+        Ok(())
+    }
+
+    fn retention(&mut self) -> Result<RetentionReport> {
+        let report = retention::run(
+            &self.conn,
+            &self.cfg.policy,
+            Utc::now().timestamp_micros(),
+            self.cfg.retention_budget,
+        )?;
+        if report.expired_by_age + report.evicted_by_size > 0 {
+            tracing::info!(
+                expired = report.expired_by_age,
+                evicted = report.evicted_by_size,
+                ms = report.duration_ms,
+                "storage retention"
+            );
+        }
+        *self
+            .shared
+            .last_retention
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((Utc::now(), report.clone()));
+        Ok(report)
+    }
+
+    /// Drain the queue, commit everything, and mark the run clean.
+    fn finish(&mut self, batch: &mut Vec<ObservabilityEvent>) {
+        let mut acks = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(Command::Event(e)) => {
+                    self.received_one();
+                    batch.push(*e);
+                    if batch.len() >= self.cfg.batch_max {
+                        self.commit(batch);
+                    }
+                }
+                Ok(Command::Flush(ack) | Command::Shutdown(ack)) => acks.push(ack),
+                Ok(Command::RetentionNow(ack)) => {
+                    let _receiver_gone = ack.send(Err(StorageError::WriterStopped));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if !batch.is_empty() || self.shared.pending_total() > 0 {
+            self.commit(batch);
+        }
+        let clean = self.shared.pending_total() == 0;
+        let ended = self.conn.execute(
+            "UPDATE runs SET ended_at = ?1, heartbeat_at = ?1, clean = ?2 WHERE id = ?3",
+            params![Utc::now().timestamp_micros(), i64::from(clean), self.run_id],
+        );
+        if let Err(e) = ended {
+            self.note_error(&e.into());
+        }
+        let _checkpoint_best_effort: rusqlite::Result<(i64, i64, i64)> =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                });
+        self.shared.health.set_state(WriterState::Stopped);
+        for ack in acks {
+            let _receiver_gone = ack.send(());
+        }
+    }
+}
+
+/// `(highest seq ever issued, observed_at floor)`.
+///
+/// The seq comes from `sqlite_sequence`, not `max(seq)`: after retention or a
+/// purge empties the table, a gap must still be anchored where the lost
+/// events would have been, not at 0 (which would place it outside every
+/// later query's range and make that range look complete).
+pub(crate) fn newest(c: &Connection) -> Result<(i64, i64)> {
+    let issued: i64 = c
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let floor: i64 = c
+        .query_row(
+            "SELECT observed_at FROM events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(i64::MIN);
+    Ok((issued, floor))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_gap(
+    c: &Connection,
+    reason: LossReason,
+    count: Option<u64>,
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+    at_seq: i64,
+    run_id: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    record_gap_range(
+        c, reason, count, first, last, at_seq, at_seq, run_id, detail,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_gap_range(
+    c: &Connection,
+    reason: LossReason,
+    count: Option<u64>,
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+    from_seq: i64,
+    to_seq: i64,
+    run_id: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO gaps (reason, count, first_at, last_at, from_seq, to_seq, run_id, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            reason.as_str(),
+            count.map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
+            first.timestamp_micros(),
+            last.timestamp_micros(),
+            from_seq,
+            to_seq,
+            run_id,
+            detail,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `system.events.dropped` event that makes a loss visible in the event
+/// stream itself, not only in the gaps table.
+pub(crate) fn loss_marker(
+    reason: LossReason,
+    count: Option<u64>,
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+) -> ObservabilityEvent {
+    let mut e = ObservabilityEvent::new(
+        format!("loss:{}:{}", reason.as_str(), Utc::now().timestamp_micros()),
+        "system.events.dropped",
+        Provenance::SystemObserved,
+        "daemon",
+        "tailflow",
+        last,
+    );
+    e.severity = tailflow_core::LogLevel::Warn;
+    e.message = Some(match count {
+        Some(n) => format!("{n} events were not persisted ({})", reason.as_str()),
+        None => format!(
+            "an unknown number of events may be missing ({})",
+            reason.as_str()
+        ),
+    });
+    let mut attrs = Map::new();
+    attrs.insert("reason".into(), Value::from(reason.as_str()));
+    attrs.insert("count".into(), count.map_or(Value::Null, Value::from));
+    attrs.insert("first_at".into(), Value::from(first.to_rfc3339()));
+    attrs.insert("last_at".into(), Value::from(last.to_rfc3339()));
+    e.attributes = attrs;
+    e
+}
+
+/// Insert one event. Returns its seq, or `None` when it was a duplicate of a
+/// stable `event_id` already stored.
+///
+/// `floor` enforces the ordering invariant: stored `observed_at` never
+/// decreases in seq order (an event may be raised to the previous row's
+/// value), and stored `ts` never exceeds stored `observed_at` (a future-dated
+/// source timestamp is clamped and the original kept as
+/// `attributes.source_timestamp`). Together these make `since` translate into
+/// an exact seq lower bound.
+pub(crate) fn insert_event(
+    c: &Connection,
+    e: &ObservabilityEvent,
+    floor: &mut i64,
+    run_id: i64,
+    fts: bool,
+) -> Result<Option<i64>> {
+    let observed = e.observed_at.timestamp_micros().max(*floor);
+    let mut ts = e.timestamp.timestamp_micros();
+    let mut attributes = std::borrow::Cow::Borrowed(&e.attributes);
+    if ts > observed {
+        ts = observed;
+        attributes.to_mut().insert(
+            "source_timestamp".into(),
+            Value::from(e.timestamp.to_rfc3339()),
+        );
+    }
+    let attributes_json = if attributes.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(attributes.as_ref()).map_err(|err| {
+            StorageError::InvalidQuery(format!("attributes not serializable: {err}"))
+        })?)
+    };
+    let redaction_json = if e.redaction.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&e.redaction).ok()
+    };
+    let mut stmt = c.prepare_cached(
+        "INSERT INTO events (
+            event_id, dedup_key, schema_version, ts, observed_at, event_type, provenance,
+            source_type, source_id, project_id, session_id, operation_id, parent_operation_id,
+            agent_name, severity, status, duration_ms, path, message, attributes, payload,
+            redaction, run_id
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+         ON CONFLICT(dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING",
+    )?;
+    let changed = stmt.execute(params![
+        e.event_id,
+        e.stable_id.then_some(e.event_id.as_str()),
+        i64::from(e.schema_version),
+        ts,
+        observed,
+        e.event_type,
+        e.provenance.as_str(),
+        e.source_type,
+        e.source_id,
+        e.project_id,
+        e.session_id,
+        e.operation_id,
+        e.parent_operation_id,
+        e.agent_name,
+        i64::from(e.severity.severity()),
+        e.status.map(|s| s.as_str()),
+        e.duration_ms.map(|d| i64::try_from(d).unwrap_or(i64::MAX)),
+        e.path,
+        e.message,
+        attributes_json,
+        e.payload,
+        redaction_json,
+        run_id,
+    ])?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let seq = c.last_insert_rowid();
+    *floor = observed;
+    if fts {
+        if let Some(message) = &e.message {
+            c.prepare_cached("INSERT INTO events_fts(rowid, message) VALUES (?1, ?2)")?
+                .execute(params![seq, message])?;
+        }
+    }
+    Ok(Some(seq))
+}

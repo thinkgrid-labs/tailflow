@@ -1,0 +1,479 @@
+//! Connection setup and schema migrations.
+//!
+//! Safety rules:
+//! - A file that is not SQLite, not ours, or from a newer schema is reported
+//!   and **never modified**. There is no code path that deletes or recreates a
+//!   database because opening it failed.
+//! - Each migration runs in one transaction together with its
+//!   `PRAGMA user_version` bump. SQLite DDL is transactional, so an
+//!   interrupted migration leaves the previous version intact.
+
+use crate::error::{Result, StorageError};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use std::path::Path;
+use std::time::Duration;
+use tailflow_core::config::SyncMode;
+
+/// `PRAGMA application_id` stamped on every TailFlow database ("TFLW").
+pub const APPLICATION_ID: i32 = 0x5446_4c57;
+
+/// Highest schema version this build understands.
+pub const SCHEMA_VERSION: i32 = 1;
+
+/// How long a connection waits on a lock held by another connection or
+/// process before reporting `SQLITE_BUSY`.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct Migration {
+    pub version: i32,
+    pub name: &'static str,
+    pub sql: &'static str,
+}
+
+/// Times are integer microseconds since the Unix epoch. `seq` is the
+/// persistent cursor: `AUTOINCREMENT` guarantees a value is never reused, even
+/// after the newest rows are deleted.
+const V1: &str = r"
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_key       TEXT NOT NULL UNIQUE,
+    started_at    INTEGER NOT NULL,
+    heartbeat_at  INTEGER NOT NULL,
+    ended_at      INTEGER,
+    clean         INTEGER NOT NULL DEFAULT 0,
+    last_seq      INTEGER NOT NULL DEFAULT 0,
+    version       TEXT NOT NULL,
+    pid           INTEGER NOT NULL,
+    project_id    TEXT
+);
+
+CREATE TABLE events (
+    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id            TEXT    NOT NULL,
+    dedup_key           TEXT,
+    schema_version      INTEGER NOT NULL,
+    ts                  INTEGER NOT NULL,
+    observed_at         INTEGER NOT NULL,
+    event_type          TEXT    NOT NULL,
+    provenance          TEXT    NOT NULL,
+    source_type         TEXT    NOT NULL,
+    source_id           TEXT    NOT NULL,
+    project_id          TEXT,
+    session_id          TEXT,
+    operation_id        TEXT,
+    parent_operation_id TEXT,
+    agent_name          TEXT,
+    severity            INTEGER NOT NULL,
+    status              TEXT,
+    duration_ms         INTEGER,
+    path                TEXT,
+    message             TEXT,
+    attributes          TEXT,
+    payload             TEXT,
+    redaction           TEXT,
+    run_id              INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX events_dedup   ON events(dedup_key)   WHERE dedup_key  IS NOT NULL;
+CREATE INDEX events_observed       ON events(observed_at);
+CREATE INDEX events_ts             ON events(ts);
+CREATE INDEX events_type           ON events(event_type);
+CREATE INDEX events_source         ON events(source_id);
+CREATE INDEX events_session        ON events(session_id)  WHERE session_id IS NOT NULL;
+CREATE INDEX events_agent          ON events(agent_name)  WHERE agent_name IS NOT NULL;
+CREATE INDEX events_project        ON events(project_id)  WHERE project_id IS NOT NULL;
+
+-- A gap is a seq interval in which events may be missing. Loss gaps have
+-- from_seq = to_seq = the last seq committed before the loss was detected.
+CREATE TABLE gaps (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason    TEXT    NOT NULL,
+    count     INTEGER,
+    first_at  INTEGER NOT NULL,
+    last_at   INTEGER NOT NULL,
+    from_seq  INTEGER NOT NULL,
+    to_seq    INTEGER NOT NULL,
+    run_id    INTEGER,
+    detail    TEXT
+);
+CREATE INDEX gaps_to_seq ON gaps(to_seq);
+
+-- Contentless: the index stores tokens only, the text lives in `events`.
+CREATE VIRTUAL TABLE events_fts USING fts5(
+    message, content = '', contentless_delete = 1, tokenize = 'unicode61'
+);
+
+INSERT INTO meta(key, value) VALUES ('event_count', '0');
+INSERT INTO meta(key, value) VALUES ('evicted_through_seq', '0');
+INSERT INTO meta(key, value) VALUES ('payload_expired_through_seq', '0');
+";
+
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "initial event store",
+    sql: V1,
+}];
+
+/// Open (creating if needed) a read-write connection and bring the schema
+/// up to date.
+pub fn open_writer(path: &Path, sync: SyncMode) -> Result<Connection> {
+    open_writer_with(path, sync, MIGRATIONS)
+}
+
+pub(crate) fn open_writer_with(
+    path: &Path,
+    sync: SyncMode,
+    migrations: &[Migration],
+) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        crate::paths::create_private_dir(parent).map_err(|e| StorageError::CannotOpen {
+            path: path.into(),
+            detail: e.to_string(),
+        })?;
+    }
+    if path.is_dir() {
+        return Err(StorageError::CannotOpen {
+            path: path.into(),
+            detail: "path is a directory".into(),
+        });
+    }
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| StorageError::from_open(path, e))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| StorageError::from_open(path, e))?;
+
+    // First real read of the file: a non-SQLite file fails here.
+    let page_count: i64 = conn
+        .pragma_query_value(None, "page_count", |r| r.get(0))
+        .map_err(|e| StorageError::from_open(path, e))?;
+    let app_id: i32 = conn
+        .pragma_query_value(None, "application_id", |r| r.get(0))
+        .map_err(|e| StorageError::from_open(path, e))?;
+    let user_version: i32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|e| StorageError::from_open(path, e))?;
+
+    if page_count == 0 {
+        // Brand-new file. auto_vacuum must be chosen before the first table.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+    } else if app_id != APPLICATION_ID {
+        let has_tables: i64 =
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+        if app_id != 0 || has_tables > 0 || user_version != 0 {
+            return Err(StorageError::ForeignDatabase {
+                path: path.into(),
+                application_id: app_id,
+            });
+        }
+        conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+    }
+
+    let latest = migrations.iter().map(|m| m.version).max().unwrap_or(0);
+    if user_version > latest {
+        return Err(StorageError::NewerSchema {
+            found: user_version,
+            supported: latest,
+        });
+    }
+
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .map_err(|e| StorageError::from_open(path, e))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        tracing::warn!(journal_mode = %mode, "SQLite refused WAL mode; continuing with {mode}");
+    }
+    conn.pragma_update(
+        None,
+        "synchronous",
+        match sync {
+            SyncMode::Normal => "NORMAL",
+            SyncMode::Full => "FULL",
+        },
+    )?;
+    // Truncate the WAL back to this size after checkpoints.
+    conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -16_000)?; // ~16 MB
+    conn.set_prepared_statement_cache_capacity(32);
+
+    migrate(&mut conn, migrations)?;
+    Ok(conn)
+}
+
+/// Apply every migration newer than the database's `user_version`.
+pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<i32> {
+    let start: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let mut current = start;
+    for m in migrations.iter().filter(|m| m.version > start) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(m.sql).map_err(|e| {
+            StorageError::Config(format!(
+                "migration {} ({}) failed and was rolled back: {e}",
+                m.version, m.name
+            ))
+        })?;
+        tx.pragma_update(None, "user_version", m.version)?;
+        tx.commit()?;
+        tracing::info!(
+            version = m.version,
+            name = m.name,
+            "applied storage migration"
+        );
+        current = m.version;
+    }
+    Ok(current)
+}
+
+/// A connection for queries. Writes are refused at the SQLite level.
+pub fn open_reader(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| StorageError::from_open(path, e))?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    conn.pragma_update(None, "cache_size", -8_000)?;
+    conn.set_prepared_statement_cache_capacity(32);
+    Ok(conn)
+}
+
+/// `PRAGMA quick_check` (or `integrity_check` when `full`). Returns the list
+/// of problems; empty means healthy.
+pub fn integrity_problems(conn: &Connection, full: bool) -> Result<Vec<String>> {
+    let pragma = if full {
+        "PRAGMA integrity_check(100)"
+    } else {
+        "PRAGMA quick_check(100)"
+    };
+    let mut stmt = conn.prepare(pragma)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut problems = Vec::new();
+    for row in rows {
+        let line = row?;
+        if line != "ok" {
+            problems.push(line);
+        }
+    }
+    Ok(problems)
+}
+
+pub(crate) fn meta_get_i64(conn: &Connection, key: &str) -> Result<i64> {
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+}
+
+pub(crate) fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other.into()),
+        })
+}
+
+pub(crate) fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [key, value],
+    )?;
+    Ok(())
+}
+
+/// Add `delta` to an integer meta value, never going below zero.
+pub(crate) fn meta_add(conn: &Connection, key: &str, delta: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, max(0, ?2))
+         ON CONFLICT(key) DO UPDATE SET value = CAST(max(0, CAST(value AS INTEGER) + ?2) AS TEXT)",
+        rusqlite::params![key, delta],
+    )?;
+    Ok(())
+}
+
+/// Raise an integer meta value to at least `value`.
+pub(crate) fn meta_max(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = CAST(max(CAST(value AS INTEGER), ?2) AS TEXT)",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_schema_and_stamps_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/events.db");
+        let conn = open_writer(&path, SyncMode::Normal).unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let id: i32 = conn
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, APPLICATION_ID);
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let av: i32 = conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .unwrap();
+        assert_eq!(av, 2, "incremental auto_vacuum");
+        drop(conn);
+        // Reopening is idempotent.
+        open_writer(&path, SyncMode::Normal).unwrap();
+    }
+
+    #[test]
+    fn garbage_file_is_reported_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let garbage = b"this is not a database, it is a shopping list\n".repeat(200);
+        std::fs::write(&path, &garbage).unwrap();
+        let err = open_writer(&path, SyncMode::Normal).unwrap_err();
+        assert!(
+            matches!(err, StorageError::NotADatabase { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            garbage,
+            "file must be untouched"
+        );
+    }
+
+    #[test]
+    fn foreign_sqlite_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE customers(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let err = open_writer(&path, SyncMode::Normal).unwrap_err();
+        assert!(
+            matches!(err, StorageError::ForeignDatabase { .. }),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn newer_schema_is_refused_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        drop(open_writer(&path, SyncMode::Normal).unwrap());
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", SCHEMA_VERSION + 5)
+                .unwrap();
+        }
+        let err = open_writer(&path, SyncMode::Normal).unwrap_err();
+        assert!(
+            matches!(err, StorageError::NewerSchema { found, .. } if found == SCHEMA_VERSION + 5),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_migration_rolls_back_completely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        drop(open_writer(&path, SyncMode::Normal).unwrap());
+        let broken = [
+            MIGRATIONS[0].clone_ref(),
+            Migration {
+                version: 2,
+                name: "half-applied",
+                sql: "CREATE TABLE new_thing(x INTEGER); INSERT INTO nonexistent VALUES (1);",
+            },
+        ];
+        let err = open_writer_with(&path, SyncMode::Normal, &broken).unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        let c = Connection::open(&path).unwrap();
+        let v: i32 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1, "version must not advance");
+        let exists: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'new_thing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "partial DDL must be rolled back");
+    }
+
+    #[test]
+    fn directory_path_and_unwritable_parent_fail_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = open_writer(dir.path(), SyncMode::Normal).unwrap_err();
+        assert!(matches!(err, StorageError::CannotOpen { .. }), "{err:?}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = dir.path().join("ro");
+            std::fs::create_dir(&ro).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let err = open_writer(&ro.join("events.db"), SyncMode::Normal).unwrap_err();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                matches!(
+                    err,
+                    StorageError::CannotOpen { .. } | StorageError::ReadOnly { .. }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_helpers_clamp_and_raise() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_writer(&dir.path().join("e.db"), SyncMode::Normal).unwrap();
+        meta_add(&conn, "event_count", 5).unwrap();
+        meta_add(&conn, "event_count", -9).unwrap();
+        assert_eq!(meta_get_i64(&conn, "event_count").unwrap(), 0);
+        meta_max(&conn, "evicted_through_seq", 7).unwrap();
+        meta_max(&conn, "evicted_through_seq", 3).unwrap();
+        assert_eq!(meta_get_i64(&conn, "evicted_through_seq").unwrap(), 7);
+    }
+
+    impl Migration {
+        fn clone_ref(&self) -> Migration {
+            Migration {
+                version: self.version,
+                name: self.name,
+                sql: self.sql,
+            }
+        }
+    }
+}

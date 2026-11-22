@@ -1,0 +1,25 @@
+[package]
+name = "tailflow-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable SQLite event store for TailFlow"
+
+[dependencies]
+tailflow-core = { path = "../tailflow-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+regex = "1"
+getrandom = "0.4"
+
+# 0.40, not 0.41: 0.41 requires Rust 1.89 and the workspace MSRV is 1.88.
+# `bundled` compiles SQLite (3.53.x) with FTS5 enabled, so behavior does not
+# depend on the host's system library.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "hooks", "functions"] }
+
+[dev-dependencies]
+tempfile = "3"
