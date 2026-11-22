@@ -241,7 +241,9 @@ fn main() {
         || std::env::temp_dir().join("tailflow-bench"),
         PathBuf::from,
     );
-    let _ = std::fs::remove_dir_all(&root);
+    if arg("--db").is_none() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
     std::fs::create_dir_all(&root).unwrap();
     let only = arg("--only");
     let want = |n: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == n));
@@ -341,6 +343,50 @@ fn main() {
             );
             s.shutdown(Duration::from_secs(60)).unwrap();
         }
+    }
+
+    // Size eviction alone on an existing database copy (`--db PATH`), with a
+    // per-phase breakdown of every pass.
+    if want("size_existing") {
+        let db = PathBuf::from(arg("--db").expect("--db PATH"));
+        let mut c = cfg(&db);
+        c.cleanup_interval_secs = 86_400;
+        let probe = open(&c);
+        let used = probe.status().unwrap().db.used_bytes;
+        probe.shutdown(Duration::from_secs(60)).unwrap();
+        drop(probe);
+        c.max_size_mb = (used / 2 / (1024 * 1024)).max(16);
+        let s = open(&c);
+        let t = Instant::now();
+        let mut worst = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut passes, mut evicted) = (0, 0);
+        loop {
+            let pt = Instant::now();
+            let r = s.run_retention(Duration::from_secs(600)).unwrap();
+            let total = pt.elapsed().as_secs_f64() * 1000.0;
+            passes += 1;
+            evicted += r.evicted_by_size;
+            worst.0 = worst.0.max(total);
+            worst.1 = worst.1.max(r.age_ms);
+            worst.2 = worst.2.max(r.payload_ms);
+            worst.3 = worst.3.max(r.size_ms);
+            worst.4 = worst.4.max(r.vacuum_ms);
+            if !r.more_work {
+                break;
+            }
+        }
+        let after = s.status().unwrap().db;
+        emit(
+            "retention_size_isolated",
+            json!({
+                "cap_mb": c.max_size_mb, "used_before": used, "used_after": after.used_bytes,
+                "evicted": evicted, "passes": passes, "total_ms": t.elapsed().as_secs_f64() * 1000.0,
+                "max_pass_ms": worst.0, "max_age_ms": worst.1, "max_payload_ms": worst.2,
+                "max_size_ms": worst.3, "max_vacuum_checkpoint_ms": worst.4,
+            }),
+        );
+        s.shutdown(Duration::from_secs(60)).unwrap();
+        return;
     }
 
     // 4. Large database: build, measure growth, queries, retention, restart.

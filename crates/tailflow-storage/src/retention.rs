@@ -293,6 +293,15 @@ pub fn run(
         let after = page_stats(conn)?.freelist_count;
         report.vacuumed_pages = stats.freelist_count.saturating_sub(after);
     }
+    if report.expired_by_age + report.evicted_by_size > 0 {
+        // A bounded amount of FTS segment merging (~64 pages of work) so
+        // deleted rows' tombstones are compacted gradually, never in one
+        // large synchronous merge.
+        conn.execute(
+            "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', 64)",
+            [],
+        )?;
+    }
     if report.expired_by_age + report.evicted_by_size + report.payloads_cleared > 0
         || report.vacuumed_pages > 0
     {

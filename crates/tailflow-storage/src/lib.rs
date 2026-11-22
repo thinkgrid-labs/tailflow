@@ -247,6 +247,13 @@ pub(crate) fn recover_dead_runs(
 /// Reconcile the FTS index with the config. Returns `(enabled, from_seq)`:
 /// text search covers seq ≥ `from_seq`.
 fn reconcile_fts(conn: &Connection, enabled: bool) -> Result<(bool, i64)> {
+    // FTS5 otherwise merges tombstoned segments synchronously when rows are
+    // deleted; on a multi-million-row index one retention COMMIT took 24 s
+    // (M1 benchmark). Retention runs bounded `merge` steps instead.
+    conn.execute(
+        "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 0)",
+        [],
+    )?;
     let prev = schema::meta_get(conn, "fts_enabled")?;
     let (max_seq, _) = writer::newest(conn)?;
     if enabled {
