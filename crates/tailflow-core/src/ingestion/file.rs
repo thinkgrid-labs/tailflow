@@ -39,6 +39,10 @@ impl FileSource {
 
 #[async_trait::async_trait]
 impl Source for FileSource {
+    fn kind(&self) -> &'static str {
+        "file"
+    }
+
     fn name(&self) -> &str {
         if let Some(l) = &self.label {
             return l.as_str();

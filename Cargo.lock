@@ -1980,6 +1980,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tailflow-core",
+ "tailflow-storage",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",

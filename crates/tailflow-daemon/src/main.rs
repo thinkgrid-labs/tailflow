@@ -1,15 +1,21 @@
+mod api_v1;
 mod routes;
 mod state;
+mod storage_cli;
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::sync::Arc;
+use std::time::Duration;
 use std::{net::SocketAddr, path::PathBuf};
 use tailflow_core::{
     config::Config,
     ingestion::{docker::DockerAllSource, file::FileSource, stdin::StdinSource, Source},
     new_bus,
-    processor::{filtered_bus, Filter},
+    privacy::CapturePolicy,
+    processor::Filter,
 };
+use tailflow_storage::{OpenOptions, Storage};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -21,6 +27,9 @@ use tracing_subscriber::EnvFilter;
     about = "TailFlow daemon — collects your stack's logs and serves them over HTTP"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Port to listen on
     #[arg(long, default_value = "7878")]
     port: u16,
@@ -38,7 +47,7 @@ struct Cli {
     stdin: Option<String>,
 
     /// Path to tailflow.toml (auto-discovered if omitted)
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
     /// Only stream records whose payload matches this regex
@@ -52,6 +61,65 @@ struct Cli {
     /// Records retained for retrospective queries (/api/query, /api/errors)
     #[arg(long, value_name = "N", default_value_t = tailflow_core::query::DEFAULT_CAPACITY)]
     buffer: usize,
+
+    /// Keep history in memory only (overrides `[storage] enabled`)
+    #[arg(long)]
+    no_storage: bool,
+
+    /// SQLite database for durable history (overrides `[storage] path`)
+    #[arg(long, value_name = "PATH", global = true)]
+    db: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Inspect or maintain durable history. Works whether or not a daemon is
+    /// running; SQLite serializes access.
+    Storage {
+        #[command(subcommand)]
+        action: storage_cli::StorageAction,
+    },
+}
+
+/// The loaded config plus the directory it came from (the project root).
+fn load_config(cli_config: Option<&std::path::Path>) -> Result<(Option<Config>, PathBuf)> {
+    let cwd = std::env::current_dir()?;
+    match cli_config {
+        Some(path) => {
+            let root = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| cwd.clone(), std::path::Path::to_path_buf);
+            Ok((Some(Config::load(path)?), root))
+        }
+        None => {
+            let mut dir = cwd.clone();
+            loop {
+                if dir.join("tailflow.toml").exists() {
+                    let cfg = Config::load(&dir.join("tailflow.toml"))?;
+                    return Ok((Some(cfg), dir));
+                }
+                if !dir.pop() {
+                    return Ok((None, cwd));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await;
 }
 
 #[tokio::main]
@@ -62,18 +130,36 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let (config, project_root) = load_config(cli.config.as_deref())?;
+
+    let mut storage_cfg = config
+        .as_ref()
+        .map(|c| c.storage.clone())
+        .unwrap_or_default();
+    let privacy_cfg = config
+        .as_ref()
+        .map(|c| c.privacy.clone())
+        .unwrap_or_default();
+    if let Some(db) = &cli.db {
+        storage_cfg.path = Some(db.clone());
+    }
+
+    if let Some(Command::Storage { action }) = cli.command {
+        return storage_cli::run(action, &storage_cfg);
+    }
+
+    if cli.no_storage {
+        storage_cfg.enabled = false;
+    }
+    // Invalid storage or privacy settings are fatal: a typo must not silently
+    // turn redaction off or retention into something else.
+    storage_cfg.validate()?;
+    let policy = Arc::new(
+        CapturePolicy::from_config(&privacy_cfg).context("invalid [privacy] configuration")?,
+    );
 
     let (tx, rx) = new_bus();
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
-
-    // Config file takes priority; CLI flags are additive
-    let cfg_path = cli.config.as_deref();
-
-    let config = if let Some(path) = cfg_path {
-        Some(Config::load(path)?)
-    } else {
-        Config::find_and_load(&std::env::current_dir()?)?
-    };
 
     if let Some(cfg) = config {
         info!("loaded tailflow.toml");
@@ -98,8 +184,19 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    let project_id = std::fs::canonicalize(&project_root)
+        .unwrap_or(project_root)
+        .display()
+        .to_string();
+    let storage_slot = open_storage(&storage_cfg, policy.clone(), project_id).await;
+    let run_key = storage_slot
+        .storage()
+        .map_or_else(|| "memory".to_string(), |s| s.run_key().to_string());
+    let storage_handle = storage_slot.storage().cloned();
+    let storage_line = describe_storage(&storage_slot, &storage_cfg);
+
     // Apply global CLI filters before records enter the ring buffer / SSE bus.
-    let rx = {
+    let filter = {
         let mut filter = match cli.grep.as_deref() {
             Some(pat) => Filter::regex(pat).unwrap_or_else(|e| {
                 eprintln!("tailflow-daemon: invalid --grep regex ({e}), filter ignored");
@@ -110,15 +207,24 @@ async fn main() -> Result<()> {
         if let Some(src) = cli.source {
             filter = filter.with_source(src);
         }
-        filtered_bus(rx, filter)
+        filter
     };
-    let shared = state::AppState::new(rx, cli.buffer.max(1));
+    let (shared, fanout) = state::AppState::with_pipeline(
+        rx,
+        cli.buffer.max(1),
+        state::Pipeline {
+            filter,
+            policy: policy.clone(),
+            storage: storage_slot,
+            run_key,
+        },
+    );
 
     let shutdown = CancellationToken::new();
     let mut source_tasks = Vec::new();
     for source in sources {
         let name = source.name().to_string();
-        shared.register_source(&name);
+        shared.register_source_kind(&name, source.kind());
         let tx_clone = tx.clone();
         let shared = shared.clone();
         let source_shutdown = shutdown.child_token();
@@ -129,7 +235,7 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     tracing::error!(source = %name, err = %e, "source error");
                     shared.mark_source_exited(&name, Some(e.to_string()));
-                    let _ = tx_clone.send(tailflow_core::LogRecord {
+                    let _no_receivers = tx_clone.send(tailflow_core::LogRecord {
                         timestamp: chrono::Utc::now(),
                         source: name,
                         level: tailflow_core::LogLevel::Error,
@@ -153,16 +259,21 @@ async fn main() -> Result<()> {
     eprintln!("  dashboard   http://{addr}");
     eprintln!("  SSE stream  http://{addr}/events");
     eprintln!("  agent API   http://{addr}/api/errors");
+    eprintln!("  history     {storage_line}");
+    eprintln!("  privacy     capture = {}", policy.mode.as_str());
 
     let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = terminate_signal() => {}
+            }
             shutdown_signal.cancel();
         })
         .await?;
     shutdown.cancel();
-    if tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+    if tokio::time::timeout(Duration::from_secs(5), async move {
         for task in source_tasks {
             if let Err(error) = task.await {
                 tracing::warn!(err = ?error, "source task did not shut down cleanly");
@@ -177,6 +288,89 @@ async fn main() -> Result<()> {
             abort.abort();
         }
     }
+    // The fan-out ends once every source sender is gone; let it hand its last
+    // records to storage before the writer drains.
+    if tokio::time::timeout(Duration::from_secs(3), fanout)
+        .await
+        .is_err()
+    {
+        tracing::warn!("timed out waiting for the ingestion fan-out");
+    }
+    if let Some(storage) = storage_handle {
+        match tokio::task::spawn_blocking(move || storage.shutdown(Duration::from_secs(15))).await {
+            Ok(Ok(())) => info!("storage closed cleanly"),
+            Ok(Err(e)) => {
+                eprintln!("tailflow-daemon: storage did not close cleanly ({e}); the next start will record a gap");
+            }
+            Err(e) => tracing::warn!(err = ?e, "storage shutdown task failed"),
+        }
+    }
 
     Ok(())
+}
+
+async fn open_storage(
+    cfg: &tailflow_core::config::StorageConfig,
+    policy: Arc<CapturePolicy>,
+    project_id: String,
+) -> state::StorageSlot {
+    if !cfg.enabled {
+        return state::StorageSlot::Disabled;
+    }
+    let cfg = cfg.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        Storage::open(
+            &cfg,
+            OpenOptions {
+                project_id: Some(project_id),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                policy,
+            },
+        )
+    })
+    .await;
+    match opened {
+        Ok(Ok(storage)) => {
+            for run in storage.recovered_runs() {
+                eprintln!(
+                    "tailflow-daemon: previous run {} ended without a clean shutdown; \
+                     recorded a history gap after seq {}",
+                    run.run_id, run.last_seq
+                );
+            }
+            state::StorageSlot::Enabled(storage)
+        }
+        Ok(Err(e)) => {
+            eprintln!("tailflow-daemon: durable history unavailable: {e}");
+            eprintln!("tailflow-daemon: continuing memory-only; live logs are unaffected");
+            state::StorageSlot::Unavailable {
+                kind: e.kind(),
+                message: e.to_string(),
+            }
+        }
+        Err(e) => state::StorageSlot::Unavailable {
+            kind: "internal",
+            message: format!("storage open task failed: {e}"),
+        },
+    }
+}
+
+fn describe_storage(
+    slot: &state::StorageSlot,
+    cfg: &tailflow_core::config::StorageConfig,
+) -> String {
+    match slot {
+        state::StorageSlot::Enabled(s) => format!(
+            "{} ({}, {} MB cap)",
+            s.path().display(),
+            cfg.retention_days
+                .days()
+                .map_or_else(|| "unlimited age".to_string(), |d| format!("{d}d")),
+            cfg.max_size_mb
+        ),
+        state::StorageSlot::Disabled => "memory only (storage disabled)".into(),
+        state::StorageSlot::Unavailable { kind, .. } => {
+            format!("UNAVAILABLE ({kind}) — memory only")
+        }
+    }
 }
