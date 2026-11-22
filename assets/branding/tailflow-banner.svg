@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600" role="img" aria-labelledby="t d">
+<title id="t">TailFlow</title>
+<desc id="d">TailFlow. Every agent action. One clear timeline. Local-first observability for AI coding agents.</desc>
+<rect width="1600" height="600" rx="28" fill="#0d0d0d"/>
+<g fill="#f5f5f5">
+<rect x="128" y="120" width="76" height="14" rx="7"/>
+<rect x="128" y="150" width="54" height="14" rx="7" fill="#9ca3af"/>
+<rect x="128" y="180" width="32" height="14" rx="7" fill="#22d3ee"/>
+<text x="236" y="196" font-family="ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="104" font-weight="700" letter-spacing="-3">tailflow</text>
+</g>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Helvetica,Arial,sans-serif">
+<text x="128" y="318" fill="#f5f5f5" font-size="60" font-weight="600" letter-spacing="-.5">Every agent action. One clear timeline.</text>
+<text x="128" y="386" fill="#9ca3af" font-size="38">Local-first observability for AI coding agents.</text>
+</g>
+<path d="M128 472H1472" stroke="#9ca3af" stroke-opacity=".28" stroke-width="2"/>
+<g fill="#9ca3af">
+<circle cx="128" cy="472" r="5"/>
+<circle cx="214" cy="472" r="5"/>
+<circle cx="262" cy="472" r="5"/>
+<circle cx="408" cy="472" r="5"/>
+<circle cx="586" cy="472" r="5"/>
+<circle cx="622" cy="472" r="5"/>
+<circle cx="806" cy="472" r="5"/>
+<circle cx="968" cy="472" r="5"/>
+<circle cx="1010" cy="472" r="5"/>
+<circle cx="1188" cy="472" r="5"/>
+<circle cx="1326" cy="472" r="5"/>
+</g>
+<g fill="#22d3ee">
+<circle cx="340" cy="472" r="7"/>
+<circle cx="704" cy="472" r="7"/>
+<circle cx="1094" cy="472" r="7"/>
+<circle cx="1472" cy="472" r="10"/>
+</g>
+</svg>
