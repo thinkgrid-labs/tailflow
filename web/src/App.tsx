@@ -2,6 +2,7 @@ import { useMemo, useRef, useEffect, useState, useCallback } from 'preact/hooks'
 import { useLogStream } from './hooks/useLogStream'
 import { LogRow } from './components/LogRow'
 import { Sidebar } from './components/Sidebar'
+import { Diagnostics } from './components/Diagnostics'
 import type { LogLevel } from './types'
 import { LEVEL_COLOR } from './types'
 
@@ -12,7 +13,8 @@ function tryRegex(s: string): RegExp | null {
 }
 
 export function App() {
-  const { records, status, clear } = useLogStream()
+  const { records, status, clear, missed } = useLogStream()
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
 
   const [version, setVersion] = useState<string | null>(null)
   useEffect(() => {
@@ -154,10 +156,24 @@ export function App() {
           })}
         </div>
 
+        <button
+          class={`diag-btn${showDiagnostics ? ' diag-btn--active' : ''}`}
+          onClick={() => setShowDiagnostics(v => !v)}
+          title="Storage and collector diagnostics"
+        >
+          diagnostics
+        </button>
         <span class={statusCls} title={status}>{statusDot}</span>
         <span class="record-count">{filtered.length.toLocaleString()}</span>
         <button class="clear-btn" onClick={clear} title="Clear all logs">✕</button>
       </header>
+
+      {missed > 0 && (
+        <div class="gap-banner" role="status">
+          This view fell behind and missed {missed.toLocaleString()} live record{missed === 1 ? '' : 's'};
+          it was refilled from the daemon buffer, which may not hold all of them.
+        </div>
+      )}
 
       {/* ── Body ────────────────────────────────────────────────────────── */}
       <div class="body">
@@ -178,6 +194,7 @@ export function App() {
             </button>
           )}
         </div>
+        {showDiagnostics && <Diagnostics onClose={() => setShowDiagnostics(false)} />}
       </div>
     </div>
   )
