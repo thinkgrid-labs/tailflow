@@ -136,7 +136,20 @@ recorded as gaps — nothing was collecting.
   short transactions, and returns free pages to the filesystem gradually.
 
 The size cap applies to live pages. The file on disk can briefly exceed it by
-the WAL (capped at 64 MB after checkpoints) and by free pages not yet returned.
+the WAL (capped at 64 MB after checkpoints) and by free pages not yet returned;
+after a large eviction the file shrinks gradually (about 4 MB per pass).
+
+Cleanup passes aim for 250 ms. Clearing a large backlog — for example after
+lowering `max_size_mb` on a multi-gigabyte database — can make individual passes
+take a second or two; persistence waits behind them, live logs do not.
+
+## Resource cost
+
+Measured on a 2018 4-core laptop: idle CPU stays at 0 %, and persistence adds
+roughly 35 µs of CPU per stored event (about 2 % of one core at 100 events/s).
+Each event takes about 400 bytes on disk including indexes, so the 2 GB default
+holds roughly 5 million events. Setting `full_text_search = false` cuts the
+write cost by about a third; `--no-storage` removes it.
 
 ## Privacy
 
