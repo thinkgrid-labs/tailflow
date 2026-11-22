@@ -47,3 +47,7 @@ npm/platforms/*/bin/tailflow-mcp.exe
 npm/platforms/*/bin/tailflow-logs.exe
 npm/platforms/*/*.tgz
 npm/tailflow/*.tgz
+
+# Internal engineering reports (milestone audits, readiness, benchmarks).
+# Never committed or published.
+docs/internal/
