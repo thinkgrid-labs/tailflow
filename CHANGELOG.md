@@ -73,6 +73,10 @@ history is incomplete.
   than top-level navigation (`Sec-Fetch-Site`), are refused with `403`. Request
   targets over 8 KiB are refused with `414`. No HTTP endpoint mutates or deletes
   data.
+- New database files are created owner-only (`0600`) on Unix, inside an
+  owner-only data directory.
+- `/api/v1/events` pages are bounded to about 8 MiB of text and to 100 events
+  when `include_payload=true`.
 
 ## [0.3.3] - 2026-08-19
 
