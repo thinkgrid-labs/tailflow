@@ -15,7 +15,7 @@ TailFlow works best when:
 - the daemon and the application run on the same machine.
 
 The prebuilt npm packages support macOS ARM64/x64, Linux ARM64/x64, and Windows
-x64. Building from source requires Rust 1.88 or newer.
+x64. Building from source requires Rust 1.89 or newer.
 
 ## Install TailFlow
 

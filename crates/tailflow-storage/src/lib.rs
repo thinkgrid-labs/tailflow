@@ -110,24 +110,24 @@ impl ReaderPool {
         }
     }
 
-    fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    fn with<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         for rc in &self.conns {
-            if let Ok(guard) = rc.conn.try_lock() {
-                return Self::run(rc, &guard, f);
+            if let Ok(mut guard) = rc.conn.try_lock() {
+                return Self::run(rc, &mut guard, f);
             }
         }
         // All busy: queue on one, round-robin.
         let n = self.conns.len().max(1);
         let pick = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let rc = self.conns.get(pick).ok_or(StorageError::WriterStopped)?;
-        let guard = rc.conn.lock().unwrap_or_else(|p| p.into_inner());
-        Self::run(rc, &guard, f)
+        let mut guard = rc.conn.lock().unwrap_or_else(|p| p.into_inner());
+        Self::run(rc, &mut guard, f)
     }
 
     fn run<T>(
         rc: &ReaderConn,
-        conn: &Connection,
-        f: impl FnOnce(&Connection) -> Result<T>,
+        conn: &mut Connection,
+        f: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
         rc.used.store(true, Ordering::Relaxed);
         rc.cached.store(true, Ordering::Relaxed);

@@ -73,13 +73,13 @@ jobs:
       - run: cd web && npm ci && npm run build
 
   msrv:
-    name: rust-1.88
+    name: rust-1.89
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Prepare web/dist for rust-embed
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv

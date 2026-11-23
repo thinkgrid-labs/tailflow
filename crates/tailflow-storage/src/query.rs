@@ -509,17 +509,24 @@ fn build_filters(q: &EventQuery) -> Result<Filters> {
 }
 
 /// Run `q`.
-pub(crate) fn execute(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> Result<EventPage> {
+pub(crate) fn execute(
+    conn: &mut Connection,
+    q: &EventQuery,
+    ctx: &QueryContext,
+) -> Result<EventPage> {
     q.validate()?;
     if q.text.is_some() && !ctx.fts_enabled {
         return Err(StorageError::FullTextDisabled);
     }
 
-    // Wall-clock guard for every statement below.
+    // Wall-clock guard for every statement below. The guard removes the
+    // handler on every exit path, including unwinding.
     let deadline = Instant::now() + QUERY_TIME_BUDGET;
-    conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
-    let _guard = ProgressGuard(conn);
+    let guarded = ProgressGuard::install(conn, deadline)?;
+    execute_bounded(&guarded, q, ctx)
+}
 
+fn execute_bounded(conn: &Connection, q: &EventQuery, ctx: &QueryContext) -> Result<EventPage> {
     let glob = q
         .path_glob
         .as_deref()
@@ -854,7 +861,25 @@ fn finish_completeness(
     Ok(())
 }
 
-struct ProgressGuard<'a>(&'a Connection);
+/// Holds the connection exclusively while a deadline progress handler is
+/// installed (rusqlite ≥ 0.41 requires `&mut` to change the handler); derefs
+/// to the connection for the query itself and removes the handler on drop.
+struct ProgressGuard<'a>(&'a mut Connection);
+
+impl<'a> ProgressGuard<'a> {
+    fn install(conn: &'a mut Connection, deadline: Instant) -> Result<Self> {
+        conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
+        Ok(Self(conn))
+    }
+}
+
+impl std::ops::Deref for ProgressGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0
+    }
+}
 
 impl Drop for ProgressGuard<'_> {
     fn drop(&mut self) {

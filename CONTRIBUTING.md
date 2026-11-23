@@ -19,7 +19,7 @@ Thank you for your interest in contributing! This document covers how to get sta
 
 ### Prerequisites
 
-- **Rust 1.88+** — install via [rustup](https://rustup.rs)
+- **Rust 1.89+** — install via [rustup](https://rustup.rs)
 - **Node.js 20+** — only needed if you are working on the web dashboard
 - **Docker** (optional) — for testing Docker log ingestion
 

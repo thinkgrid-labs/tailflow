@@ -215,13 +215,13 @@ tailflow/
 
 | Layer | Technology |
 |---|---|
-| Core language | Rust 2021, Rust 1.88+ |
+| Core language | Rust 2021, Rust 1.89+ |
 | Async runtime | Tokio |
 | Docker client | Bollard |
 | File watching | notify |
 | Terminal UI | Ratatui and Crossterm |
 | HTTP server | Axum |
-| Durable storage | SQLite 3.53 (bundled via rusqlite 0.40), WAL, FTS5 |
+| Durable storage | SQLite 3.54 (bundled via rusqlite 0.41), WAL, FTS5 |
 | Web UI | Preact and Vite, embedded with rust-embed |
 | Agent protocol | JSON-RPC 2.0 and MCP over stdio |
 | Distribution | npm platform packages and GitHub release binaries |
