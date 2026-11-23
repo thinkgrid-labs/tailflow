@@ -511,8 +511,12 @@ impl CapturePolicy {
         }
         if let Some(path) = event.path.as_deref() {
             let p = Path::new(path);
+            // `has_root`, not `is_absolute`: on Windows `\Windows\x` or
+            // `/etc/passwd` has no drive prefix, so it is not "absolute",
+            // yet it names a location outside the project as surely as
+            // `C:\Windows\x` does. On Unix the two are the same.
             if !self.allowed_dirs.is_empty()
-                && p.is_absolute()
+                && p.has_root()
                 && !self.allowed_dirs.iter().any(|d| p.starts_with(d))
             {
                 return Err(Exclusion::PathOutsideAllowedDirs);
@@ -887,6 +891,16 @@ mod tests {
         };
         assert_eq!(
             p.admit(&with_path("file.modified", "/etc/passwd")),
+            Err(Exclusion::PathOutsideAllowedDirs)
+        );
+        // Rooted without a drive prefix: not `is_absolute` on Windows, still
+        // outside the project.
+        #[cfg(windows)]
+        assert_eq!(
+            p.admit(&with_path(
+                "file.modified",
+                r"\Windows\System32\drivers\etc\hosts"
+            )),
             Err(Exclusion::PathOutsideAllowedDirs)
         );
         assert_eq!(
