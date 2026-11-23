@@ -69,7 +69,13 @@ cut and marked `… [tailflow: line truncated from N bytes]`. Durable history is
 - one database is shared by all your daemons by default, so history from
   other projects (recorded under their own privacy settings) is visible unless
   you filter by `project` or give each project its own `[storage] path`; and
-- time during which no daemon ran is not recorded as a gap.
+- time during which no daemon ran is not recorded as a gap; and
+- on Windows there is no cheap process-liveness probe, so a daemon that was
+  killed (not stopped cleanly) is recognised only once its heartbeat is more
+  than 60 s old — at the next start, or at the next full cleanup pass of a
+  running daemon. Until then the up to ~0.5 s of events it had not yet
+  committed are not reported as a gap. On macOS and Linux the next start
+  detects it immediately.
 
 Responses expose `buffer_start_cursor`, `next_cursor`, `buffer_starts_at`, and
 `cursor_gap` where relevant. Callers should treat `cursor_gap: true` or a short
