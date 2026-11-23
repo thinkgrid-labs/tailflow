@@ -100,5 +100,5 @@ fn init_accepts_explicit_sources_when_detection_finds_nothing() {
     assert!(config.contains("docker = true"));
     assert!(config.contains("label = \"api\""));
     assert!(config.contains("cmd = \"go run ./cmd/api\""));
-    assert!(config.contains("path = \"logs/future.log\""));
+    assert!(config.contains("path = \"logs/future.log\""), "{config}");
 }

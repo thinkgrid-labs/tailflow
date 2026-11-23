@@ -22,8 +22,7 @@ fn queue_overflow_is_counted_recorded_and_reported() {
 
     // Stall the writer with a held write lock, then overflow its queue. The
     // lock is held until every submission and the mid-run checks are done —
-    // not for a fixed time, which a loaded host can outrun (the overflow
-    // then lands in two gap rows instead of one).
+    // not for a fixed time, which a loaded host can outrun.
     let locker = Connection::open(&path).unwrap();
     locker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let mut dropped = 0;
@@ -66,8 +65,10 @@ fn queue_overflow_is_counted_recorded_and_reported() {
     assert!(p.completeness.reasons.contains(&"loss_in_range"));
     let gap = &p.completeness.gaps[0];
     assert_eq!(gap.reason, "queue_full");
-    // Exact: every queue_full drop is in a recorded gap (one row when the
-    // lock outlasts the burst, which it now always does).
+    // Exact: every queue_full drop is in a recorded gap. Not necessarily
+    // one row — the writer takes pending loss when a commit attempt
+    // *starts*, so drops counted before its first (blocked) attempt and
+    // drops after it land in separate rows (seen on Windows: 136 + 1,096).
     let recorded: u64 = p
         .completeness
         .gaps
@@ -76,7 +77,6 @@ fn queue_overflow_is_counted_recorded_and_reported() {
         .map(|g| g.count.unwrap_or(0))
         .sum();
     assert_eq!(recorded, dropped);
-    assert_eq!(gap.count, Some(dropped));
     assert!(
         p.events
             .iter()

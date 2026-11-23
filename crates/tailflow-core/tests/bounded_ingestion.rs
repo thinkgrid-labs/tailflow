@@ -7,8 +7,10 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use tailflow_core::ingestion::{lines, process::ProcessSource};
 use tailflow_core::{
-    ingestion::{file::FileSource, lines, process::ProcessSource, Source},
+    ingestion::{file::FileSource, Source},
     new_bus, LogReceiver,
 };
 use tempfile::TempDir;
