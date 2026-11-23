@@ -24,6 +24,9 @@
 .env.*
 !.env.example
 
+# Python bytecode from the benchmark scripts
+__pycache__/
+
 # Test log files generated during development
 *.log
 

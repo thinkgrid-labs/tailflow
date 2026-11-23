@@ -5,6 +5,7 @@ mod storage_cli;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{net::SocketAddr, path::PathBuf};
@@ -61,6 +62,13 @@ struct Cli {
     /// Records retained for retrospective queries (/api/query, /api/errors)
     #[arg(long, value_name = "N", default_value_t = tailflow_core::query::DEFAULT_CAPACITY)]
     buffer: usize,
+
+    /// Memory cap for that buffer, in MiB of retained log text. Ordinary
+    /// lines reach the record limit first; this bounds the buffer when lines
+    /// are large. Older records stay in durable history.
+    #[arg(long, value_name = "MIB", default_value_t = 16,
+          value_parser = clap::value_parser!(u32).range(1..=4096))]
+    buffer_mb: u32,
 
     /// Keep history in memory only (overrides `[storage] enabled`)
     #[arg(long)]
@@ -122,8 +130,30 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Async worker threads when `TOKIO_WORKER_THREADS` is not set.
+///
+/// Measured in M1.5 (4C/8T host): 2 workers instead of Tokio's default of one
+/// per logical CPU cut daemon CPU 23 % at 1,000 ev/s, 39 % with four SSE
+/// clients and 14 % in a mixed ingest + query workload, with equal or lower
+/// query and SSE latency. The work per event is small; most of the cost was
+/// waking idle workers on other cores. SQLite queries and writes run on
+/// separate threads (blocking pool, writer thread), so this does not limit
+/// query concurrency. One worker was measured too: worse SSE tail latency.
+const DEFAULT_WORKERS: usize = 2;
+
+fn main() -> Result<()> {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    // An explicit TOKIO_WORKER_THREADS still wins (Tokio reads it when no
+    // count is set on the builder).
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        runtime.worker_threads(cpus.clamp(1, DEFAULT_WORKERS));
+    }
+    runtime.build()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -175,7 +205,7 @@ async fn main() -> Result<()> {
     }
     if let Some(label) = cli.stdin {
         sources.push(Box::new(StdinSource::new(label)));
-    } else if atty::isnt(atty::Stream::Stdin) {
+    } else if !std::io::stdin().is_terminal() {
         sources.push(Box::new(StdinSource::new("stdin")));
     }
 
@@ -211,7 +241,12 @@ async fn main() -> Result<()> {
     };
     let (shared, fanout) = state::AppState::with_pipeline(
         rx,
-        cli.buffer.max(1),
+        state::RingLimits {
+            records: cli.buffer.max(1),
+            bytes: usize::try_from(cli.buffer_mb)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(1024 * 1024),
+        },
         state::Pipeline {
             filter,
             policy: policy.clone(),

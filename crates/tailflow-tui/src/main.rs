@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
 
     if let Some(label) = cli.stdin {
         sources.push(Box::new(StdinSource::new(label)));
-    } else if atty::isnt(atty::Stream::Stdin) {
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         sources.push(Box::new(StdinSource::new("stdin")));
     }
 

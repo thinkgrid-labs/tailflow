@@ -15,7 +15,7 @@ use crate::{processor::Filter, LogLevel, LogRecord};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Records retained for retrospective queries.
 ///
@@ -337,79 +337,144 @@ fn classify_token(token: &str) -> &'static str {
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
-struct Entry {
-    seq: u64,
-    record: LogRecord,
+/// Default cap on the bytes the ring keeps alive (payload + source + per-record
+/// overhead), alongside the record-count cap.
+///
+/// Typical lines are 100–300 bytes, so 5,000 records use about 1 MB and the
+/// count cap binds first. The byte cap only binds when payloads are large
+/// (e.g. 64 KiB JSON lines), where a count-only ring could pin hundreds of MB.
+/// Evicted records remain in durable storage, and every response reports the
+/// retained horizon (`buffer_start_cursor`, `cursor_gap`).
+pub const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+struct Ring {
+    entries: VecDeque<Arc<SeqRecord>>,
+    /// Sum of [`retained_bytes`] over `entries`.
+    bytes: usize,
+    next_seq: u64,
+}
+
+impl Ring {
+    /// Index of the first entry with `seq > cursor`. Entries are in seq order.
+    fn after(&self, cursor: Option<u64>) -> usize {
+        cursor.map_or(0, |c| self.entries.partition_point(|e| e.seq <= c))
+    }
+}
+
+/// Heap and inline bytes one retained record keeps alive. Counts allocated
+/// capacity, not length: a line grown by doubling can hold up to 2× its
+/// length.
+fn retained_bytes(r: &SeqRecord) -> usize {
+    r.payload
+        .capacity()
+        .saturating_add(r.source.capacity())
+        .saturating_add(std::mem::size_of::<SeqRecord>())
 }
 
 /// Ring buffer of recent records, queryable after the fact.
+///
+/// Records are stored once, as `Arc<SeqRecord>`, and the same allocation is
+/// what [`LogStore::push`] returns for the live bus — the ring, the broadcast
+/// channel, and every SSE subscriber share it instead of each holding a copy.
 ///
 /// Cloneable handles are not provided — wrap in an `Arc`. All methods take
 /// `&self` and lock internally; a poisoned lock is recovered rather than
 /// propagated, since a panicked writer must not take the read path down with it.
 pub struct LogStore {
-    ring: Mutex<VecDeque<Entry>>,
+    ring: Mutex<Ring>,
     capacity: usize,
-    next_seq: Mutex<u64>,
+    max_bytes: usize,
 }
 
 impl LogStore {
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_MAX_BYTES)
+    }
+
+    /// A store bounded by both record count and retained bytes. The newest
+    /// record is always kept, even if it alone exceeds `max_bytes`.
+    pub fn with_limits(capacity: usize, max_bytes: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            ring: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            ring: Mutex::new(Ring {
+                entries: VecDeque::with_capacity(capacity.min(1024)),
+                bytes: 0,
+                next_seq: 1,
+            }),
             capacity,
-            next_seq: Mutex::new(1),
+            max_bytes,
         }
     }
 
-    pub fn push(&self, record: LogRecord) -> SeqRecord {
-        let seq = {
-            let mut n = self.next_seq.lock().unwrap_or_else(|p| p.into_inner());
-            let seq = *n;
-            *n += 1;
-            seq
-        };
-        let mut ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
-        if ring.len() >= self.capacity {
-            ring.pop_front();
-        }
-        let emitted = SeqRecord {
+    fn lock(&self) -> MutexGuard<'_, Ring> {
+        self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Assign the next sequence number, retain the record, and return the
+    /// shared handle to publish. Moves the record's strings; copies nothing.
+    pub fn push(&self, record: LogRecord) -> Arc<SeqRecord> {
+        let mut ring = self.lock();
+        let seq = ring.next_seq;
+        ring.next_seq = seq.saturating_add(1);
+        let entry = Arc::new(SeqRecord {
             seq,
             timestamp: record.timestamp,
-            source: record.source.clone(),
+            source: record.source,
             level: record.level,
-            payload: record.payload.clone(),
+            payload: record.payload,
             payload_truncated_from: None,
-        };
-        ring.push_back(Entry { seq, record });
-        emitted
+        });
+        ring.bytes = ring.bytes.saturating_add(retained_bytes(&entry));
+        ring.entries.push_back(Arc::clone(&entry));
+        while ring.entries.len() > self.capacity
+            || (ring.bytes > self.max_bytes && ring.entries.len() > 1)
+        {
+            let Some(old) = ring.entries.pop_front() else {
+                break;
+            };
+            ring.bytes = ring.bytes.saturating_sub(retained_bytes(&old));
+        }
+        entry
     }
 
     pub fn len(&self) -> usize {
-        self.ring.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.lock().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Bytes currently retained (see [`DEFAULT_MAX_BYTES`]).
+    pub fn retained_bytes(&self) -> usize {
+        self.lock().bytes
+    }
+
     /// Highest sequence issued so far — the cursor a caller should start from
     /// if it only wants records from now on.
     pub fn cursor(&self) -> u64 {
-        self.next_seq
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .saturating_sub(1)
+        self.lock().next_seq.saturating_sub(1)
+    }
+
+    /// Every retained record matching `filter`, oldest first, as shared
+    /// handles (no payload copies). For the dashboard's history load.
+    pub fn snapshot(&self, filter: &Filter) -> Vec<Arc<SeqRecord>> {
+        self.lock()
+            .entries
+            .iter()
+            .filter(|e| filter.matches_seq(e))
+            .cloned()
+            .collect()
     }
 
     /// Most recent `limit` records, oldest-first (reading order).
     pub fn records(&self, q: &Query) -> QueryResult {
-        let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
-        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring, q.cursor);
-        let matched: Vec<&Entry> = ring
-            .iter()
-            .filter(|e| q.cursor.is_none_or(|c| e.seq > c))
-            .filter(|e| q.filter.matches(&e.record))
+        let ring = self.lock();
+        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring.entries, q.cursor);
+        let matched: Vec<&Arc<SeqRecord>> = ring
+            .entries
+            .range(ring.after(q.cursor)..)
+            .filter(|e| q.filter.matches_seq(e))
             .collect();
 
         let total_matching = matched.len();
@@ -424,7 +489,7 @@ impl LogStore {
             records,
             total_matching,
             truncated: skip > 0,
-            next_cursor: ring.back().map(|e| e.seq).unwrap_or(0),
+            next_cursor: ring.entries.back().map_or(0, |e| e.seq),
             buffer_start_cursor,
             cursor_gap,
         }
@@ -432,35 +497,34 @@ impl LogStore {
 
     /// Most recent retained record that matches a query.
     pub fn latest_matching_seq(&self, q: &Query) -> Option<u64> {
-        self.ring
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
+        let ring = self.lock();
+        ring.entries
+            .range(ring.after(q.cursor)..)
             .rev()
-            .find(|e| q.cursor.is_none_or(|c| e.seq > c) && q.filter.matches(&e.record))
+            .find(|e| q.filter.matches_seq(e))
             .map(|e| e.seq)
     }
 
     /// First matching record after an explicit snapshot cursor.
     pub fn first_matching_seq_after(&self, q: &Query, cursor: u64) -> Option<u64> {
-        self.ring
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|e| e.seq > cursor && q.filter.matches(&e.record))
+        let ring = self.lock();
+        ring.entries
+            .range(ring.after(Some(cursor))..)
+            .find(|e| q.filter.matches_seq(e))
             .map(|e| e.seq)
     }
 
     /// The event burst beginning at `anchor`, without reapplying the trigger
     /// filter. This preserves stack frames and correlated downstream output.
     pub fn records_from(&self, anchor: u64, limit: usize, max_payload_chars: usize) -> QueryResult {
-        let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let ring = self.lock();
         let (buffer_start_cursor, cursor_gap) =
-            cursor_horizon(&ring, Some(anchor.saturating_sub(1)));
-        let matching: Vec<&Entry> = ring.iter().filter(|e| e.seq >= anchor).collect();
-        let total_matching = matching.len();
-        let records = matching
-            .into_iter()
+            cursor_horizon(&ring.entries, Some(anchor.saturating_sub(1)));
+        let start = ring.after(Some(anchor.saturating_sub(1)));
+        let total_matching = ring.entries.len().saturating_sub(start);
+        let records = ring
+            .entries
+            .range(start..)
             .take(limit)
             .map(|e| to_seq_record(e, max_payload_chars))
             .collect();
@@ -468,7 +532,7 @@ impl LogStore {
             records,
             total_matching,
             truncated: total_matching > limit,
-            next_cursor: ring.back().map(|e| e.seq).unwrap_or(0),
+            next_cursor: ring.entries.back().map_or(0, |e| e.seq),
             buffer_start_cursor,
             cursor_gap,
         }
@@ -482,36 +546,42 @@ impl LogStore {
     /// is exactly the shape of an indented stack frame, and why stack traces
     /// survive a `level >= error` filter that would otherwise drop them.
     pub fn summarize(&self, q: &Query, context_lines: usize) -> Summary {
-        let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
-        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring, q.cursor);
-        let entries: Vec<&Entry> = ring.iter().collect();
+        let ring = self.lock();
+        let (buffer_start_cursor, cursor_gap) = cursor_horizon(&ring.entries, q.cursor);
+        // One contiguous view for index-based context lookups.
+        let entries: Vec<&SeqRecord> = ring.entries.iter().map(AsRef::as_ref).collect();
 
-        let mut order: Vec<String> = Vec::new();
-        let mut groups: HashMap<String, GroupAcc> = HashMap::new();
+        // Groups in first-seen order, indexed by fingerprint.
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut groups: Vec<(String, GroupAcc<'_>)> = Vec::new();
         let mut total_matching = 0usize;
 
-        for (idx, e) in entries.iter().enumerate() {
-            if q.cursor.is_some_and(|c| e.seq <= c) || !q.filter.matches(&e.record) {
+        for (idx, e) in entries.iter().enumerate().skip(ring.after(q.cursor)) {
+            if !q.filter.matches_seq(e) {
                 continue;
             }
             total_matching += 1;
 
-            let key = fingerprint(&e.record.payload);
-            let acc = groups.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                GroupAcc::new(&e.record)
-            });
-            acc.absorb(&e.record, idx);
+            let key = fingerprint(&e.payload);
+            match index.get(&key) {
+                Some(&g) => {
+                    if let Some((_, acc)) = groups.get_mut(g) {
+                        acc.absorb(e, idx);
+                    }
+                }
+                None => {
+                    let mut acc = GroupAcc::new(e);
+                    acc.absorb(e, idx);
+                    index.insert(key.clone(), groups.len());
+                    groups.push((key, acc));
+                }
+            }
         }
 
-        let distinct = order.len();
-        let mut built: Vec<ErrorGroup> = order
+        let distinct = groups.len();
+        let mut built: Vec<ErrorGroup> = groups
             .into_iter()
-            .filter_map(|k| {
-                groups
-                    .remove(&k)
-                    .map(|acc| acc.finish(k, &entries, context_lines, q.max_payload_chars))
-            })
+            .map(|(k, acc)| acc.finish(k, &entries, context_lines, q.max_payload_chars))
             .collect();
 
         // Most recent first: an agent asking "what just broke" reads top-down
@@ -525,8 +595,8 @@ impl LogStore {
             total_matching,
             distinct,
             truncated,
-            buffer_starts_at: entries.first().map(|e| e.record.timestamp),
-            next_cursor: entries.last().map(|e| e.seq).unwrap_or(0),
+            buffer_starts_at: entries.first().map(|e| e.timestamp),
+            next_cursor: entries.last().map_or(0, |e| e.seq),
             buffer_start_cursor,
             cursor_gap,
         }
@@ -534,33 +604,48 @@ impl LogStore {
 
     /// Per-source counters — the "what is running and is it healthy" view.
     pub fn sources(&self) -> Vec<SourceStat> {
-        let ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
-        let mut order: Vec<String> = Vec::new();
-        let mut stats: HashMap<String, SourceStat> = HashMap::new();
+        struct Acc<'a> {
+            total: usize,
+            errors: usize,
+            warns: usize,
+            last: &'a SeqRecord,
+        }
+        let ring = self.lock();
+        let mut order: Vec<&str> = Vec::new();
+        let mut stats: HashMap<&str, Acc<'_>> = HashMap::new();
 
-        for e in ring.iter() {
-            let s = stats.entry(e.record.source.clone()).or_insert_with(|| {
-                order.push(e.record.source.clone());
-                SourceStat {
-                    name: e.record.source.clone(),
+        for e in &ring.entries {
+            let s = stats.entry(e.source.as_str()).or_insert_with(|| {
+                order.push(e.source.as_str());
+                Acc {
                     total: 0,
                     errors: 0,
                     warns: 0,
-                    last_seen: None,
-                    last_line: None,
+                    last: e,
                 }
             });
             s.total += 1;
-            match e.record.level {
+            match e.level {
                 LogLevel::Error => s.errors += 1,
                 LogLevel::Warn => s.warns += 1,
                 _ => {}
             }
-            s.last_seen = Some(e.record.timestamp);
-            s.last_line = Some(elide(&e.record.payload, 200).0);
+            s.last = e;
         }
 
-        let mut out: Vec<SourceStat> = order.into_iter().filter_map(|n| stats.remove(&n)).collect();
+        let mut out: Vec<SourceStat> = order
+            .into_iter()
+            .filter_map(|n| stats.remove(n))
+            .map(|a| SourceStat {
+                name: a.last.source.clone(),
+                total: a.total,
+                errors: a.errors,
+                warns: a.warns,
+                last_seen: Some(a.last.timestamp),
+                // Elide only the line that is reported, not every record.
+                last_line: Some(elide(&a.last.payload, 200).0),
+            })
+            .collect();
         // Noisiest-in-errors first — the source a caller most likely wants.
         out.sort_by(|a, b| b.errors.cmp(&a.errors).then(b.total.cmp(&a.total)));
         out
@@ -575,31 +660,30 @@ impl Default for LogStore {
 
 // ── Group accumulation ────────────────────────────────────────────────────────
 
-struct GroupAcc {
+struct GroupAcc<'a> {
     count: usize,
     level: LogLevel,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    sample: String,
-    /// Ring index of the most recent occurrence, used to walk forward for context.
+    /// Ring index of the most recent occurrence: its payload is the sample,
+    /// and context is collected walking forward from it.
     last_idx: usize,
-    source_counts: HashMap<String, usize>,
+    source_counts: HashMap<&'a str, usize>,
 }
 
-impl GroupAcc {
-    fn new(r: &LogRecord) -> Self {
+impl<'a> GroupAcc<'a> {
+    fn new(r: &SeqRecord) -> Self {
         Self {
             count: 0,
             level: r.level,
             first_seen: r.timestamp,
             last_seen: r.timestamp,
-            sample: String::new(),
             last_idx: 0,
             source_counts: HashMap::new(),
         }
     }
 
-    fn absorb(&mut self, r: &LogRecord, idx: usize) {
+    fn absorb(&mut self, r: &'a SeqRecord, idx: usize) {
         self.count += 1;
         if r.level.severity() > self.level.severity() {
             self.level = r.level;
@@ -611,31 +695,34 @@ impl GroupAcc {
             self.last_seen = r.timestamp;
         }
         // Entries arrive in ring order, so the last write is the newest.
-        self.sample = r.payload.clone();
         self.last_idx = idx;
-        *self.source_counts.entry(r.source.clone()).or_insert(0) += 1;
+        *self.source_counts.entry(r.source.as_str()).or_insert(0) += 1;
     }
 
     fn finish(
         self,
         fingerprint: String,
-        entries: &[&Entry],
+        entries: &[&SeqRecord],
         context_lines: usize,
         max_payload_chars: usize,
     ) -> ErrorGroup {
-        let mut sources: Vec<(String, usize)> = self.source_counts.into_iter().collect();
-        sources.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut sources: Vec<(&str, usize)> = self.source_counts.into_iter().collect();
+        sources.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 
         let context = collect_context(entries, self.last_idx, context_lines, max_payload_chars);
+        let sample = entries
+            .get(self.last_idx)
+            .map(|e| elide(&e.payload, max_payload_chars).0)
+            .unwrap_or_default();
 
         ErrorGroup {
             fingerprint,
             count: self.count,
-            sources: sources.into_iter().map(|(n, _)| n).collect(),
+            sources: sources.into_iter().map(|(n, _)| n.to_string()).collect(),
             level: self.level,
             first_seen: self.first_seen,
             last_seen: self.last_seen,
-            sample: elide(&self.sample, max_payload_chars).0,
+            sample,
             context,
         }
     }
@@ -643,7 +730,7 @@ impl GroupAcc {
 
 /// Walk forward from `idx`, collecting continuation lines from the same source.
 fn collect_context(
-    entries: &[&Entry],
+    entries: &[&SeqRecord],
     idx: usize,
     max_lines: usize,
     max_payload_chars: usize,
@@ -652,20 +739,20 @@ fn collect_context(
         return Vec::new();
     }
     let source = match entries.get(idx) {
-        Some(e) => &e.record.source,
+        Some(e) => &e.source,
         None => return Vec::new(),
     };
 
     let mut out = Vec::new();
     for e in entries.iter().skip(idx + 1) {
-        if &e.record.source != source {
+        if &e.source != source {
             continue; // interleaved output from another service — skip, don't stop
         }
         // A detected level means a new log event started; the trace has ended.
-        if e.record.level != LogLevel::Unknown || e.record.payload.trim().is_empty() {
+        if e.level != LogLevel::Unknown || e.payload.trim().is_empty() {
             break;
         }
-        out.push(elide(&e.record.payload, max_payload_chars).0);
+        out.push(elide(&e.payload, max_payload_chars).0);
         if out.len() >= max_lines {
             break;
         }
@@ -687,19 +774,19 @@ fn elide(s: &str, max: usize) -> (String, Option<usize>) {
     (out, Some(count))
 }
 
-fn to_seq_record(e: &Entry, max_payload_chars: usize) -> SeqRecord {
-    let (payload, truncated_from) = elide(&e.record.payload, max_payload_chars);
+fn to_seq_record(e: &SeqRecord, max_payload_chars: usize) -> SeqRecord {
+    let (payload, truncated_from) = elide(&e.payload, max_payload_chars);
     SeqRecord {
         seq: e.seq,
-        timestamp: e.record.timestamp,
-        source: e.record.source.clone(),
-        level: e.record.level,
+        timestamp: e.timestamp,
+        source: e.source.clone(),
+        level: e.level,
         payload,
         payload_truncated_from: truncated_from,
     }
 }
 
-fn cursor_horizon(ring: &VecDeque<Entry>, cursor: Option<u64>) -> (Option<u64>, bool) {
+fn cursor_horizon(ring: &VecDeque<Arc<SeqRecord>>, cursor: Option<u64>) -> (Option<u64>, bool) {
     let oldest = ring.front().map(|e| e.seq);
     let latest = ring.back().map_or(0, |e| e.seq);
     let gap = cursor.is_some_and(|c| match oldest {
@@ -999,5 +1086,86 @@ mod tests {
         assert_eq!(stats[0].warns, 1);
         assert_eq!(stats[1].total, 2);
         assert_eq!(stats[1].last_line.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn byte_cap_evicts_oldest_and_reports_the_horizon() {
+        // `format!` sizes these exactly, so capacity == length here.
+        let per = std::mem::size_of::<SeqRecord>() + 3 + 1000;
+        let store = LogStore::with_limits(1_000, per * 4);
+        for i in 0..10 {
+            store.push(rec(
+                "api",
+                LogLevel::Info,
+                &format!("{i}{}", "x".repeat(999)),
+            ));
+        }
+        assert_eq!(store.len(), 4, "count cap is not what bound the ring");
+        assert!(store.retained_bytes() <= per * 4);
+        let out = store.records(&Query::default().with_cursor(Some(2)));
+        assert_eq!(out.buffer_start_cursor, Some(7));
+        assert!(
+            out.cursor_gap,
+            "a cursor behind the byte-capped horizon is a gap"
+        );
+        assert_eq!(out.records.first().map(|r| r.seq), Some(7));
+    }
+
+    #[test]
+    fn byte_cap_always_keeps_the_newest_record() {
+        let store = LogStore::with_limits(10, 16);
+        store.push(rec("api", LogLevel::Info, "small"));
+        store.push(rec("api", LogLevel::Error, &"y".repeat(10_000)));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.cursor(), 2);
+        assert_eq!(store.records(&Query::default()).records[0].seq, 2);
+    }
+
+    #[test]
+    fn count_cap_still_binds_for_ordinary_lines() {
+        let store = LogStore::new(DEFAULT_CAPACITY);
+        for i in 0..(DEFAULT_CAPACITY + 50) {
+            store.push(rec(
+                "api",
+                LogLevel::Info,
+                &format!("GET /api/users/{i} 200 12ms"),
+            ));
+        }
+        assert_eq!(store.len(), DEFAULT_CAPACITY);
+        assert!(store.retained_bytes() < DEFAULT_MAX_BYTES / 4);
+    }
+
+    #[test]
+    fn push_returns_the_retained_allocation() {
+        let store = LogStore::new(10);
+        let published = store.push(rec("api", LogLevel::Info, "shared"));
+        let held = store.snapshot(&Filter::none());
+        assert!(
+            Arc::ptr_eq(&published, &held[0]),
+            "ring and bus must share one record"
+        );
+    }
+
+    #[test]
+    fn cursor_queries_skip_by_seq_without_scanning() {
+        let store = LogStore::new(100);
+        for i in 0..50 {
+            store.push(rec(
+                "api",
+                if i % 10 == 0 {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Info
+                },
+                &format!("l{i}"),
+            ));
+        }
+        let q = Query::new(Filter::none().with_min_level(LogLevel::Error));
+        assert_eq!(store.latest_matching_seq(&q.with_cursor(Some(41))), None);
+        let q = Query::new(Filter::none().with_min_level(LogLevel::Error));
+        assert_eq!(store.first_matching_seq_after(&q, 25), Some(31));
+        let q = Query::new(Filter::none().with_min_level(LogLevel::Error)).with_cursor(Some(25));
+        let s = store.summarize(&q, 0);
+        assert_eq!(s.total_matching, 2);
     }
 }

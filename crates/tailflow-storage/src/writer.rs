@@ -95,6 +95,8 @@ pub(crate) struct Writer {
     pub next_cleanup: Instant,
     pub next_heartbeat: Instant,
     pub resuming_cleanup: bool,
+    /// Query connections; their idle caches are released on heartbeat ticks.
+    pub readers: Arc<crate::ReaderPool>,
 }
 
 struct Outcome {
@@ -154,6 +156,10 @@ impl Writer {
                 if let Err(e) = self.heartbeat() {
                     self.note_error(&e);
                 }
+                // Query connections unused for a whole interval give back
+                // their page cache. (Releasing the writer's own cache was
+                // measured too: the allocator kept the pages, so no gain.)
+                self.readers.release_idle();
                 self.next_heartbeat = now + self.cfg.heartbeat_interval;
             }
             if now >= self.next_cleanup {

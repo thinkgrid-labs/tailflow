@@ -239,8 +239,8 @@ tailflow-logs sources
 tailflow-logs errors --since 5m
 ```
 
-The daemon keeps the newest 5,000 records by default. Change that with
-`tailflow-daemon --buffer N`.
+The daemon keeps the newest 5,000 records by default (at most 16 MiB of log
+text). Change that with `tailflow-daemon --buffer N` and `--buffer-mb M`.
 
 ### Add sources without a config file
 
