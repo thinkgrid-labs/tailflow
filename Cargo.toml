@@ -13,7 +13,7 @@ version = "0.3.3"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-authors = ["TailFlow Contributors"]
+authors = ["DennisP."]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -29,3 +29,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Release builds ship to npm, Homebrew and GitHub releases. Measured during
+# M1.5 on the daemon's own workloads: fat LTO + one codegen unit + stripped
+# symbols cut every binary 31–37 % (daemon 11.1 → 7.7 MB) with CPU
+# equal or slightly better. `opt-level = "s"/"z"` were smaller still but cost
+# ~20 % / ~26 % CPU per ingested line — not worth it for an always-on daemon.
+# `panic` stays `unwind`: collectors and handlers rely on a panicking task
+# being caught and logged (and poisoned locks recovered) instead of the whole
+# daemon — and its storage queue — aborting.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

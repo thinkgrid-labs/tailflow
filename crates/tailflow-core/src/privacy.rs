@@ -538,7 +538,20 @@ impl CapturePolicy {
                 }
             }
             // Every string at any depth (attributes allow nesting up to 4).
-            let mut stack: Vec<&mut serde_json::Value> = event.attributes.values_mut().collect();
+            // Starts empty: the work stack only allocates when an attribute
+            // is a string or container, not for numeric-only maps.
+            let mut stack: Vec<&mut serde_json::Value> = event
+                .attributes
+                .values_mut()
+                .filter(|v| {
+                    matches!(
+                        v,
+                        serde_json::Value::String(_)
+                            | serde_json::Value::Array(_)
+                            | serde_json::Value::Object(_)
+                    )
+                })
+                .collect();
             while let Some(value) = stack.pop() {
                 match value {
                     serde_json::Value::String(s) => {

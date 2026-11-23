@@ -179,7 +179,7 @@ async fn sse_handler(
     let rx = state.tx.subscribe();
     let ingest = state.ingest.clone();
     let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
-        Ok(record) if filter.matches_seq(&record) => match serde_json::to_string(&record) {
+        Ok(record) if filter.matches_seq(&record) => match serde_json::to_string(&*record) {
             Ok(data) => Some(Ok(Event::default().data(data))),
             Err(e) => {
                 tracing::error!(err = %e, "failed to serialize log record for SSE");
@@ -210,10 +210,18 @@ async fn records_handler(
     AxumQuery(params): AxumQuery<FilterParams>,
 ) -> impl IntoResponse {
     // Human-facing: no elision, no dedup — the dashboard renders raw lines.
-    let q = Query::new(params.into_filter())
-        .with_limit(usize::MAX)
-        .with_max_payload_chars(usize::MAX);
-    Json(state.store.records(&q).records)
+    // Serialized straight from the shared ring entries: no per-request copy
+    // of every retained payload.
+    Json(SharedRecords(state.store.snapshot(&params.into_filter())))
+}
+
+/// Serializes shared ring entries exactly as `Vec<SeqRecord>` would.
+struct SharedRecords(Vec<Arc<tailflow_core::query::SeqRecord>>);
+
+impl serde::Serialize for SharedRecords {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(AsRef::as_ref))
+    }
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -241,6 +249,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "buffered": state.store.len(),
+            "buffered_bytes": state.store.retained_bytes(),
             "cursor": state.store.cursor(),
             "ingest_dropped": ingest.records_dropped,
             "storage": storage,

@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,26 +73,82 @@ pub struct RecoveredRun {
     pub last_seq: i64,
 }
 
-struct ReaderPool {
-    conns: Vec<Mutex<Connection>>,
+/// Read-only connections for queries.
+///
+/// Connection 0 is preferred whenever it is idle, so sequential queries reuse
+/// one warm page cache instead of filling every connection's in turn; the
+/// others serve concurrent queries. A connection that goes a whole writer
+/// heartbeat interval (15 s) unused has its page cache released
+/// ([`ReaderPool::release_idle`]), so a burst of history queries does not pin
+/// up to `READERS ×` 8 MB of cache for the rest of the daemon's life. Caches
+/// stay warm for the duration of a burst.
+pub(crate) struct ReaderPool {
+    conns: Vec<ReaderConn>,
     next: AtomicUsize,
 }
 
+struct ReaderConn {
+    conn: Mutex<Connection>,
+    /// Used since the last [`ReaderPool::release_idle`] tick.
+    used: AtomicBool,
+    /// May hold cached pages (used since its cache was last released).
+    cached: AtomicBool,
+}
+
 impl ReaderPool {
+    fn new(conns: Vec<Connection>) -> Self {
+        Self {
+            conns: conns
+                .into_iter()
+                .map(|c| ReaderConn {
+                    conn: Mutex::new(c),
+                    used: AtomicBool::new(false),
+                    cached: AtomicBool::new(false),
+                })
+                .collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let n = self.conns.len().max(1);
-        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
-        // Prefer an idle connection; otherwise wait on the round-robin one.
-        for i in 0..n {
-            if let Some(m) = self.conns.get((start + i) % n) {
-                if let Ok(guard) = m.try_lock() {
-                    return f(&guard);
-                }
+        for rc in &self.conns {
+            if let Ok(guard) = rc.conn.try_lock() {
+                return Self::run(rc, &guard, f);
             }
         }
-        let m = self.conns.get(start).ok_or(StorageError::WriterStopped)?;
-        let guard = m.lock().unwrap_or_else(|p| p.into_inner());
-        f(&guard)
+        // All busy: queue on one, round-robin.
+        let n = self.conns.len().max(1);
+        let pick = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        let rc = self.conns.get(pick).ok_or(StorageError::WriterStopped)?;
+        let guard = rc.conn.lock().unwrap_or_else(|p| p.into_inner());
+        Self::run(rc, &guard, f)
+    }
+
+    fn run<T>(
+        rc: &ReaderConn,
+        conn: &Connection,
+        f: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        rc.used.store(true, Ordering::Relaxed);
+        rc.cached.store(true, Ordering::Relaxed);
+        f(conn)
+    }
+
+    /// Release the page cache of every connection unused since the previous
+    /// call. Never waits: a connection that is busy right now is skipped.
+    pub(crate) fn release_idle(&self) {
+        for rc in &self.conns {
+            if rc.used.swap(false, Ordering::Relaxed) || !rc.cached.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Ok(guard) = rc.conn.try_lock() else {
+                continue;
+            };
+            match guard.release_memory() {
+                Ok(()) => rc.cached.store(false, Ordering::Relaxed),
+                Err(e) => tracing::debug!(err = %e, "reader cache release failed"),
+            }
+        }
     }
 }
 
@@ -103,7 +159,7 @@ struct Inner {
     project_id: Option<String>,
     tx: SyncSender<Command>,
     shared: Arc<Shared>,
-    readers: ReaderPool,
+    readers: Arc<ReaderPool>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     run_id: i64,
     run_key: String,
@@ -335,8 +391,9 @@ impl Storage {
 
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
-            readers.push(Mutex::new(schema::open_reader(&path)?));
+            readers.push(schema::open_reader(&path)?);
         }
+        let readers = Arc::new(ReaderPool::new(readers));
 
         let shared = Arc::new(Shared::default());
         let (tx, rx) = mpsc::sync_channel(config.queue_capacity);
@@ -363,6 +420,7 @@ impl Storage {
             next_cleanup: Instant::now(),
             next_heartbeat: Instant::now() + HEARTBEAT,
             resuming_cleanup: false,
+            readers: readers.clone(),
         };
         let handle = std::thread::Builder::new()
             .name("tailflow-storage".into())
@@ -409,10 +467,7 @@ impl Storage {
                 project_id: opts.project_id,
                 tx,
                 shared,
-                readers: ReaderPool {
-                    conns: readers,
-                    next: AtomicUsize::new(0),
-                },
+                readers,
                 writer: Mutex::new(Some(handle)),
                 run_id,
                 run_key,

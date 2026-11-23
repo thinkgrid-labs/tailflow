@@ -257,6 +257,10 @@ async fn list_events(
     let storage = storage_of(&state)?.clone();
     // Serialized straight into the response body: no intermediate `Value`
     // copy of a page that may approach the 8 MiB page budget.
+    // No flush-before-read: measured in M1.5, it let any polling client
+    // force a commit per poll (3× M1's write amplification) and tripled
+    // query latency under ingestion. History trails live ingestion by at
+    // most `batch_max_delay_ms`; the live endpoints are not batched.
     let page = blocking(move || storage.query(&q).map_err(V1Error::from)).await?;
     Ok(Json(page))
 }
@@ -483,7 +487,10 @@ mod tests {
         let (tx, rx) = tailflow_core::new_bus();
         let (state, _fanout) = AppState::with_pipeline(
             rx,
-            10_000,
+            crate::state::RingLimits {
+                records: 10_000,
+                bytes: tailflow_core::query::DEFAULT_MAX_BYTES,
+            },
             Pipeline {
                 filter: Filter::none(),
                 policy,
@@ -689,7 +696,10 @@ mod tests {
         drop(tx);
         let (state, _) = AppState::with_pipeline(
             rx,
-            10,
+            crate::state::RingLimits {
+                records: 10,
+                bytes: tailflow_core::query::DEFAULT_MAX_BYTES,
+            },
             Pipeline {
                 filter: Filter::none(),
                 policy: Arc::new(CapturePolicy::from_config(&PrivacyConfig::default()).unwrap()),

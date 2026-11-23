@@ -103,8 +103,9 @@ impl Source for DockerSource {
             let Some(output) = output else { break };
             match output {
                 Ok(log_output) => {
-                    let payload = log_output.to_string();
-                    let payload = payload.trim_end_matches('\n').to_string();
+                    let mut payload = log_output.to_string();
+                    payload.truncate(payload.trim_end_matches('\n').len());
+                    let payload = super::lines::cap_payload(payload, super::lines::MAX_LINE_BYTES);
                     if payload.is_empty() {
                         continue;
                     }

@@ -30,8 +30,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# stdin detection
-atty = "0.2"
 
 # Embed the built web UI into the binary
 rust-embed = { version = "8", features = ["mime-guess"] }

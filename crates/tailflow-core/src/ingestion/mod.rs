@@ -1,5 +1,6 @@
 pub mod docker;
 pub mod file;
+pub mod lines;
 pub mod process;
 pub mod stdin;
 

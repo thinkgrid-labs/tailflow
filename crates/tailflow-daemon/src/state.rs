@@ -42,6 +42,13 @@ impl StorageSlot {
     }
 }
 
+/// Bounds of the in-memory ring (see [`LogStore::with_limits`]).
+#[derive(Clone, Copy)]
+pub struct RingLimits {
+    pub records: usize,
+    pub bytes: usize,
+}
+
 /// Everything the ingestion fan-out needs beyond the bus.
 pub struct Pipeline {
     /// Daemon-level `--grep`/`--source` filter.
@@ -91,7 +98,9 @@ impl IngestStats {
 }
 
 pub struct AppState {
-    pub tx: broadcast::Sender<SeqRecord>,
+    /// Live records. The ring and every subscriber share each record's
+    /// allocation (`Arc`), so N SSE clients cost N pointers, not N copies.
+    pub tx: broadcast::Sender<Arc<SeqRecord>>,
     pub store: Arc<LogStore>,
     pub storage: StorageSlot,
     pub policy: Arc<CapturePolicy>,
@@ -158,13 +167,22 @@ impl AppState {
     /// kept for API compatibility.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(source_rx: LogReceiver, capacity: usize) -> Arc<Self> {
+        Self::with_limits(source_rx, capacity, tailflow_core::query::DEFAULT_MAX_BYTES)
+    }
+
+    /// Memory-only state with explicit ring bounds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_limits(source_rx: LogReceiver, capacity: usize, max_bytes: usize) -> Arc<Self> {
         let policy = Arc::new(
             CapturePolicy::from_config(&PrivacyConfig::default())
                 .expect("the default privacy policy is valid"),
         );
         Self::with_pipeline(
             source_rx,
-            capacity,
+            RingLimits {
+                records: capacity,
+                bytes: max_bytes,
+            },
             Pipeline {
                 filter: Filter::none(),
                 policy,
@@ -179,7 +197,7 @@ impl AppState {
     /// which finishes once every source has dropped its sender.
     pub fn with_pipeline(
         source_rx: LogReceiver,
-        capacity: usize,
+        limits: RingLimits,
         pipeline: Pipeline,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
         let (tx, _) = broadcast::channel(tailflow_core::BUS_CAPACITY);
@@ -191,7 +209,7 @@ impl AppState {
         } = pipeline;
         let state = Arc::new(AppState {
             tx: tx.clone(),
-            store: Arc::new(LogStore::new(capacity)),
+            store: Arc::new(LogStore::with_limits(limits.records, limits.bytes)),
             storage,
             policy: policy.clone(),
             ingest: Arc::new(IngestStats::default()),
@@ -226,18 +244,23 @@ impl AppState {
                         }
                         let kind = {
                             let mut map = collectors.lock().unwrap_or_else(|p| p.into_inner());
-                            if map.len() >= MAX_COLLECTOR_ENTRIES
+                            // Look up before inserting: `entry()` would clone
+                            // the source name for every event.
+                            if map.len() < MAX_COLLECTOR_ENTRIES
                                 && !map.contains_key(&record.source)
                             {
-                                "runtime"
-                            } else {
-                                let entry = map.entry(record.source.clone()).or_default();
-                                entry.received += 1;
-                                entry.last_event_at = Some(record.timestamp);
-                                if entry.kind.is_empty() {
-                                    entry.kind = "runtime";
+                                map.insert(record.source.clone(), CollectorCounters::default());
+                            }
+                            match map.get_mut(&record.source) {
+                                Some(entry) => {
+                                    entry.received += 1;
+                                    entry.last_event_at = Some(record.timestamp);
+                                    if entry.kind.is_empty() {
+                                        entry.kind = "runtime";
+                                    }
+                                    entry.kind
                                 }
-                                entry.kind
+                                None => "runtime",
                             }
                         };
                         let seq_record = store.push(record);
@@ -443,23 +466,22 @@ impl AppState {
     }
 }
 
-/// The persisted twin of a live record.
+/// The persisted twin of a live record. Copies the payload once: the live
+/// record stays shared by the ring and subscribers, while storage needs its
+/// own copy to redact, truncate, and queue independently.
 fn runtime_event(record: &SeqRecord, run_key: &str, kind: &str) -> ObservabilityEvent {
-    let line = LogRecord {
-        timestamp: record.timestamp,
-        // A label longer than the id bound (or with control characters)
-        // would fail validation; keep it storable.
-        source: tailflow_core::event::bounded_id(&record.source),
-        level: record.level,
-        payload: record.payload.clone(),
-    };
     let kind = if record.source == SYSTEM_SOURCE {
         "daemon"
     } else {
         kind
     };
-    ObservabilityEvent::from_log_record(
-        &line,
+    ObservabilityEvent::from_log_line(
+        record.timestamp,
+        // A label longer than the id bound (or with control characters)
+        // would fail validation; keep it storable.
+        tailflow_core::event::bounded_id(&record.source),
+        record.level,
+        record.payload.clone(),
         format!("{run_key}:{}", record.seq),
         kind,
         Some(record.seq),

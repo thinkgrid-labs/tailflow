@@ -117,7 +117,13 @@ impl Default for StorageConfig {
             synchronous: SyncMode::Normal,
             queue_capacity: 16_384,
             batch_max_events: 512,
-            batch_max_delay_ms: 100,
+            // M1 used 100 ms. Each commit rewrites ~9 b-tree pages however
+            // few events it carries, so at agent-typical rates (10–100/s) a
+            // 100 ms window wrote 9–35 KB to the WAL per ~400 B event.
+            // 500 ms cuts that by about two thirds. The cost: history
+            // (`/api/v1/events`) trails live ingestion by up to ~0.5 s;
+            // the live endpoints are not batched. Measured during M1.5.
+            batch_max_delay_ms: 500,
         }
     }
 }

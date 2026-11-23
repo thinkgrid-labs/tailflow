@@ -410,7 +410,29 @@ impl ObservabilityEvent {
         source_type: &str,
         legacy_seq: Option<u64>,
     ) -> Self {
-        let event_type = match record.level {
+        Self::from_log_line(
+            record.timestamp,
+            record.source.clone(),
+            record.level,
+            record.payload.clone(),
+            event_id,
+            source_type,
+            legacy_seq,
+        )
+    }
+
+    /// [`Self::from_log_record`] from owned parts, so a caller that already
+    /// holds the line elsewhere makes exactly one copy of it.
+    pub fn from_log_line(
+        timestamp: DateTime<Utc>,
+        source_id: String,
+        level: LogLevel,
+        message: String,
+        event_id: String,
+        source_type: &str,
+        legacy_seq: Option<u64>,
+    ) -> Self {
+        let event_type = match level {
             LogLevel::Error => "runtime.error",
             LogLevel::Warn => "runtime.warning",
             _ => "runtime.log",
@@ -420,11 +442,11 @@ impl ObservabilityEvent {
             event_type,
             Provenance::RuntimeObserved,
             source_type,
-            record.source.clone(),
-            record.timestamp,
+            source_id,
+            timestamp,
         );
-        event.severity = record.level;
-        event.message = Some(record.payload.clone());
+        event.severity = level;
+        event.message = Some(message);
         if let Some(seq) = legacy_seq {
             event
                 .attributes
@@ -529,19 +551,51 @@ fn validate_attributes(attributes: &Map<String, Value>) -> Result<(), EventError
             });
         }
     }
-    let size = serde_json::to_vec(attributes).map_or(usize::MAX, |v| v.len());
+    let size = serialized_len(attributes, MAX_ATTRIBUTES_BYTES);
     if size > MAX_ATTRIBUTES_BYTES {
         return Err(EventError::InvalidField {
             field: "attributes",
-            reason: format!("serialized size {size} exceeds {MAX_ATTRIBUTES_BYTES} bytes"),
+            reason: format!("serialized size exceeds {MAX_ATTRIBUTES_BYTES} bytes"),
         });
     }
     Ok(())
 }
 
+/// Serialized JSON length of `value`, counted without building the string.
+/// Stops counting (returns a value > `cap`) once `cap` is exceeded, so an
+/// oversized document costs at most `cap` bytes of serializer work.
+fn serialized_len(value: &impl Serialize, cap: usize) -> usize {
+    struct Counter {
+        n: usize,
+        cap: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.n = self.n.saturating_add(buf.len());
+            if self.n > self.cap {
+                return Err(std::io::Error::other("cap exceeded"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Counter { n: 0, cap };
+    match serde_json::to_writer(&mut c, value) {
+        Ok(()) => c.n,
+        // Over the cap, or not serializable at all: both are "too large".
+        Err(_) => cap.saturating_add(1).max(c.n),
+    }
+}
+
 /// Nesting depth, computed iteratively so a hostile document cannot overflow
 /// the stack.
 fn depth(value: &Value) -> usize {
+    // Scalars (the common case) need no work stack.
+    if !matches!(value, Value::Array(_) | Value::Object(_)) {
+        return 1;
+    }
     let mut max = 0;
     let mut stack = vec![(value, 1usize)];
     while let Some((v, d)) = stack.pop() {
