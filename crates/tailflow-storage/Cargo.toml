@@ -16,10 +16,11 @@ tracing = { workspace = true }
 regex = "1"
 getrandom = "0.4"
 
-# 0.40, not 0.41: 0.41 requires Rust 1.89 and the workspace MSRV is 1.88.
-# `bundled` compiles SQLite (3.53.x) with FTS5 enabled, so behavior does not
-# depend on the host's system library.
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "hooks", "functions"] }
+# 0.41 (libsqlite3-sys 0.39, SQLite 3.54.1): the first release with the fix
+# for RUSTSEC-2026-0459 / CVE-2026-119375; it is why the MSRV is 1.89.
+# `bundled` compiles SQLite with FTS5 enabled, so behavior does not depend on
+# the host's system library.
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache", "hooks", "functions"] }
 
 [dev-dependencies]
 tempfile = "3"

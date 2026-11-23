@@ -40,7 +40,12 @@ async fn never_policy_does_not_restart_on_failure() {
 
     let payloads = collect(rx, 10, Duration::from_secs(3)).await;
     // Should get exactly one "hello" and an explicit terminal exit record.
-    assert_eq!(payloads.iter().filter(|p| p.as_str() == "hello").count(), 1);
+    // `trim_end`: cmd.exe's `echo hello && …` prints "hello " (it keeps
+    // the space before `&&`); sh prints "hello".
+    assert_eq!(
+        payloads.iter().filter(|p| p.trim_end() == "hello").count(),
+        1
+    );
     assert!(
         payloads.iter().any(|p| p.contains("will not restart")),
         "missing non-zero exit record with Never policy"

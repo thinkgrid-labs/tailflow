@@ -73,13 +73,13 @@ jobs:
       - run: cd web && npm ci && npm run build
 
   msrv:
-    name: rust-1.88
+    name: rust-1.89
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Prepare web/dist for rust-embed
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
@@ -94,6 +94,7 @@ jobs:
   resources:
     name: resources
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -108,18 +109,55 @@ jobs:
           key: release
       - run: cargo build --release --locked --bins
       - run: cargo build --release --locked -p tailflow-daemon --examples
-      - run: python3 scripts/bench/check_budgets.py --out resource-checks.jsonl
+      - run: python3 scripts/bench/check_budgets.py --require-size-budget --out resource-checks.jsonl
+      # The gate must fail on a crashed daemon, a failed SSE probe, real
+      # event loss, missing metrics and an oversized binary — proven here by
+      # injecting each fault against the real daemon.
+      - run: python3 scripts/bench/gate_selftest.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: resource-checks
           path: resource-checks.jsonl
+          if-no-files-found: error
+
+  # ── Native platforms ───────────────────────────────────────────────────────
+  # The full test suite and a release smoke test (start, API, database, file
+  # and process collection, graceful stop, restart persistence, hard-kill
+  # recovery) on Windows x86_64 (MSVC) and macOS arm64, natively.
+  platforms:
+    name: platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare web/dist for rust-embed
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform
+      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo build --release --locked --bins
+      - run: python3 scripts/smoke/platform_smoke.py --out smoke-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ matrix.os }}
+          path: smoke-${{ matrix.os }}.json
 
   # ── Quality gate ───────────────────────────────────────────────────────────
   # Set this as the required status check in branch protection for main and dev.
   quality:
     name: quality
-    needs: [fmt, clippy, build, test, web, msrv, resources]
+    needs: [fmt, clippy, build, test, web, msrv, resources, platforms]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All checks passed."

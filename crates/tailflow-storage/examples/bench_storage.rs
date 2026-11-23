@@ -248,6 +248,17 @@ fn main() {
     let only = arg("--only");
     let want = |n: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == n));
 
+    if want("fts_merge_cost") {
+        let db = PathBuf::from(arg("--db").expect("--db <copy of a database>"));
+        fts_merge_cost(
+            &db,
+            &arg("--variant").unwrap_or_else(|| "neg64".into()),
+            arg("--cycles").map_or(60, |v| v.parse().unwrap()),
+            arg("--batch").map_or(20_000, |v| v.parse().unwrap()),
+        );
+        return;
+    }
+
     // 1. Redaction cost per line (the hot path on every live record).
     if want("redaction") {
         let redactor = Redactor::builtin();
@@ -697,6 +708,290 @@ fn main() {
         );
         s.shutdown(Duration::from_secs(60)).unwrap();
     }
+
+    // 9. FTS5 index under continuous size eviction (M1.5-F). Streams
+    // `--stream` runtime events through a `--cap-mb` database in batches of
+    // `--batch`, running retention after each batch exactly as the writer
+    // would, then the maintenance `--variant` from a second connection:
+    //   current     nothing extra (retention's bounded ('merge', 64))
+    //   merge<N>    an extra positive ('merge', N) per evicting pass
+    //   neg<N>      ('merge', -N) per evicting pass: bounded work that also
+    //               merges across levels, so old tombstoned segments are
+    //               rewritten
+    //   secure      'secure-delete' on: deletes remove index entries
+    // Every `--every` events: FTS bytes per live event, live rows, used and
+    // file bytes, and common-term FTS query latency.
+    if want("fts_maint") {
+        let variant = arg("--variant").unwrap_or_else(|| "current".into());
+        let cap_mb: u64 = arg("--cap-mb").map_or(32, |v| v.parse().unwrap());
+        let total: u64 = arg("--stream").map_or(5_000_000, |v| v.parse().unwrap());
+        let batch: u64 = arg("--batch").map_or(20_000, |v| v.parse().unwrap());
+        let every: u64 = arg("--every").map_or(500_000, |v| v.parse().unwrap());
+        let path = root.join(format!("fts-{variant}.db"));
+        let mut c = cfg(&path);
+        c.max_size_mb = cap_mb;
+        c.cleanup_interval_secs = 86_400;
+        let s = open(&c);
+        let side = rusqlite_conn(&path);
+        side.busy_timeout(Duration::from_secs(60)).unwrap();
+        if variant == "secure" {
+            side.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('secure-delete', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let maint: Option<i64> = variant
+            .strip_prefix("neg")
+            .map(|n| -n.parse::<i64>().unwrap())
+            .or_else(|| variant.strip_prefix("merge").map(|n| n.parse().unwrap()));
+        let fts_stats = |conn: &rusqlite::Connection| -> (i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM events_fts_data),
+                        (SELECT coalesce(sum(length(block)), 0) FROM events_fts_data),
+                        (SELECT count(*) FROM events)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        // Exact write accounting (as `walamp` in resource_bench.py): before
+        // each step, reset the WAL and pin it with a read transaction from a
+        // third connection, so the writer can only append to it; the WAL's
+        // growth over the step is then every page frame the step wrote. The
+        // writer is idle between steps (sequential driver).
+        let pin = rusqlite_conn(&path);
+        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+        let wal_len =
+            || std::fs::metadata(&wal_path).map_or(0i64, |m| i64::try_from(m.len()).unwrap());
+        let begin_step = || -> i64 {
+            let _: (i64, i64, i64) = side
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap();
+            pin.execute_batch("BEGIN").unwrap();
+            let _: i64 = pin
+                .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
+                .unwrap();
+            wal_len()
+        };
+        let end_step = |start: i64| -> i64 {
+            let frames = (wal_len() - start.max(32)).max(0) / (4096 + 24);
+            pin.execute_batch("COMMIT").unwrap();
+            frames
+        };
+        let (mut frames_ingest, mut frames_retention, mut frames_maint) = (0i64, 0i64, 0i64);
+        let terms = ["error", "connection refused", "GET", "processed job"];
+        let mut r = Rng(23);
+        let mut i = 0u64;
+        let (mut pass_ms, mut extra_ms) = (Vec::new(), Vec::new());
+        let mut extra_calls = 0u64;
+        let mut next_report = every;
+        let started = Instant::now();
+        while i < total {
+            // The writer commits while events arrive, so the step starts
+            // before submission.
+            let step = begin_step();
+            for _ in 0..batch {
+                let _ = s.submit(runtime_event(&mut r, i));
+                i += 1;
+            }
+            s.flush(Duration::from_secs(600)).unwrap();
+            frames_ingest += end_step(step);
+            let step = begin_step();
+            let mut evicted = 0;
+            loop {
+                let t = Instant::now();
+                let rep = s.run_retention(Duration::from_secs(600)).unwrap();
+                pass_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                evicted += rep.evicted_by_size;
+                if !rep.more_work {
+                    break;
+                }
+            }
+            frames_retention += end_step(step);
+            if let (Some(n), true) = (maint, evicted > 0) {
+                let step = begin_step();
+                let t = Instant::now();
+                side.execute(
+                    "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                    [n],
+                )
+                .unwrap();
+                extra_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                extra_calls += 1;
+                frames_maint += end_step(step);
+            }
+            if i >= next_report || i >= total {
+                next_report += every;
+                let (rows, bytes, live) = fts_stats(&side);
+                let mut q_ms = Vec::new();
+                for term in terms {
+                    let t = Instant::now();
+                    let page = s
+                        .query(&EventQuery {
+                            text: Some(term.into()),
+                            limit: 500,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    q_ms.push(json!({"term": term, "ms": t.elapsed().as_secs_f64() * 1000.0, "hits": page.events.len()}));
+                }
+                let db = s.status().unwrap().db;
+                emit(
+                    "fts_maint_point",
+                    json!({
+                        "variant": variant, "streamed": i, "live_events": live,
+                        "fts_data_rows": rows, "fts_data_bytes": bytes,
+                        "fts_bytes_per_live_event": bytes as f64 / live.max(1) as f64,
+                        "used_bytes": db.used_bytes, "file_bytes": db.file_bytes,
+                        "fts_queries": q_ms, "elapsed_s": started.elapsed().as_secs_f64(),
+                    }),
+                );
+            }
+        }
+        // Floor: the same live rows after a full optimize (not a candidate
+        // for the ingestion path — it rewrites the whole index at once).
+        let (_, before_opt, live) = fts_stats(&side);
+        let t = Instant::now();
+        side.execute("INSERT INTO events_fts(events_fts) VALUES ('optimize')", [])
+            .unwrap();
+        let opt_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let (_, after_opt, _) = fts_stats(&side);
+        emit(
+            "fts_maint_summary",
+            json!({
+                "variant": variant, "cap_mb": cap_mb, "streamed": i, "batch": batch,
+                "retention_pass_ms": summary(pass_ms), "extra_maint_ms": summary(extra_ms),
+                "extra_maint_calls": extra_calls, "live_events": live,
+                "wal_frames": {"ingest": frames_ingest, "retention": frames_retention, "maintenance": frames_maint},
+                "wal_bytes_per_streamed_event": (frames_ingest + frames_retention + frames_maint) as f64 * 4120.0 / i.max(1) as f64,
+                "fts_bytes_per_live_event": before_opt as f64 / live.max(1) as f64,
+                "fts_bytes_per_live_event_after_optimize": after_opt as f64 / live.max(1) as f64,
+                "optimize_ms": opt_ms, "elapsed_s": started.elapsed().as_secs_f64(),
+            }),
+        );
+        drop(side);
+        s.shutdown(Duration::from_secs(60)).unwrap();
+    }
+}
+
+/// `--only fts_merge_cost --db <copy> --variant <v> --cycles N --batch K`:
+/// on a copy of a large, tombstone-heavy database, emulate the full-text
+/// index workload of N cleanup cycles directly on `events_fts` (insert K new
+/// rows, delete the K oldest) and after each run one maintenance call:
+///   none | neg<N> ('merge', -N) | pos<N> ('merge', N)
+///   | dm<N> ('deletemerge' 10, ('merge', N), 'deletemerge' 0 — in one txn)
+/// Reports per-call time and WAL frames (pinned WAL), and index bytes per
+/// live row every 10 cycles.
+fn fts_merge_cost(db: &Path, variant: &str, cycles: u64, batch: i64) {
+    let c = rusqlite_conn(db);
+    c.busy_timeout(Duration::from_secs(60)).unwrap();
+    c.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    let pin = rusqlite_conn(db);
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let wal_len = || std::fs::metadata(&wal).map_or(0i64, |m| i64::try_from(m.len()).unwrap());
+    let stats = || -> (i64, i64) {
+        c.query_row(
+            "SELECT (SELECT coalesce(sum(length(block)),0) FROM events_fts_data),
+                    (SELECT count(*) FROM events_fts_docsize)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let (mut lo, mut hi): (i64, i64) = c
+        .query_row("SELECT min(id), max(id) FROM events_fts_docsize", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let mut r = Rng(97);
+    let (b0, l0) = stats();
+    emit(
+        "fts_merge_cost_start",
+        json!({"variant": variant, "fts_bytes": b0, "live": l0, "bytes_per_live": b0 as f64 / l0.max(1) as f64}),
+    );
+    let (mut call_ms, mut call_frames) = (Vec::new(), Vec::new());
+    for cyc in 0..cycles {
+        // Index workload of one cycle: new rows, then eviction of the oldest.
+        c.execute_batch("BEGIN").unwrap();
+        {
+            let mut ins = c
+                .prepare_cached("INSERT INTO events_fts(rowid, message) VALUES (?1, ?2)")
+                .unwrap();
+            for _ in 0..batch {
+                hi += 1;
+                let (msg, _, _) = runtime_line(&mut r, u64::try_from(hi).unwrap());
+                ins.execute(rusqlite::params![hi, msg]).unwrap();
+            }
+        }
+        c.execute(
+            "DELETE FROM events_fts WHERE rowid BETWEEN ?1 AND ?2",
+            [lo, lo + batch - 1],
+        )
+        .unwrap();
+        lo += batch;
+        c.execute_batch("COMMIT").unwrap();
+        // The measured maintenance call.
+        let _: (i64, i64, i64) = c
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        pin.execute_batch("BEGIN").unwrap();
+        let _: i64 = pin
+            .query_row("SELECT count(*) FROM events_fts_config", [], |r| r.get(0))
+            .unwrap();
+        let w0 = wal_len();
+        let t = Instant::now();
+        if let Some(n) = variant.strip_prefix("neg") {
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [-n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+        } else if let Some(n) = variant.strip_prefix("pos") {
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+        } else if let Some(n) = variant.strip_prefix("dm") {
+            c.execute_batch("BEGIN").unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 10)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute_batch("COMMIT").unwrap();
+        }
+        call_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        call_frames.push(((wal_len() - w0.max(32)).max(0) / 4120) as f64);
+        pin.execute_batch("COMMIT").unwrap();
+        if cyc % 10 == 9 || cyc + 1 == cycles {
+            let (b, l) = stats();
+            emit(
+                "fts_merge_cost_point",
+                json!({"variant": variant, "cycle": cyc + 1, "fts_bytes": b, "live": l, "bytes_per_live": b as f64 / l.max(1) as f64,
+                "last10_ms": call_ms.iter().rev().take(10).sum::<f64>() / 10.0}),
+            );
+        }
+    }
+    emit(
+        "fts_merge_cost_summary",
+        json!({"variant": variant, "call_ms": summary(call_ms), "call_wal_frames": summary(call_frames)}),
+    );
 }
 
 fn rusqlite_conn(path: &Path) -> rusqlite::Connection {

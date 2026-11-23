@@ -16,7 +16,7 @@ history is incomplete.
 ### Added
 
 - **Durable local history.** `tailflow-daemon` records runtime logs and
-  collector lifecycle in a local SQLite database (WAL, bundled SQLite 3.53,
+  collector lifecycle in a local SQLite database (WAL, bundled SQLite 3.54,
   FTS5) in the user data directory. Defaults: 30-day retention, 2 GB size cap,
   7-day retention for optional payload bodies. New `tailflow-storage` crate.
 - **Versioned event model** (`ObservabilityEvent`, schema v1) with provenance
@@ -77,9 +77,24 @@ history is incomplete.
   cache, a quiet tailed file is polled every 2 s instead of every 250 ms, and
   release binaries are built with LTO and stripped symbols (31–37 % smaller).
   The dashboard re-renders only new rows.
+- **Minimum supported Rust version is now 1.89** (was 1.88), required by
+  rusqlite 0.41 for the bundled SQLite security fix below.
 
 ### Fixed
 
+- Under continuous size eviction the full-text index kept the entries of
+  deleted events in segments that were almost never merged, and grew to
+  between 3 and 13 times its compacted size. Because the size cap counts it,
+  the database typically held about 40 % fewer events than it could (at
+  times about 65 % fewer). A cleanup cycle that removes events now ends with
+  one bounded merge (about 64 pages) of the index segments that consist mostly
+  of deleted entries; the index stays close to its compacted size without
+  extra work during ingestion. Retention reports carry `fts_compacted`.
+- On Windows the daemon now stops cleanly — draining storage and closing the
+  run — on Ctrl+Break (how supervisors stop console processes), not only on
+  Ctrl+C, and attempts the same when its console window is closed (Windows
+  allows about 5 seconds). Previously all of these ended it as an unclean
+  shutdown.
 - On Linux, tailing a file kept one CPU core busy for as long as the daemon ran:
   the collector re-read the file on inotify *access* events, and its own
   re-read produced the next one. Access events are now ignored.
@@ -103,6 +118,12 @@ history is incomplete.
   when `include_payload=true`.
 - Removed the unmaintained `atty` dependency (RUSTSEC-2021-0145,
   RUSTSEC-2024-0375); terminal detection uses the standard library.
+- Bundled SQLite updated to 3.54.1 (rusqlite 0.41.1, libsqlite3-sys 0.39.1)
+  for CVE-2026-119375 / RUSTSEC-2026-0459: a database opened together with a
+  crafted `-wal` file could return uninitialized memory.
+- `url` 2.5.9 (RUSTSEC-2026-0592; not reachable from TailFlow), `tokio`
+  1.51.6, `rustix` 1.1.6 and `anyhow` 1.0.103 (unsoundness advisories).
+  `cargo audit` reports no vulnerabilities.
 
 ## [0.3.3] - 2026-08-19
 

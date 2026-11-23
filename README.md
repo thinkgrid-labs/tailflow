@@ -137,7 +137,7 @@ Other MCP clients can run `tailflow-mcp` as a stdio server:
 Then ask your agent to call `list_log_sources`. It should list your configured
 services. For a shell-only check, run `tailflow-logs status`.
 
-Prefer to build from source? With Rust 1.88 or newer:
+Prefer to build from source? With Rust 1.89 or newer:
 
 ```bash
 git clone https://github.com/thinkgrid-labs/tailflow.git

@@ -95,6 +95,8 @@ pub(crate) struct Writer {
     pub next_cleanup: Instant,
     pub next_heartbeat: Instant,
     pub resuming_cleanup: bool,
+    /// The cleanup cycle in progress (passes chained by `more_work`).
+    pub cycle: retention::Cycle,
     /// Query connections; their idle caches are released on heartbeat ticks.
     pub readers: Arc<crate::ReaderPool>,
 }
@@ -360,12 +362,25 @@ impl Writer {
     }
 
     fn retention(&mut self) -> Result<RetentionReport> {
-        let report = retention::run(
+        let result = retention::run(
             &self.conn,
             &self.cfg.policy,
             Utc::now().timestamp_micros(),
             self.cfg.retention_budget,
-        )?;
+            self.cycle,
+        );
+        let report = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // The cycle is abandoned; the next one starts afresh.
+                self.cycle = retention::Cycle::default();
+                return Err(e);
+            }
+        };
+        self.cycle = self.cycle.after(
+            report.expired_by_age + report.evicted_by_size > 0,
+            report.more_work,
+        );
         if report.expired_by_age + report.evicted_by_size > 0 {
             tracing::info!(
                 expired = report.expired_by_age,

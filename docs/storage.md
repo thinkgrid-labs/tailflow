@@ -84,7 +84,10 @@ few events it carries. History queries (`/api/v1/events`) therefore trail
 live ingestion by up to half a second; the live endpoints (`/events`,
 `/api/query`, `/api/wait`, MCP) are not batched. Events still in the queue
 when the daemon is killed are lost, and the next start records that as a gap
-(see below). A clean stop (Ctrl-C or `SIGTERM`) drains the queue first.
+(see below). A clean stop (Ctrl-C or `SIGTERM`; on Windows also Ctrl+Break)
+drains the queue first. Closing the console window on Windows is best effort:
+Windows ends the process about 5 seconds later, and if the drain takes longer
+the loss is recorded at the next start like any other unclean stop.
 
 ## Completeness: TailFlow never hides missing history
 
@@ -139,6 +142,10 @@ recorded as gaps — nothing was collecting.
   are evicted until usage falls to 90% of the cap.
 - Cleanup runs at startup and every `cleanup_interval_secs` (default 300) in
   short transactions, and returns free pages to the filesystem gradually.
+- A cleanup cycle that removed events ends with a bounded merge (about 64
+  pages) of the full-text index segments that consist mostly of deleted
+  events' entries — and so does every 20th pass of a long cleanup backlog — so
+  those entries do not accumulate and take the size cap away from history.
 
 The size cap applies to live pages. The file on disk can briefly exceed it by
 the WAL (capped at 64 MB after checkpoints) and by free pages not yet returned;

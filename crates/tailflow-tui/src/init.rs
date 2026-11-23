@@ -559,14 +559,25 @@ fn render_config(candidates: &[Candidate], selected: &[usize]) -> String {
     for source in &sources {
         if let SourceKind::File { path, label } = source {
             output.push_str("\n[[sources.file]]\n");
-            output.push_str(&format!(
-                "path = {}\n",
-                toml_string(&path.to_string_lossy())
-            ));
+            output.push_str(&format!("path = {}\n", toml_string(&portable_path(path))));
             output.push_str(&format!("label = {}\n", toml_string(label)));
         }
     }
     output
+}
+
+/// A path for `tailflow.toml`, which is often committed and shared across
+/// operating systems: on Windows, separators are written as `/` (Windows
+/// accepts them; a `\` path would not work for a teammate on macOS or
+/// Linux). Elsewhere a backslash is a legal file-name character, so the
+/// path is written unchanged.
+fn portable_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
 }
 
 fn toml_string(value: &str) -> String {
