@@ -3,6 +3,25 @@ import type { LogRecord, ConnectionStatus } from '../types'
 
 const MAX_RECORDS = 5_000
 
+/** True when `batch` is strictly ascending and starts after `prev`'s last seq. */
+function appendsInOrder(prev: LogRecord[], batch: LogRecord[]): boolean {
+  let last = prev.length > 0 ? prev[prev.length - 1].seq : -Infinity
+  for (const record of batch) {
+    if (record.seq <= last) return false
+    last = record.seq
+  }
+  return true
+}
+
+/** Deduplicate by seq and sort: the history-hydration path, where ring
+ *  records and live records overlap. */
+function mergeBySeq(prev: LogRecord[], batch: LogRecord[]): LogRecord[] {
+  const bySeq = new Map<number, LogRecord>()
+  for (const record of prev) bySeq.set(record.seq, record)
+  for (const record of batch) bySeq.set(record.seq, record)
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq)
+}
+
 export function useLogStream() {
   const [records, setRecords] = useState<LogRecord[]>([])
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
@@ -20,10 +39,11 @@ export function useLogStream() {
     const batch = pending.current.splice(0)
     if (batch.length === 0) return
     setRecords(prev => {
-      const bySeq = new Map<number, LogRecord>()
-      for (const record of prev) bySeq.set(record.seq, record)
-      for (const record of batch) bySeq.set(record.seq, record)
-      const next = [...bySeq.values()].sort((a, b) => a.seq - b.seq)
+      // Live SSE records arrive in seq order after everything already held:
+      // append without rebuilding and re-sorting the whole buffer.
+      const next = appendsInOrder(prev, batch)
+        ? prev.concat(batch)
+        : mergeBySeq(prev, batch)
       return next.length > MAX_RECORDS
         ? next.slice(next.length - MAX_RECORDS)
         : next

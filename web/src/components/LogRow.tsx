@@ -1,4 +1,5 @@
-import { useState } from 'preact/hooks'
+import { Component, h } from 'preact'
+import { useMemo, useState } from 'preact/hooks'
 import type { LogRecord } from '../types'
 import { sourceColor, LEVEL_COLOR } from '../types'
 
@@ -25,10 +26,23 @@ function tryParseJson(s: string): object | null {
   }
 }
 
-export function LogRow({ record }: Props) {
+// Records are immutable once received, so a row only re-renders when its
+// record object changes (never, for a given seq) or its own state toggles.
+// A local shouldComponentUpdate instead of `preact/compat`'s `memo`, which
+// would add ~6 kB to the bundle for this one helper.
+export class LogRow extends Component<Props> {
+  shouldComponentUpdate(next: Props) {
+    return next.record !== this.props.record
+  }
+  render(props: Props) {
+    return h(LogRowView, props)
+  }
+}
+
+function LogRowView({ record }: Props) {
   const sc = sourceColor(record.source)
   const lc = LEVEL_COLOR[record.level]
-  const parsed = tryParseJson(record.payload)
+  const parsed = useMemo(() => tryParseJson(record.payload), [record.payload])
   const [expanded, setExpanded] = useState(false)
 
   return (
