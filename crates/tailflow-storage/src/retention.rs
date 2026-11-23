@@ -56,6 +56,9 @@ pub struct RetentionReport {
     /// The time budget ran out with deletion work remaining; run again soon.
     /// Free-page reclamation never sets this.
     pub more_work: bool,
+    /// This pass completed a cleanup cycle that deleted events and ran the
+    /// bounded cross-level full-text index merge.
+    pub fts_compacted: bool,
     pub used_bytes_after: u64,
     pub age_ms: f64,
     pub payload_ms: f64,
@@ -180,11 +183,16 @@ pub(crate) fn delete_seq_range(c: &Connection, lo: i64, hi: i64) -> Result<u64> 
 }
 
 /// One retention pass under a time budget.
+///
+/// `earlier_passes_deleted`: an earlier pass of the same cleanup cycle (one
+/// that ended with `more_work`) deleted events. The pass that completes such
+/// a cycle compacts the full-text index across levels (see below).
 pub fn run(
     conn: &Connection,
     policy: &RetentionPolicy,
     now_us: i64,
     budget: Duration,
+    earlier_passes_deleted: bool,
 ) -> Result<RetentionReport> {
     let started = Instant::now();
     let mut report = RetentionReport::default();
@@ -293,7 +301,8 @@ pub fn run(
         let after = page_stats(conn)?.freelist_count;
         report.vacuumed_pages = stats.freelist_count.saturating_sub(after);
     }
-    if report.expired_by_age + report.evicted_by_size > 0 {
+    let deleted = report.expired_by_age + report.evicted_by_size > 0;
+    if deleted {
         // A bounded amount of FTS segment merging (~64 pages of work) so
         // deleted rows' tombstones are compacted gradually, never in one
         // large synchronous merge.
@@ -301,6 +310,24 @@ pub fn run(
             "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', 64)",
             [],
         )?;
+    }
+    if !report.more_work && (deleted || earlier_passes_deleted) {
+        // Once per completed cleanup cycle that deleted events: the same
+        // bounded work (~64 pages written), but across *all* levels. A
+        // positive merge only touches a level holding `usermerge` (4)
+        // segments, so the oldest, largest segments — where eviction leaves
+        // its tombstones — were almost never rewritten: under continuous
+        // eviction the index swung between ~3× and ~11× its compacted size
+        // and took that space from the history the size cap can hold
+        // (M1.5-F). Merging consumes the oldest segments first, and those
+        // are mostly tombstones, so one bounded step per cycle keeps up.
+        // Running it on *every* pass instead re-optimized the whole index
+        // continuously (≈3× ingest time) for little extra gain.
+        conn.execute(
+            "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', -64)",
+            [],
+        )?;
+        report.fts_compacted = true;
     }
     if report.expired_by_age + report.evicted_by_size + report.payloads_cleared > 0
         || report.vacuumed_pages > 0
@@ -367,7 +394,7 @@ mod tests {
             payload_max_age_days: 7,
             max_bytes: u64::MAX,
         };
-        let r = run(&c, &policy, 0, Duration::from_secs(1)).unwrap();
+        let r = run(&c, &policy, 0, Duration::from_secs(1), false).unwrap();
         assert!(!r.more_work);
     }
 }

@@ -420,6 +420,7 @@ impl Storage {
             next_cleanup: Instant::now(),
             next_heartbeat: Instant::now() + HEARTBEAT,
             resuming_cleanup: false,
+            cycle_deleted: false,
             readers: readers.clone(),
         };
         let handle = std::thread::Builder::new()
