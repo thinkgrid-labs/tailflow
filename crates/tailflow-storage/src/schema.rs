@@ -479,6 +479,13 @@ mod tests {
             let ro = dir.path().join("ro");
             std::fs::create_dir(&ro).unwrap();
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+            // Root (e.g. a CI container) bypasses directory permissions; the
+            // read-only case cannot be produced there.
+            if std::fs::write(ro.join("probe"), b"").is_ok() {
+                std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+                eprintln!("skipped: directory permissions are not enforced for this user");
+                return;
+            }
             let err = open_writer(&ro.join("events.db"), SyncMode::Normal).unwrap_err();
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(

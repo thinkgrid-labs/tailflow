@@ -10,21 +10,6 @@ use tailflow_core::privacy::PrivacyConfig;
 use tailflow_core::LogLevel;
 use tailflow_storage::{EventQuery, LossReason, Storage, StorageError, Submitted, WriterState};
 
-/// Hold the database write lock from another connection for `hold`.
-fn hold_write_lock(path: &std::path::Path, hold: Duration) -> std::thread::JoinHandle<()> {
-    let path = path.to_path_buf();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let h = std::thread::spawn(move || {
-        let c = Connection::open(&path).unwrap();
-        c.execute_batch("BEGIN IMMEDIATE").unwrap();
-        ready_tx.send(()).unwrap();
-        std::thread::sleep(hold);
-        c.execute_batch("COMMIT").unwrap();
-    });
-    ready_rx.recv().unwrap();
-    h
-}
-
 #[test]
 fn queue_overflow_is_counted_recorded_and_reported() {
     let dir = tempfile::tempdir().unwrap();
@@ -35,8 +20,12 @@ fn queue_overflow_is_counted_recorded_and_reported() {
     let _ = s.submit(log_event(0, "api", LogLevel::Info, "baseline"));
     s.flush(T).unwrap();
 
-    // Stall the writer, then overflow its queue.
-    let lock = hold_write_lock(&path, Duration::from_millis(1500));
+    // Stall the writer with a held write lock, then overflow its queue. The
+    // lock is held until every submission and the mid-run checks are done —
+    // not for a fixed time, which a loaded host can outrun (the overflow
+    // then lands in two gap rows instead of one).
+    let locker = Connection::open(&path).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let mut dropped = 0;
     for i in 1..=2_000 {
         if let Submitted::Dropped(LossReason::QueueFull) =
@@ -57,7 +46,8 @@ fn queue_overflow_is_counted_recorded_and_reported() {
     );
     assert!(p.completeness.reasons.contains(&"pending_loss"));
 
-    lock.join().unwrap();
+    locker.execute_batch("COMMIT").unwrap();
+    drop(locker);
     s.flush(T).unwrap();
     let h = s.health();
     assert_eq!(h.pending_loss_unrecorded, 0, "loss is now durable");
@@ -76,6 +66,16 @@ fn queue_overflow_is_counted_recorded_and_reported() {
     assert!(p.completeness.reasons.contains(&"loss_in_range"));
     let gap = &p.completeness.gaps[0];
     assert_eq!(gap.reason, "queue_full");
+    // Exact: every queue_full drop is in a recorded gap (one row when the
+    // lock outlasts the burst, which it now always does).
+    let recorded: u64 = p
+        .completeness
+        .gaps
+        .iter()
+        .filter(|g| g.reason == "queue_full")
+        .map(|g| g.count.unwrap_or(0))
+        .sum();
+    assert_eq!(recorded, dropped);
     assert_eq!(gap.count, Some(dropped));
     assert!(
         p.events
@@ -107,13 +107,60 @@ fn lock_contention_is_retried_without_loss() {
     let s = open(&path);
     let _ = s.submit(log_event(0, "api", LogLevel::Info, "warm"));
     s.flush(T).unwrap();
-    // Longer than the 5 s busy timeout: the first attempt fails with BUSY and
-    // a retry succeeds once the lock is released.
-    let lock = hold_write_lock(&path, Duration::from_millis(5_300));
+    let before = s.health();
+    assert_eq!(before.storage_errors, 0);
+
+    // Take the write lock from another connection *before* submitting, so
+    // every commit attempt for these events has to wait on it.
+    let locker = Connection::open(&path).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
     for i in 1..=100 {
         let _ = s.submit(log_event(i, "api", LogLevel::Info, "during lock"));
     }
-    lock.join().unwrap();
+
+    // Hold the lock until the writer has *observably* failed an attempt
+    // (BUSY after the production 5 s busy timeout) — not for a fixed time
+    // that races the writer's start. Release right after, inside the retry
+    // window (two more attempts, each waiting up to 5 s), so the retry, not
+    // the first attempt, is what commits.
+    // `note_error` updates the counter, the message and the state one after
+    // another; wait for all of them (the state stays Degraded until a retry
+    // succeeds, which cannot happen while the lock is held).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let during = loop {
+        let h = s.health();
+        if h.storage_errors > before.storage_errors && h.writer_state == WriterState::Degraded {
+            break h;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the writer never reported the held lock: {h:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        during.writer_state,
+        WriterState::Degraded,
+        "a failed attempt is visible while the lock is held: {during:?}"
+    );
+    assert_eq!(
+        during.events_persisted, 1,
+        "nothing commits while another connection holds the lock"
+    );
+    assert_eq!(
+        during.events_dropped_total, 0,
+        "a single BUSY is retried, not counted as loss"
+    );
+    assert!(
+        during
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("locked") || e.contains("busy")),
+        "the error names the contention: {during:?}"
+    );
+    locker.execute_batch("COMMIT").unwrap();
+    drop(locker);
+
     s.flush(T).unwrap();
     let h = s.health();
     assert!(h.storage_errors >= 1, "contention was observed: {h:?}");
@@ -384,12 +431,32 @@ fn review_r2_loss_during_the_final_commit_is_never_marked_clean() {
     .unwrap();
     let _ = s.submit(log_event(0, "api", LogLevel::Info, "warm"));
     s.flush(T).unwrap();
-    let lock = hold_write_lock(&path, Duration::from_millis(1_500));
+    // Hold the lock until the writer has stopped — every commit up to and
+    // including its final one has failed against it — then release it so
+    // shutdown's late-loss write (5 s busy timeout) can still record the
+    // loss durably. A fixed-length hold could expire before the final
+    // commit on a loaded host.
+    let locker = Connection::open(&path).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
     for i in 1..=50 {
         let _ = s.submit(log_event(i, "api", LogLevel::Info, "in flight at shutdown"));
     }
-    s.shutdown(T).unwrap();
-    lock.join().unwrap();
+    std::thread::scope(|scope| {
+        let stopping = scope.spawn(|| s.shutdown(T));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.health().writer_state != WriterState::Stopped {
+            assert!(
+                Instant::now() < deadline,
+                "the final commit never failed: {:?}",
+                s.health()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(s.health().events_dropped.storage_error >= 50);
+        locker.execute_batch("COMMIT").unwrap();
+        stopping.join().unwrap().unwrap();
+    });
+    drop(locker);
     assert!(s.health().events_dropped.storage_error >= 50);
     drop(s);
     let c = Connection::open(&path).unwrap();
