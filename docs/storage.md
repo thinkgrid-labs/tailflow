@@ -77,9 +77,14 @@ logs.
 | `normal` (default) | Every committed batch | All but possibly the most recent commits |
 | `full` | Every committed batch | Every committed batch (slower writes) |
 
-Events are committed in batches every 100 ms or 512 events. Events still in the
-queue when the daemon is killed are lost, and the next start records that as a
-gap (see below). A clean stop (Ctrl-C or `SIGTERM`) drains the queue first.
+Events are committed in batches: every 500 ms or 512 events, whichever comes
+first (`batch_max_delay_ms`, `batch_max_events`). Fewer, larger commits keep
+disk writes low: each commit rewrites the same handful of index pages however
+few events it carries. History queries (`/api/v1/events`) therefore trail
+live ingestion by up to half a second; the live endpoints (`/events`,
+`/api/query`, `/api/wait`, MCP) are not batched. Events still in the queue
+when the daemon is killed are lost, and the next start records that as a gap
+(see below). A clean stop (Ctrl-C or `SIGTERM`) drains the queue first.
 
 ## Completeness: TailFlow never hides missing history
 

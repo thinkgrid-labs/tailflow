@@ -53,8 +53,11 @@ tested first-class workflow.
 
 ## Retention and completeness
 
-The live ring retains the newest `--buffer` records, defaulting to 5,000, and
-restarts its cursor at each daemon start. Durable history is separate: SQLite,
+The live ring retains the newest `--buffer` records (default 5,000), up to
+`--buffer-mb` of log text (default 16 MiB; reported as `buffered_bytes` on
+`/health`) — with very long lines the byte limit is reached first — and
+restarts its cursor at each daemon start. Single lines longer than 64 KiB are
+cut and marked `… [tailflow: line truncated from N bytes]`. Durable history is separate: SQLite,
 30-day retention, 2 GB cap, persistent cursors. See
 [durable history](storage.md) for its guarantees. In particular:
 

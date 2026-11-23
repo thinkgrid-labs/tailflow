@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
-## [Unreleased]
+## [0.4.0] - [Unreleased]
 
 Milestone M1: durable event engine and observability foundation. TailFlow now
 keeps a local, private, queryable history and states explicitly when that
@@ -66,6 +66,30 @@ history is incomplete.
   exiting.
 - The daemon applies `--grep`/`--source` in its single ingestion task instead
   of a second broadcast hop, removing one point where records could be lost.
+- **Lower resource use (M1.5).** Durable storage commits every 500 ms (was
+  100 ms) or 512 events, cutting SQLite write volume by about two thirds at
+  typical event rates; `/api/v1/events` history trails live ingestion by up to
+  ~0.5 s (live endpoints are unaffected; `batch_max_delay_ms` restores the old
+  value). The in-memory buffer is also bounded by bytes (`--buffer-mb`,
+  default 16 MiB; `buffered_bytes` on `/health`), records are shared between
+  the buffer and every SSE subscriber instead of copied, level detection no
+  longer allocates per line, idle history-query connections give back their
+  cache, a quiet tailed file is polled every 2 s instead of every 250 ms, and
+  release binaries are built with LTO and stripped symbols (31–37 % smaller).
+  The dashboard re-renders only new rows.
+
+### Fixed
+
+- On Linux, tailing a file kept one CPU core busy for as long as the daemon ran:
+  the collector re-read the file on inotify *access* events, and its own
+  re-read produced the next one. Access events are now ignored.
+- A process, stdin, or tailed file that wrote a non-UTF-8 byte stopped being
+  captured (process and stdin) or failed its collector (file), silently. Invalid
+  bytes are now replaced with U+FFFD and capture continues.
+- Collectors buffered a line without a size limit. Lines are now capped at
+  64 KiB and marked `… [tailflow: line truncated from N bytes]`; the cut drops
+  the token it lands in so no fragment of a secret escapes redaction. A cut
+  JSON line is classified by its text, since it no longer parses.
 
 ### Security
 
@@ -77,6 +101,8 @@ history is incomplete.
   owner-only data directory.
 - `/api/v1/events` pages are bounded to about 8 MiB of text and to 100 events
   when `include_payload=true`.
+- Removed the unmaintained `atty` dependency (RUSTSEC-2021-0145,
+  RUSTSEC-2024-0375); terminal detection uses the standard library.
 
 ## [0.3.3] - 2026-08-19
 

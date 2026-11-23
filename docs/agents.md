@@ -481,7 +481,7 @@ version message, rather than accepting a weaker answer than it asked for.
 
 ### Buffer horizon
 
-The daemon retains `--buffer` records (default 5000) and reports
-`buffer_starts_at`. A query for `since: "1h"` against a buffer holding twenty
+The daemon retains `--buffer` records (default 5000, or fewer once they
+exceed `--buffer-mb`, default 16 MiB) and reports `buffer_starts_at`. A query for `since: "1h"` against a buffer holding twenty
 minutes of a chatty stack cannot see the full hour — the horizon field is what
 lets a caller notice that rather than conclude the first forty minutes were quiet.

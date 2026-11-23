@@ -22,7 +22,7 @@ Docker / Process / File / Stdin
    bounded queue ── full → counted, gap recorded
             │
             ▼
-   writer thread: batch (≤512 / 100 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL)
+   writer thread: batch (≤512 / 500 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL)
             │                                                        ▲
             └─ retention, heartbeats, gap rows          reader pool ─┘ /api/v1/*
 ```
