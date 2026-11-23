@@ -41,6 +41,15 @@ Scenarios (comma separated; `name:arg` where noted):
                           write-back on macOS, so this is the exact metric.
   endurance:<minutes>     cycling rates (idle, 10, 100, 1000/s) with periodic
                           queries and retention; RSS sampled every 10 s
+  soak:<minutes>[:max_size_mb]
+                          multi-hour stability run: endurance cycle plus a
+                          10k/s burst, reconnecting SSE clients, heavy history
+                          and common-term FTS reads, retention at max_size_mb
+                          (default 32). Full time series (memory, WAL, DB,
+                          loss, retention passes, per-query latency, macOS
+                          malloc zone, FTS segment size). Analyse with
+                          soak_report.py. TAILFLOW_BENCH_KEEP=<path> keeps the
+                          final database.
 
 --repeat N runs every (scenario, binary) pair N times, interleaving binaries
 so host drift affects both alike; summaries report median, min, max and
@@ -67,6 +76,13 @@ import procstat  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXAMPLES = os.environ.get("TAILFLOW_BENCH_EXAMPLES", os.path.join(ROOT, "target", "release", "examples"))
 MB = 1024 * 1024
+
+# Fault injection for the CI gate's self-test (`check_budgets.py --inject`).
+# Never set in benchmarks. crash: SIGKILL the daemon mid-run; probe: the SSE
+# probe dies without output; probe_garbage: it prints malformed output; loss:
+# a 256-event storage queue plus a held write lock make storage really drop
+# events; missing: the storage status endpoint "returns" nothing.
+FAULT = None
 
 
 def free_port():
@@ -103,6 +119,8 @@ def write_config(workdir, cmd=None, file_path=None, storage_extra=""):
             f.write(f'[[sources.process]]\nlabel = "gen"\ncmd = "{cmd}"\n\n')
         if file_path is not None:
             f.write(f'[[sources.file]]\npath = "{file_path}"\nlabel = "file"\n\n')
+        if FAULT == "loss":
+            storage_extra += "queue_capacity = 256\n"
         f.write(f'[storage]\npath = "{os.path.join(workdir, "events.db")}"\n{storage_extra}')
     return cfg
 
@@ -124,10 +142,26 @@ def start(binary, extra, workdir, cfg):
             time.sleep(0.002)
             continue
         if get(port, "/health", timeout=1):
+            _inject_runtime_fault(p, workdir)
             return p, port, (time.perf_counter() - t0) * 1000
         time.sleep(0.002)
     p.kill()
     raise RuntimeError(f"{binary} did not start")
+
+
+def _inject_runtime_fault(p, workdir):
+    if FAULT == "crash":
+        threading.Timer(6.0, p.kill).start()
+    elif FAULT == "loss":
+        def hold_lock():
+            import sqlite3
+            time.sleep(4.0)  # load starts ~2 s after the daemon
+            c = sqlite3.connect(os.path.join(workdir, "events.db"), isolation_level=None, timeout=10)
+            c.execute("BEGIN IMMEDIATE")
+            time.sleep(6.0)  # > the writer's 5 s busy timeout, queue overflows
+            c.execute("COMMIT")
+            c.close()
+        threading.Thread(target=hold_lock, daemon=True).start()
 
 
 def stop(p):
@@ -191,7 +225,7 @@ class Sampler:
 
 
 def storage_status(port):
-    status = get(port, "/api/v1/storage/status") or {}
+    status = {} if FAULT == "missing" else (get(port, "/api/v1/storage/status") or {})
     h = status.get("health") or {}
     db = status.get("db") or {}
     return {
@@ -202,13 +236,26 @@ def storage_status(port):
 
 
 def probe(port, seconds):
+    if FAULT == "probe":
+        return subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"], stdout=subprocess.PIPE, text=True)
+    if FAULT == "probe_garbage":
+        return subprocess.Popen([sys.executable, "-c", "print('{not json')"], stdout=subprocess.PIPE, text=True)
     return subprocess.Popen([os.path.join(EXAMPLES, "sse_probe"), str(port), str(seconds)],
                             stdout=subprocess.PIPE, text=True)
 
 
 def probe_result(pr, timeout):
+    """Parsed probe summary. A probe that failed or printed something
+    unparseable yields {} — every consumer treats that as missing data."""
     out, _ = pr.communicate(timeout=timeout)
-    r = json.loads(out) if out.strip() else {}
+    if pr.returncode != 0:
+        return {}
+    try:
+        r = json.loads(out) if out.strip() else {}
+    except ValueError:
+        return {}
+    if not isinstance(r, dict):
+        return {}
     lat = r.get("latency_ms") or {}
     for k in ("p50", "p95", "p99", "max"):
         r[f"{k}_ms"] = lat.get(k)
@@ -591,6 +638,219 @@ def sc_endurance(binary, extra, minutes):
         return res
 
 
+SOAK_QUERIES = [
+    ("recent", "/api/v1/events?limit=100"),
+    ("type", "/api/v1/events?type=runtime.error&since=1h&limit=100"),
+    ("fts", "/api/v1/events?q=connection%20refused&limit=50"),
+    ("source", "/api/v1/events?source=gen&severity=warn&limit=100"),
+    ("legacy", "/api/errors"),
+    ("legacy", "/api/query?level=warn&limit=100"),
+    ("legacy", "/api/sources"),
+]
+# Heavier history reads, one every 30 s: common-term FTS (many matches in a
+# tombstone-heavy index), wide unindexed scans and deep pages.
+SOAK_HEAVY = [
+    ("fts_common", "/api/v1/events?q=error&limit=500"),
+    ("history", "/api/v1/events?severity=error&since=24h&limit=500"),
+    ("fts_common", "/api/v1/events?q=timeout&order=desc&limit=500"),
+    ("history", "/api/v1/events?since=24h&order=desc&limit=500"),
+]
+
+
+class SoakQueries:
+    """Every query is kept as (t, kind, ms, ok) so latency can be bucketed by hour."""
+
+    def __init__(self, port, t0, interval=2.0, heavy_every=15):
+        self.port, self.t0, self.interval, self.heavy_every = port, t0, interval, heavy_every
+        self.log = []
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        i = 0
+        while not self._stop.wait(self.interval):
+            kind, path = SOAK_QUERIES[i % len(SOAK_QUERIES)]
+            if self.heavy_every and i % self.heavy_every == 0:
+                kind, path = SOAK_HEAVY[(i // self.heavy_every) % len(SOAK_HEAVY)]
+            i += 1
+            ms, ok = timed_get(self.port, path, timeout=30)
+            self.log.append((round(time.time() - self.t0, 1), kind, round(ms, 2), ok))
+
+    def finish(self):
+        self._stop.set()
+        self._t.join()
+        return self.log
+
+
+def malloc_zone(pid):
+    """macOS only: the default malloc zone row of `vmmap --summary` —
+    allocated (live) bytes vs dirty bytes separates growth of live heap from
+    allocator retention/fragmentation."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(["vmmap", "--summary", str(pid)], capture_output=True, text=True,
+                             timeout=60).stdout
+    except Exception:
+        return None
+    unit = {"K": 1 / 1024, "M": 1, "G": 1024}
+
+    def mb(tok):
+        try:
+            return round(float(tok[:-1]) * unit[tok[-1]], 2)
+        except (KeyError, ValueError, IndexError):
+            return None
+    for line in out.splitlines():
+        if line.startswith("DefaultMallocZone"):
+            f = line.split()
+            # name, virtual, resident, dirty, swapped, count, allocated, frag, %frag, regions
+            return {"zone_dirty_mb": mb(f[3]), "zone_allocations": int(f[5]),
+                    "zone_allocated_mb": mb(f[6]), "zone_frag_mb": mb(f[7])}
+    return None
+
+
+def fts_stats(db):
+    """Size of the FTS5 segment store vs live rows (read-only, short read txn)."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        rows, blob = c.execute("SELECT count(*), coalesce(sum(length(block)),0) FROM events_fts_data").fetchone()
+        live = c.execute("SELECT count(*) FROM events").fetchone()[0]
+        c.close()
+        return {"fts_data_rows": rows, "fts_data_mb": round(blob / MB, 2), "live_events": live,
+                "fts_bytes_per_live_event": round(blob / live, 1) if live else None}
+    except Exception as e:  # the daemon may hold the write lock briefly
+        return {"fts_error": str(e)}
+
+
+def sc_soak(binary, extra, minutes, max_size_mb=32):
+    """Long-run stability soak (M1.5-F). One 300 s cycle:
+    60 s idle, 60 s @10/s, 60 s @100/s, 30 s @1000/s, 10 s @10000/s burst,
+    80 s @10/s. Two SSE clients reconnect every cycle; a query every 2 s
+    (every 15th a heavy history/FTS read); retention under `max_size_mb`
+    pressure every 30 s. Samples memory, storage and retention every 10 s,
+    and the malloc zone (macOS) + FTS segment size every 15 min."""
+    cycle = [(0, 60), (10, 60), (100, 60), (1000, 30), (10000, 10), (10, 80)]
+    period = sum(s for _, s in cycle)
+    cycles = max(1, int(minutes * 60 // period))
+    loadgen = os.path.join(EXAMPLES, "loadgen")
+    lines, invocations = [], 0
+    for _ in range(cycles):
+        for rate, secs in cycle:
+            if rate == 0:
+                lines.append(f"sleep {secs}")
+            else:
+                lines.append(f"{loadgen} {rate} {secs} linger=0")
+                invocations += 1
+    expected = cycles * sum(r * s for r, s in cycle)
+    keep = os.environ.get("TAILFLOW_BENCH_KEEP")
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TAILFLOW_BENCH_TMP")) as d:
+        sh = os.path.join(d, "cycle.sh")
+        with open(sh, "w") as f:
+            f.write("#!/bin/sh\nsleep 5\n" + "\n".join(lines) + "\nsleep 86400\n")
+        os.chmod(sh, 0o755)
+        cfg = write_config(d, cmd=sh,
+                           storage_extra=f"max_size_mb = {max_size_mb}\ncleanup_interval_secs = 30\n")
+        p, port, _ = start(binary, extra, d, cfg)
+        db = os.path.join(d, "events.db")
+        t0 = time.time()
+        first = procstat.snapshot(p.pid)
+        ql = SoakQueries(port, t0)
+        series, heap, sse, retention_passes = [], [], [], {}
+        probes, next_probe, next_heap = [], t0 + 5, t0
+        end = t0 + 5 + cycles * period
+        alive = True
+        while time.time() < end:
+            now = time.time()
+            if now >= next_probe:
+                for pr in probes:
+                    try:
+                        sse.append({"t": round(now - t0), **probe_result(pr, 30)})
+                    except Exception as e:
+                        sse.append({"t": round(now - t0), "error": str(e)})
+                probes = [probe(port, period - 2) for _ in range(2)]
+                next_probe = now + period
+            if now >= next_heap:
+                heap.append({"t": round(now - t0), **(malloc_zone(p.pid) or {}), **fts_stats(db)})
+                next_heap = now + 900
+            time.sleep(10)
+            if p.poll() is not None:
+                alive = False
+                break
+            snap = procstat.snapshot(p.pid)
+            status = get(port, "/api/v1/storage/status") or {}
+            h, dbs = status.get("health") or {}, status.get("db") or {}
+            ret = (status.get("retention") or {})
+            lc, at = ret.get("last_cleanup") or {}, ret.get("last_cleanup_at")
+            if at and at not in retention_passes:
+                retention_passes[at] = (round(time.time() - t0), lc.get("duration_ms"),
+                                        lc.get("evicted_by_size"), lc.get("more_work"))
+            ing = status.get("ingest") or {}
+            if snap:
+                series.append({
+                    "t": round(time.time() - t0),
+                    "rss_mb": round(snap["rss_bytes"] / MB, 2),
+                    "private_mb": round((snap.get("private_bytes") or 0) / MB, 2),
+                    "cpu_s": round(snap.get("cpu_s") or 0, 2),
+                    "db_mb": round((dbs.get("file_bytes") or 0) / MB, 2),
+                    "wal_mb": round((dbs.get("wal_bytes") or 0) / MB, 2),
+                    "live_events": dbs.get("events"),
+                    "persisted": h.get("events_persisted"),
+                    "dropped": h.get("events_dropped_total"),
+                    "queue": h.get("ingestion_queue_depth"),
+                    "storage_errors": h.get("storage_errors"),
+                    "ingest_dropped": ing.get("records_dropped"),
+                    "sse_lag": ing.get("sse_client_lag_records"),
+                })
+        for pr in probes:
+            try:
+                sse.append({"t": round(time.time() - t0), **probe_result(pr, 30)})
+            except Exception as e:
+                sse.append({"error": str(e)})
+        heap.append({"t": round(time.time() - t0), **(malloc_zone(p.pid) or {}), **fts_stats(db)})
+        last = procstat.snapshot(p.pid)
+        qlog = ql.finish()
+        health = get(port, "/health") or {}
+        st = storage_status(port)
+        integrity = None
+        if alive:
+            res_shutdown = stop(p)
+            import sqlite3
+            try:
+                c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                integrity = c.execute("PRAGMA quick_check").fetchone()[0]
+                c.close()
+            except Exception as e:
+                integrity = f"error: {e}"
+        else:
+            res_shutdown = None
+        if keep:
+            import shutil
+            shutil.copy(db, keep)
+        wall = time.time() - t0
+        d_ = procstat.delta(first, last) or {}
+        res = {
+            "minutes": round(wall / 60, 1), "cycles": cycles, "max_size_mb": max_size_mb,
+            "daemon_alive": alive,
+            "generated": expected, "generator_invocations": invocations,
+            "ingested_ring_cursor": health.get("cursor"),
+            "ingest_dropped_reported": health.get("ingest_dropped"),
+            "cpu_percent": round(100 * d_["cpu_s"] / wall, 3) if d_.get("cpu_s") is not None else None,
+            "disk_write_mb": round(d_["disk_write_bytes"] / MB, 1) if d_.get("disk_write_bytes") is not None else None,
+            "queries": len(qlog), "query_failed": sum(1 for q in qlog if not q[3]),
+            "sse_gap_events": sum(x.get("gap_events") or 0 for x in sse),
+            "sse_received": sum(x.get("received") or 0 for x in sse),
+            "sse_probe_errors": sum(1 for x in sse if "error" in x),
+            "integrity": integrity,
+            **st,
+            "shutdown_ms": res_shutdown,
+            "series": series, "heap": heap, "sse": sse, "query_log": qlog,
+            "retention_passes": sorted(retention_passes.values()),
+        }
+        return res
+
+
 def run_scenario(spec, binary, extra):
     name, *args = spec.split(":")
     a = [int(x) for x in args]
@@ -620,6 +880,9 @@ def run_scenario(spec, binary, extra):
         return sc_querymem(binary, extra)
     if name == "endurance":
         return sc_endurance(binary, extra, *(a or [60]))
+    if name == "soak":
+        # soak:<minutes>[:max_size_mb]
+        return sc_soak(binary, extra, *(a or [480]))
     raise SystemExit(f"unknown scenario {spec}")
 
 
