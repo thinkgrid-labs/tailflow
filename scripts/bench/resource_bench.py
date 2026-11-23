@@ -770,7 +770,10 @@ def sc_soak(binary, extra, minutes, max_size_mb=32):
                     except Exception as e:
                         sse.append({"t": round(now - t0), "error": str(e)})
                 probes = [probe(port, period - 2) for _ in range(2)]
-                next_probe = now + period
+                # Anchored to the start, so a 10 s sampling sleep cannot
+                # make the schedule drift across an 8-hour run.
+                while next_probe <= now:
+                    next_probe += period
             if now >= next_heap:
                 heap.append({"t": round(now - t0), **(malloc_zone(p.pid) or {}), **fts_stats(db)})
                 next_heap = now + 900
@@ -805,8 +808,9 @@ def sc_soak(binary, extra, minutes, max_size_mb=32):
                 })
         for pr in probes:
             try:
-                sse.append({"t": round(time.time() - t0), **probe_result(pr, 30)})
+                sse.append({"t": round(time.time() - t0), **probe_result(pr, period)})
             except Exception as e:
+                pr.kill()
                 sse.append({"error": str(e)})
         heap.append({"t": round(time.time() - t0), **(malloc_zone(p.pid) or {}), **fts_stats(db)})
         last = procstat.snapshot(p.pid)

@@ -248,6 +248,17 @@ fn main() {
     let only = arg("--only");
     let want = |n: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == n));
 
+    if want("fts_merge_cost") {
+        let db = PathBuf::from(arg("--db").expect("--db <copy of a database>"));
+        fts_merge_cost(
+            &db,
+            &arg("--variant").unwrap_or_else(|| "neg64".into()),
+            arg("--cycles").map_or(60, |v| v.parse().unwrap()),
+            arg("--batch").map_or(20_000, |v| v.parse().unwrap()),
+        );
+        return;
+    }
+
     // 1. Redaction cost per line (the hot path on every live record).
     if want("redaction") {
         let redactor = Redactor::builtin();
@@ -864,6 +875,123 @@ fn main() {
         drop(side);
         s.shutdown(Duration::from_secs(60)).unwrap();
     }
+}
+
+/// `--only fts_merge_cost --db <copy> --variant <v> --cycles N --batch K`:
+/// on a copy of a large, tombstone-heavy database, emulate the full-text
+/// index workload of N cleanup cycles directly on `events_fts` (insert K new
+/// rows, delete the K oldest) and after each run one maintenance call:
+///   none | neg<N> ('merge', -N) | pos<N> ('merge', N)
+///   | dm<N> ('deletemerge' 10, ('merge', N), 'deletemerge' 0 — in one txn)
+/// Reports per-call time and WAL frames (pinned WAL), and index bytes per
+/// live row every 10 cycles.
+fn fts_merge_cost(db: &Path, variant: &str, cycles: u64, batch: i64) {
+    let c = rusqlite_conn(db);
+    c.busy_timeout(Duration::from_secs(60)).unwrap();
+    c.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    let pin = rusqlite_conn(db);
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let wal_len = || std::fs::metadata(&wal).map_or(0i64, |m| i64::try_from(m.len()).unwrap());
+    let stats = || -> (i64, i64) {
+        c.query_row(
+            "SELECT (SELECT coalesce(sum(length(block)),0) FROM events_fts_data),
+                    (SELECT count(*) FROM events_fts_docsize)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let (mut lo, mut hi): (i64, i64) = c
+        .query_row("SELECT min(id), max(id) FROM events_fts_docsize", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let mut r = Rng(97);
+    let (b0, l0) = stats();
+    emit(
+        "fts_merge_cost_start",
+        json!({"variant": variant, "fts_bytes": b0, "live": l0, "bytes_per_live": b0 as f64 / l0.max(1) as f64}),
+    );
+    let (mut call_ms, mut call_frames) = (Vec::new(), Vec::new());
+    for cyc in 0..cycles {
+        // Index workload of one cycle: new rows, then eviction of the oldest.
+        c.execute_batch("BEGIN").unwrap();
+        {
+            let mut ins = c
+                .prepare_cached("INSERT INTO events_fts(rowid, message) VALUES (?1, ?2)")
+                .unwrap();
+            for _ in 0..batch {
+                hi += 1;
+                let (msg, _, _) = runtime_line(&mut r, u64::try_from(hi).unwrap());
+                ins.execute(rusqlite::params![hi, msg]).unwrap();
+            }
+        }
+        c.execute(
+            "DELETE FROM events_fts WHERE rowid BETWEEN ?1 AND ?2",
+            [lo, lo + batch - 1],
+        )
+        .unwrap();
+        lo += batch;
+        c.execute_batch("COMMIT").unwrap();
+        // The measured maintenance call.
+        let _: (i64, i64, i64) = c
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        pin.execute_batch("BEGIN").unwrap();
+        let _: i64 = pin
+            .query_row("SELECT count(*) FROM events_fts_config", [], |r| r.get(0))
+            .unwrap();
+        let w0 = wal_len();
+        let t = Instant::now();
+        if let Some(n) = variant.strip_prefix("neg") {
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [-n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+        } else if let Some(n) = variant.strip_prefix("pos") {
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+        } else if let Some(n) = variant.strip_prefix("dm") {
+            c.execute_batch("BEGIN").unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 10)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+                [n.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 0)",
+                [],
+            )
+            .unwrap();
+            c.execute_batch("COMMIT").unwrap();
+        }
+        call_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        call_frames.push(((wal_len() - w0.max(32)).max(0) / 4120) as f64);
+        pin.execute_batch("COMMIT").unwrap();
+        if cyc % 10 == 9 || cyc + 1 == cycles {
+            let (b, l) = stats();
+            emit(
+                "fts_merge_cost_point",
+                json!({"variant": variant, "cycle": cyc + 1, "fts_bytes": b, "live": l, "bytes_per_live": b as f64 / l.max(1) as f64,
+                "last10_ms": call_ms.iter().rev().take(10).sum::<f64>() / 10.0}),
+            );
+        }
+    }
+    emit(
+        "fts_merge_cost_summary",
+        json!({"variant": variant, "call_ms": summary(call_ms), "call_wal_frames": summary(call_frames)}),
+    );
 }
 
 fn rusqlite_conn(path: &Path) -> rusqlite::Connection {

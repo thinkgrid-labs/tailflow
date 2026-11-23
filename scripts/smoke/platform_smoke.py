@@ -39,6 +39,7 @@ import urllib.request
 WINDOWS = os.name == "nt"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FILE_LINES = 50
+LIVE = []  # every daemon started, killed on any unexpected exit
 
 
 class SmokeFailure(Exception):
@@ -90,6 +91,7 @@ def start(binary, cfg, d):
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=open(os.path.join(d, f"daemon-{port}.log"), "w"),
                          env={**os.environ, "RUST_LOG": "warn"}, **kwargs)
+    LIVE.append(p)
     t0 = time.time()
     while time.time() - t0 < 60:
         check(p.poll() is None, f"daemon exited during startup (code {p.returncode})")
@@ -217,6 +219,14 @@ def main():
     except SmokeFailure as e:
         ok = False
         report["failure"] = str(e)
+    except Exception as e:  # never lose the report or leave a daemon behind
+        ok = False
+        report["failure"] = f"{type(e).__name__}: {e}"
+    finally:
+        for p in LIVE:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
     report["passed"] = ok
     text = json.dumps(report, indent=2)
     print(text)
