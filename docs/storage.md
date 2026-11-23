@@ -84,8 +84,10 @@ few events it carries. History queries (`/api/v1/events`) therefore trail
 live ingestion by up to half a second; the live endpoints (`/events`,
 `/api/query`, `/api/wait`, MCP) are not batched. Events still in the queue
 when the daemon is killed are lost, and the next start records that as a gap
-(see below). A clean stop (Ctrl-C or `SIGTERM`; on Windows also Ctrl+Break,
-closing the console window, logoff, or system shutdown) drains the queue first.
+(see below). A clean stop (Ctrl-C or `SIGTERM`; on Windows also Ctrl+Break)
+drains the queue first. Closing the console window on Windows is best effort:
+Windows ends the process about 5 seconds later, and if the drain takes longer
+the loss is recorded at the next start like any other unclean stop.
 
 ## Completeness: TailFlow never hides missing history
 

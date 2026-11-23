@@ -127,9 +127,11 @@ async fn terminate_signal() {
 
 /// Windows has no SIGTERM. Besides Ctrl+C (handled by the caller), stop
 /// gracefully on Ctrl+Break — how a supervisor stops a console process
-/// started in its own process group — and on console close, logoff and
-/// system shutdown, so the storage queue drains and the run is closed
-/// cleanly instead of being recorded as an unclean shutdown.
+/// started in its own process group. Console close is best effort: Windows
+/// ends the process about 5 s after delivering it, which a busy shutdown
+/// can exceed (the loss is then recorded at the next start, as for any
+/// unclean stop). Logoff and shutdown events reach services only; they are
+/// listened for in case the daemon is run as one.
 #[cfg(windows)]
 async fn terminate_signal() {
     use tokio::signal::windows;
