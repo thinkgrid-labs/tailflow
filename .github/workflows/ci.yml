@@ -85,11 +85,41 @@ jobs:
           key: msrv
       - run: cargo check --all --locked
 
+  # ── Resource bounds ────────────────────────────────────────────────────────
+  # Deterministic checks only: zero event loss under short steady, burst and
+  # large-payload loads, release binary size within budget, and bounded
+  # memory. Shared-runner timing is noise, so CPU and latency are recorded
+  # (artifact) but never gated; compare those on a dedicated host with
+  # scripts/bench/compare.py.
+  resources:
+    name: resources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked --bins
+      - run: cargo build --release --locked -p tailflow-daemon --examples
+      - run: python3 scripts/bench/check_budgets.py --out resource-checks.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resource-checks
+          path: resource-checks.jsonl
+
   # ── Quality gate ───────────────────────────────────────────────────────────
   # Set this as the required status check in branch protection for main and dev.
   quality:
     name: quality
-    needs: [fmt, clippy, build, test, web, msrv]
+    needs: [fmt, clippy, build, test, web, msrv, resources]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All checks passed."
