@@ -272,12 +272,15 @@ fn unclean_previous_run_is_recovered_as_a_gap_of_unknown_size() {
     s.shutdown(T).unwrap();
     drop(s);
     // Simulate `kill -9`: an open run row whose process no longer exists.
+    // Unix detects it at once by its pid; Windows has no pid probe and
+    // relies on heartbeat staleness (> 60 s), so it gets an old heartbeat.
+    let heartbeat_age_secs = if cfg!(unix) { 0 } else { 120 };
     {
         let c = Connection::open(&path).unwrap();
         c.execute(
             "INSERT INTO runs (run_key, started_at, heartbeat_at, version, pid, last_seq)
-             VALUES ('dead', 1, strftime('%s','now') * 1000000, 'test', 2147483000, 10)",
-            [],
+             VALUES ('dead', 1, (strftime('%s','now') - ?1) * 1000000, 'test', 2147483000, 10)",
+            [heartbeat_age_secs],
         )
         .unwrap();
     }

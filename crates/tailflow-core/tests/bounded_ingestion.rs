@@ -77,6 +77,8 @@ async fn collect_until(rx: &mut LogReceiver, want: &str, timeout: Duration) -> V
     out
 }
 
+// POSIX shell command (`;`, printf, /dev/zero); Windows runs commands via cmd.exe.
+#[cfg(unix)]
 #[tokio::test]
 async fn process_capture_survives_invalid_utf8() {
     let (tx, mut rx) = new_bus();
@@ -97,6 +99,8 @@ async fn process_capture_survives_invalid_utf8() {
     );
 }
 
+// POSIX shell command (`;`, printf, /dev/zero); Windows runs commands via cmd.exe.
+#[cfg(unix)]
 #[tokio::test]
 async fn process_huge_line_is_cut_and_marked() {
     let (tx, mut rx) = new_bus();
