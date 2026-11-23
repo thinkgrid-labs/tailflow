@@ -38,6 +38,83 @@ const VACUUM_PAGES_PER_PASS: u64 = 1_024;
 /// would keep retention running forever (found by the M1 benchmark).
 const VACUUM_MIN_FREE_PAGES: u64 = 2_048;
 
+/// Pages of full-text index merging per maintenance step (≈ what one step
+/// writes; measured 121 WAL pages median, 315 max on a 256 MB index).
+const FTS_MERGE_PAGES: i64 = 64;
+
+/// Tombstone share (%) above which a full-text segment level is eligible for
+/// the targeted merge. Only set for the duration of that merge: left on, FTS5
+/// would also run it inside ordinary commits, where M1 measured a 24 s COMMIT.
+const FTS_DELETEMERGE_PERCENT: i64 = 10;
+
+/// In a cleanup cycle that keeps running out of time (a large backlog), also
+/// compact every this many passes instead of only when the cycle completes.
+const FTS_COMPACT_EVERY_PASSES: u32 = 20;
+
+/// What the earlier passes of the cleanup cycle in progress did. A cycle is
+/// one pass, or several chained by `more_work`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cycle {
+    /// An earlier pass of this cycle deleted events.
+    pub deleted: bool,
+    /// Passes of this cycle before the current one.
+    pub passes: u32,
+}
+
+impl Cycle {
+    /// The state for the next pass, given this pass's outcome.
+    #[must_use]
+    pub fn after(self, deleted: bool, more_work: bool) -> Self {
+        if more_work {
+            Self {
+                deleted: self.deleted || deleted,
+                passes: self.passes.saturating_add(1),
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// Whether this pass ends with the targeted full-text compaction: the cycle
+/// deleted events and either completes now or has run for another
+/// `FTS_COMPACT_EVERY_PASSES` passes.
+fn should_compact(cycle: Cycle, deleted_now: bool, more_work: bool) -> bool {
+    (deleted_now || cycle.deleted)
+        && (!more_work || cycle.passes % FTS_COMPACT_EVERY_PASSES == FTS_COMPACT_EVERY_PASSES - 1)
+}
+
+/// Merge the full-text segment levels that consist mostly of deleted rows'
+/// tombstones, bounded to about `FTS_MERGE_PAGES` pages.
+///
+/// Retention deletes the oldest events; their index entries stay in the
+/// oldest, largest segments as tombstones until those are merged. A positive
+/// `merge` only touches a level holding `usermerge` (4) segments, which those
+/// big old segments rarely reach, so under continuous eviction the index grew
+/// to 3–13× its compacted size and took that space from the history the size
+/// cap can hold (M1.5-F). With `deletemerge` set, a level whose segments are
+/// over the tombstone threshold is merged even when alone. A *negative*
+/// merge was rejected: it regroups every segment into one whole-index merge
+/// that ordinary inserts then keep continuing through automerge, so its cost
+/// grows with the index and lands on ingestion (≈3× slower cycles measured).
+fn compact_fts(conn: &Connection) -> Result<()> {
+    immediate(conn, |c| {
+        c.execute(
+            "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', ?1)",
+            [FTS_DELETEMERGE_PERCENT],
+        )?;
+        c.execute(
+            "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)",
+            [FTS_MERGE_PAGES],
+        )?;
+        c.execute(
+            "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', 0)",
+            [],
+        )?;
+        Ok(())
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RetentionPolicy {
     /// `None` = unlimited age (size cap still applies).
@@ -56,8 +133,8 @@ pub struct RetentionReport {
     /// The time budget ran out with deletion work remaining; run again soon.
     /// Free-page reclamation never sets this.
     pub more_work: bool,
-    /// This pass completed a cleanup cycle that deleted events and ran the
-    /// bounded cross-level full-text index merge.
+    /// This pass ran the bounded full-text compaction (the cleanup cycle had
+    /// deleted events and completed, or ran long).
     pub fts_compacted: bool,
     pub used_bytes_after: u64,
     pub age_ms: f64,
@@ -184,15 +261,15 @@ pub(crate) fn delete_seq_range(c: &Connection, lo: i64, hi: i64) -> Result<u64> 
 
 /// One retention pass under a time budget.
 ///
-/// `earlier_passes_deleted`: an earlier pass of the same cleanup cycle (one
-/// that ended with `more_work`) deleted events. The pass that completes such
-/// a cycle compacts the full-text index across levels (see below).
+/// `cycle` describes the earlier passes of the cleanup cycle in progress; a
+/// cycle that deleted events ends with a bounded full-text compaction
+/// ([`compact_fts`]). Callers advance it with [`Cycle::after`].
 pub fn run(
     conn: &Connection,
     policy: &RetentionPolicy,
     now_us: i64,
     budget: Duration,
-    earlier_passes_deleted: bool,
+    cycle: Cycle,
 ) -> Result<RetentionReport> {
     let started = Instant::now();
     let mut report = RetentionReport::default();
@@ -302,32 +379,24 @@ pub fn run(
         report.vacuumed_pages = stats.freelist_count.saturating_sub(after);
     }
     let deleted = report.expired_by_age + report.evicted_by_size > 0;
+    // Full-text maintenance is best effort: the deletions above are already
+    // committed, and a failed merge (e.g. BUSY from a concurrent CLI
+    // command) must not fail the pass, drop its report or skip the
+    // checkpoint below. The next cycle tries again.
     if deleted {
-        // A bounded amount of FTS segment merging (~64 pages of work) so
-        // deleted rows' tombstones are compacted gradually, never in one
-        // large synchronous merge.
-        conn.execute(
+        // Routine bounded merging (~64 pages) of same-level segments.
+        if let Err(e) = conn.execute(
             "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', 64)",
             [],
-        )?;
+        ) {
+            tracing::warn!(err = %e, "full-text merge skipped");
+        }
     }
-    if !report.more_work && (deleted || earlier_passes_deleted) {
-        // Once per completed cleanup cycle that deleted events: the same
-        // bounded work (~64 pages written), but across *all* levels. A
-        // positive merge only touches a level holding `usermerge` (4)
-        // segments, so the oldest, largest segments — where eviction leaves
-        // its tombstones — were almost never rewritten: under continuous
-        // eviction the index swung between ~3× and ~11× its compacted size
-        // and took that space from the history the size cap can hold
-        // (M1.5-F). Merging consumes the oldest segments first, and those
-        // are mostly tombstones, so one bounded step per cycle keeps up.
-        // Running it on *every* pass instead re-optimized the whole index
-        // continuously (≈3× ingest time) for little extra gain.
-        conn.execute(
-            "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', -64)",
-            [],
-        )?;
-        report.fts_compacted = true;
+    if should_compact(cycle, deleted, report.more_work) {
+        match compact_fts(conn) {
+            Ok(()) => report.fts_compacted = true,
+            Err(e) => tracing::warn!(err = %e, "full-text compaction skipped"),
+        }
     }
     if report.expired_by_age + report.evicted_by_size + report.payloads_cleared > 0
         || report.vacuumed_pages > 0
@@ -394,7 +463,81 @@ mod tests {
             payload_max_age_days: 7,
             max_bytes: u64::MAX,
         };
-        let r = run(&c, &policy, 0, Duration::from_secs(1), false).unwrap();
+        let r = run(&c, &policy, 0, Duration::from_secs(1), Cycle::default()).unwrap();
         assert!(!r.more_work);
+    }
+
+    #[test]
+    fn compaction_runs_once_a_deleting_cycle_completes_or_runs_long() {
+        let none = Cycle::default();
+        // Single-pass cycles.
+        assert!(should_compact(none, true, false), "deleted and complete");
+        assert!(!should_compact(none, false, false), "nothing deleted");
+        assert!(!should_compact(none, true, true), "deleted, still running");
+        // The completing pass deletes nothing, an earlier one did.
+        let after_one = none.after(true, true);
+        assert_eq!(
+            after_one,
+            Cycle {
+                deleted: true,
+                passes: 1
+            }
+        );
+        assert!(should_compact(after_one, false, false));
+        // A long backlog: every pass runs out of time.
+        let mut c = none;
+        let mut compactions = Vec::new();
+        for pass in 0..45u32 {
+            if should_compact(c, true, true) {
+                compactions.push(pass);
+            }
+            c = c.after(true, true);
+        }
+        assert_eq!(compactions, vec![19, 39], "every 20th pass of a long cycle");
+        // Completion resets the cycle.
+        assert_eq!(c.after(false, false), Cycle::default());
+        assert_eq!(
+            Cycle {
+                deleted: false,
+                passes: u32::MAX
+            }
+            .after(false, true)
+            .passes,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn compaction_leaves_deletemerge_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_writer(&dir.path().join("e.db"), SyncMode::Normal).unwrap();
+        for i in 1..=50 {
+            c.execute(
+                "INSERT INTO events_fts(rowid, message) VALUES (?1, 'alpha bravo')",
+                [i],
+            )
+            .unwrap();
+        }
+        c.execute("DELETE FROM events_fts WHERE rowid <= 40", [])
+            .unwrap();
+        compact_fts(&c).unwrap();
+        // Ordinary commits must never run tombstone merges themselves (M1:
+        // a 24 s COMMIT): the setting is back at 0 after the step.
+        let v: i64 = c
+            .query_row(
+                "SELECT v FROM events_fts_config WHERE k = 'deletemerge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 0);
+        let live: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events_fts WHERE events_fts MATCH 'alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 10, "search sees exactly the live rows");
     }
 }

@@ -140,11 +140,10 @@ recorded as gaps — nothing was collecting.
   are evicted until usage falls to 90% of the cap.
 - Cleanup runs at startup and every `cleanup_interval_secs` (default 300) in
   short transactions, and returns free pages to the filesystem gradually.
-- A cleanup cycle that removed events ends by compacting a bounded slice
-  (about 64 pages) of the full-text index across all of its levels, so the
-  index entries of deleted events do not accumulate and take the size cap away
-  from history. Under continuous eviction the index stays within about 1.4×
-  of its fully compacted size.
+- A cleanup cycle that removed events ends with a bounded merge (about 64
+  pages) of the full-text index segments that consist mostly of deleted
+  events' entries — and so does every 20th pass of a long cleanup backlog — so
+  those entries do not accumulate and take the size cap away from history.
 
 The size cap applies to live pages. The file on disk can briefly exceed it by
 the WAL (capped at 64 MB after checkpoints) and by free pages not yet returned;

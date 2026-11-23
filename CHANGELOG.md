@@ -87,13 +87,14 @@ history is incomplete.
   between 3 and 13 times its compacted size. Because the size cap counts it,
   the database typically held about 40 % fewer events than it could (at
   times about 65 % fewer). A cleanup cycle that removes events now ends with
-  one bounded merge across all index levels; the index stays within about
-  1.4× of its compacted size with the same disk writes per event, and the
-  slowest cleanup passes are shorter. Retention reports carry
-  `fts_compacted`.
+  one bounded merge (about 64 pages) of the index segments that consist mostly
+  of deleted entries; the index stays close to its compacted size without
+  extra work during ingestion. Retention reports carry `fts_compacted`.
 - On Windows the daemon now stops cleanly — draining storage and closing the
-  run — on Ctrl+Break, closing the console window, logoff and system shutdown,
-  not only on Ctrl+C. Previously these ended it as an unclean shutdown.
+  run — on Ctrl+Break (how supervisors stop console processes), not only on
+  Ctrl+C, and attempts the same when its console window is closed (Windows
+  allows about 5 seconds). Previously all of these ended it as an unclean
+  shutdown.
 - On Linux, tailing a file kept one CPU core busy for as long as the daemon ran:
   the collector re-read the file on inotify *access* events, and its own
   re-read produced the next one. Access events are now ignored.
