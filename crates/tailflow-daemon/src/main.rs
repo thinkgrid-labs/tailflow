@@ -270,6 +270,7 @@ async fn run() -> Result<()> {
         }
         filter
     };
+    let shutdown = CancellationToken::new();
     let (shared, fanout) = state::AppState::with_pipeline(
         rx,
         state::RingLimits {
@@ -283,10 +284,10 @@ async fn run() -> Result<()> {
             policy: policy.clone(),
             storage: storage_slot,
             run_key,
+            shutdown: shutdown.clone(),
         },
     );
 
-    let shutdown = CancellationToken::new();
     let mut source_tasks = Vec::new();
     for source in sources {
         let name = source.name().to_string();

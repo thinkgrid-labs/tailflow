@@ -11,8 +11,8 @@ what a user relies on, natively on the host it runs on:
   3. file collection: lines appended to a tailed file are captured;
   4. process collection: a configured command's output is captured;
   5. everything captured is persisted (history API), with nothing dropped;
-  6. graceful shutdown (SIGTERM on Unix, Ctrl+Break on Windows) exits 0
-     and closes the run cleanly;
+  6. graceful shutdown (SIGTERM on Unix, Ctrl+Break on Windows) with a live
+     SSE client connected exits 0 and closes the run cleanly;
   7. after a restart the first run's events are still there and history is
      reported complete (no unclean-shutdown gap);
   8. after a hard kill, the next start records the loss as a gap — on Windows,
@@ -169,8 +169,14 @@ def run(binary, report):
     check(h.get("writer_state") == "ok", f"writer not ok: {h}")
     report["persisted_run1"] = h.get("events_persisted")
 
-    # 6. Graceful shutdown.
+    # 6. Graceful shutdown — with a live SSE client connected, as when a
+    # dashboard tab is open (the stream must end so the server can stop).
+    sse = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sse.sendall(f"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n".encode())
+    check(sse.recv(64).startswith(b"HTTP/1.1 200"), "SSE stream did not open")
+    report["sse_client_connected_at_stop"] = True
     code, ms = graceful_stop(p)
+    sse.close()
     report["graceful_exit_code"], report["graceful_shutdown_ms"] = code, ms
     check(code == 0, f"graceful stop exited with {code}")
 
