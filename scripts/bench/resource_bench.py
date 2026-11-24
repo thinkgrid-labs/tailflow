@@ -813,6 +813,17 @@ def sc_soak(binary, extra, minutes, max_size_mb=32):
                 pr.kill()
                 sse.append({"error": str(e)})
         heap.append({"t": round(time.time() - t0), **(malloc_zone(p.pid) or {}), **fts_stats(db)})
+        # The generator runs hundreds of processes back to back and drifts
+        # behind wall-clock time (≈1 s over 8 h). Stopping on schedule would
+        # kill its last lines before they are written and look like loss, so
+        # wait (bounded) until every line has reached the ring.
+        want = expected + invocations
+        drain_deadline = time.time() + 120
+        while alive and time.time() < drain_deadline:
+            cur = (get(port, "/health") or {}).get("cursor") or 0
+            if cur >= want:
+                break
+            time.sleep(1)
         last = procstat.snapshot(p.pid)
         qlog = ql.finish()
         health = get(port, "/health") or {}
