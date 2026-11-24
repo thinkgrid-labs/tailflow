@@ -82,6 +82,12 @@ history is incomplete.
 
 ### Fixed
 
+- Ctrl-C or `SIGTERM` did not stop the daemon while any client was connected
+  to the live stream (`/events` — an open dashboard tab, `curl`, an agent): the
+  HTTP server waited for that never-ending stream, so storage was never
+  drained and the eventual forced kill was recorded as an unclean shutdown.
+  Live streams now end when shutdown begins, and a pending `/api/wait` returns
+  `503` ("the daemon is shutting down") instead of waiting out its timeout.
 - Under continuous size eviction the full-text index kept the entries of
   deleted events in segments that were almost never merged, and grew to
   between 3 and 13 times its compacted size. Because the size cap counts it,

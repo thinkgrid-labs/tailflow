@@ -200,7 +200,42 @@ async fn sse_handler(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(EndOnShutdown::new(stream, state.shutdown.clone())).keep_alive(KeepAlive::default())
+}
+
+/// A stream that ends as soon as the daemon starts shutting down.
+///
+/// The live record stream never ends by itself (the broadcast sender lives
+/// as long as the server), and the HTTP server's graceful shutdown waits for
+/// every open connection. Without this, one connected dashboard tab or SSE
+/// client kept Ctrl-C / SIGTERM from ever stopping the daemon, so storage
+/// never drained and a forced kill was recorded as an unclean shutdown.
+struct EndOnShutdown<S> {
+    inner: std::pin::Pin<Box<S>>,
+    cancelled: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+impl<S> EndOnShutdown<S> {
+    fn new(inner: S, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            cancelled: Box::pin(shutdown.cancelled_owned()),
+        }
+    }
+}
+
+impl<S: tokio_stream::Stream> tokio_stream::Stream for EndOnShutdown<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<S::Item>> {
+        if std::future::Future::poll(self.cancelled.as_mut(), cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        self.inner.as_mut().poll_next(cx)
+    }
 }
 
 // ── REST ──────────────────────────────────────────────────────────────────────
@@ -507,15 +542,23 @@ async fn wait_handler(
     }
 
     let deadline = Duration::from_millis(timeout_ms);
-    let matched_seq = tokio::time::timeout(deadline, async {
+    let shutdown = state.shutdown.clone();
+    let waited = tokio::time::timeout(deadline, async {
         loop {
-            match rx.recv().await {
+            let received = tokio::select! {
+                // The daemon is stopping: end the wait now (graceful shutdown
+                // waits for open connections) and say so — an empty
+                // "matched: false" would read as "nothing happened".
+                () = shutdown.cancelled() => return Err(()),
+                r = rx.recv() => r,
+            };
+            match received {
                 Ok(record)
                     if record.seq > snapshot
                         && q.cursor.is_none_or(|cursor| record.seq > cursor)
                         && q.filter.matches_seq(&record) =>
                 {
-                    return Some(record.seq)
+                    return Ok(Some(record.seq))
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -525,16 +568,25 @@ async fn wait_handler(
                     // predates the call, which is the one thing a wait must not
                     // report as a new event.
                     if let Some(anchor) = state.store.first_matching_seq_after(&q, snapshot) {
-                        return Some(anchor);
+                        return Ok(Some(anchor));
                     }
                     continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
             }
         }
     })
-    .await
-    .unwrap_or(None);
+    .await;
+    let matched_seq = match waited {
+        Ok(Err(())) => {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the daemon is shutting down; the wait was interrupted".into(),
+            ))
+        }
+        Ok(Ok(seq)) => seq,
+        Err(_elapsed) => None,
+    };
 
     let Some(anchor) = matched_seq else {
         let horizon = state.store.records(&q);
@@ -662,6 +714,55 @@ mod tests {
         }
         records.push(("api", LogLevel::Unknown, "    at Pool.connect (db.js:42)"));
         state_with(records)
+    }
+
+    // ── shutdown ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sse_stream_ends_when_the_daemon_shuts_down() {
+        let state = state_with(vec![]);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        state.shutdown.cancel();
+        // The body must end; before the fix it never did, and the server's
+        // graceful shutdown waited on it forever.
+        tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .expect("the SSE body ends on shutdown")
+            .expect("and ends cleanly");
+    }
+
+    #[tokio::test]
+    async fn wait_is_interrupted_by_shutdown_and_says_so() {
+        let state = state_with(vec![]);
+        let waiting = tokio::spawn(get(
+            state.clone(),
+            "/api/wait?grep=never&timeout_ms=60000&require_new=true",
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        state.shutdown.cancel();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait ends on shutdown, not at its 60 s timeout")
+            .unwrap();
+        // Not 200 + "matched: false", which an agent would read as "nothing
+        // happened".
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("shutting down"),
+            "{body}"
+        );
     }
 
     // ── /api/errors ───────────────────────────────────────────────────────────

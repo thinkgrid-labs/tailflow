@@ -302,3 +302,71 @@ fn storage_cli_status_check_and_guarded_purge() {
     d.kill().unwrap();
     d.wait().unwrap();
 }
+
+#[test]
+fn sigterm_stops_cleanly_while_an_sse_client_is_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("events.db");
+    let config = dir.path().join("tailflow.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[[sources.process]]\nlabel = \"gen\"\ncmd = \"echo hello; sleep 30\"\n\n[storage]\npath = \"{}\"\n",
+            db.display()
+        ),
+    )
+    .unwrap();
+    let port = free_port();
+    let mut daemon = spawn(&config, port);
+    wait_for(
+        port,
+        "/api/v1/storage/status",
+        Duration::from_secs(20),
+        |v| v["db"]["events"].as_u64().unwrap_or(0) >= 1,
+    );
+
+    // A live-stream client (a dashboard tab, `curl /events`) stays connected.
+    let mut sse = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        sse,
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n"
+    )
+    .unwrap();
+    sse.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut head = [0u8; 64];
+    let n = sse.read(&mut head).unwrap();
+    assert!(String::from_utf8_lossy(&head[..n]).starts_with("HTTP/1.1 200"));
+
+    let started = Instant::now();
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(daemon.id().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exit = loop {
+        if let Some(exit) = daemon.try_wait().unwrap() {
+            break exit;
+        }
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = daemon.kill();
+            panic!("the daemon ignored SIGTERM while an SSE client was connected");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit.success(), "clean exit, got {exit:?}");
+    drop(sse);
+
+    // The stop was clean: the next start finds no unclean run to recover.
+    let port = free_port();
+    let mut daemon = spawn(&config, port);
+    let status = wait_for(
+        port,
+        "/api/v1/storage/status",
+        Duration::from_secs(20),
+        |v| v["recovered_unclean_runs"].is_number(),
+    );
+    assert_eq!(status["recovered_unclean_runs"], 0, "{status}");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}

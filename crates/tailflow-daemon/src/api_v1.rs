@@ -496,6 +496,7 @@ mod tests {
                 policy,
                 storage,
                 run_key: "testrun".into(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
             },
         );
         Harness {
@@ -708,6 +709,7 @@ mod tests {
                     message: "x is not a SQLite database".into(),
                 },
                 run_key: "m".into(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
             },
         );
         let (status, body) = send(state.clone(), Request::builder().uri("/api/v1/events")).await;

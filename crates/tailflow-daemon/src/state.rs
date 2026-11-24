@@ -12,6 +12,7 @@ use tailflow_core::{
 };
 use tailflow_storage::Storage;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// Source name used for records TailFlow itself injects into the live stream.
 pub const SYSTEM_SOURCE: &str = "tailflow";
@@ -57,6 +58,8 @@ pub struct Pipeline {
     pub storage: StorageSlot,
     /// Prefix for persisted runtime event ids: `<run_key>:<legacy seq>`.
     pub run_key: String,
+    /// Cancelled when the daemon starts shutting down.
+    pub shutdown: CancellationToken,
 }
 
 /// Loss and throughput at the live ingestion point. These cover the ring,
@@ -105,6 +108,12 @@ pub struct AppState {
     pub storage: StorageSlot,
     pub policy: Arc<CapturePolicy>,
     pub ingest: Arc<IngestStats>,
+    /// Cancelled when the daemon starts shutting down. Long-lived responses
+    /// (SSE streams, `/api/wait`) end on it: the HTTP server's graceful
+    /// shutdown waits for every open connection, so a stream that never
+    /// ends would keep the daemon — and the storage drain behind it — from
+    /// ever stopping.
+    pub shutdown: CancellationToken,
     sources: Mutex<HashMap<String, RuntimeSource>>,
     collectors: Arc<Mutex<HashMap<String, CollectorCounters>>>,
 }
@@ -188,6 +197,7 @@ impl AppState {
                 policy,
                 storage: StorageSlot::Disabled,
                 run_key: "memory".into(),
+                shutdown: CancellationToken::new(),
             },
         )
         .0
@@ -206,6 +216,7 @@ impl AppState {
             policy,
             storage,
             run_key,
+            shutdown,
         } = pipeline;
         let state = Arc::new(AppState {
             tx: tx.clone(),
@@ -213,6 +224,7 @@ impl AppState {
             storage,
             policy: policy.clone(),
             ingest: Arc::new(IngestStats::default()),
+            shutdown,
             sources: Mutex::new(HashMap::new()),
             collectors: Arc::new(Mutex::new(HashMap::new())),
         });
