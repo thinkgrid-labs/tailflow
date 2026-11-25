@@ -1,7 +1,9 @@
+pub mod agent;
 pub mod config;
 pub mod event;
 pub mod ingestion;
 pub mod json;
+pub mod paths;
 pub mod privacy;
 pub mod processor;
 pub mod query;

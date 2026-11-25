@@ -476,7 +476,14 @@ impl CapturePolicy {
             excluded_types,
             excluded_prefixes,
             excluded_agents: config.excluded_agents.clone(),
-            allowed_dirs: config.allowed_project_dirs.clone(),
+            allowed_dirs: config
+                .allowed_project_dirs
+                .iter()
+                .map(|d| {
+                    crate::agent::normalize_path(&d.to_string_lossy(), None)
+                        .unwrap_or_else(|| d.clone())
+                })
+                .collect(),
             excluded_globs,
         })
     }
@@ -510,7 +517,21 @@ impl CapturePolicy {
             return Err(Exclusion::Agent);
         }
         if let Some(path) = event.path.as_deref() {
-            let p = Path::new(path);
+            // Resolve `.` and `..` lexically first: `/work/../etc/passwd`
+            // must not pass an allowlist of `/work`. A rooted path that
+            // climbs above the root cannot be placed anywhere.
+            let normalized_buf = if Path::new(path).has_root() {
+                match crate::agent::normalize_path(path, None) {
+                    Some(n) => Some(n),
+                    None if !self.allowed_dirs.is_empty() => {
+                        return Err(Exclusion::PathOutsideAllowedDirs)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let p = normalized_buf.as_deref().unwrap_or_else(|| Path::new(path));
             // `has_root`, not `is_absolute`: on Windows `\Windows\x` or
             // `/etc/passwd` has no drive prefix, so it is not "absolute",
             // yet it names a location outside the project as surely as
@@ -521,7 +542,7 @@ impl CapturePolicy {
             {
                 return Err(Exclusion::PathOutsideAllowedDirs);
             }
-            let normalized = path.replace('\\', "/");
+            let normalized = p.to_string_lossy().replace('\\', "/");
             if self.excluded_globs.iter().any(|g| g.is_match(&normalized)) {
                 return Err(Exclusion::PathExcluded);
             }
