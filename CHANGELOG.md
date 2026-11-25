@@ -13,6 +13,10 @@ Milestone M1: durable event engine and observability foundation. TailFlow now
 keeps a local, private, queryable history and states explicitly when that
 history is incomplete.
 
+Milestone M2: agent capture and session tracking. With opt-in hooks, TailFlow
+records what Claude Code and Codex report doing — sessions, tool calls, shell
+commands, the files their tools read or edit — and says what it cannot see.
+
 ### Added
 
 - **Durable local history.** `tailflow-daemon` records runtime logs and
@@ -47,6 +51,39 @@ history is incomplete.
 - `Source::kind()` (default method) so persisted events record their collector
   family.
 
+- **Agent capture (M2).** `tailflow agent install|uninstall|status|list` for
+  Claude Code and Codex. Installs observe-only hooks into the agent's own
+  configuration (Claude Code `settings.json` at user, project or local scope;
+  Codex `hooks.json`, events chosen by the detected Codex version),
+  idempotently, preserving every other setting and hook, with a backup and an
+  atomic write. Uninstall removes only TailFlow's handlers.
+- **Hook bridge** `tailflow agent hook <agent>`: reads the hook input (bounded
+  to 8 MiB), normalizes it, applies the per-user agent capture policy
+  (`<data dir>/agents/config.toml`, same keys as `[privacy]`) and writes an
+  owner-only spool record. Prints nothing, always exits 0, never touches the
+  database or network; ~15 ms per call, nearly all process start.
+- **Normalized agent events**: `agent.session.*`, `agent.tool.*`,
+  `command.*`, `file.read|created|modified|deleted|renamed` (agent-reported,
+  never claimed as verified on disk), and new types `agent.subagent.started`,
+  `agent.subagent.stopped`, `agent.prompt.submitted` (character count only),
+  `agent.turn.completed`, `agent.turn.failed`, `agent.model.completed` (Codex
+  token counts). Source ids are namespaced (`claude-code:<id>`); ids derived
+  from tool-call identity deduplicate replays and duplicate registrations.
+- **Sessions**: `tailflow sessions`, `tailflow session <id> [--events]` (work
+  without a running daemon), `GET /api/v1/sessions`,
+  `GET /api/v1/sessions/{id}`, `GET /api/v1/agents/status`. Each session has a
+  derived status (`active`, `ended`, `unterminated`), lifecycle coverage,
+  recorded loss, retention truncation, the integration's capability limits,
+  and tool / command / failure / file summaries. Git branch and HEAD at start
+  and end come from `.git` files (no `git` process).
+- **Daemon spool ingestion**: an event-driven thread moves spooled agent
+  events into history (~0.2 s), deleting a record only after its events are
+  committed. `--agents` runs the daemon with no log sources (implied when an
+  integration is installed); `--no-agents` turns ingestion off.
+  `tailflow-daemon agent ingest` drains the spool once.
+- Gap reasons `agent_spool_overflow`, `agent_input_rejected`,
+  `agent_spool_corrupt`; `health.events_dropped.agent`.
+
 ### Changed
 
 - **Live output is redacted by default.** Redaction runs once at ingestion, so
@@ -79,6 +116,21 @@ history is incomplete.
   The dashboard re-renders only new rows.
 - **Minimum supported Rust version is now 1.89** (was 1.88), required by
   rusqlite 0.41 for the bundled SQLite security fix below.
+
+- **Storage schema v2**: adds the `agent_sessions` table and drops the
+  never-used `events_ts` index (5–8 % fewer WAL bytes per event). Migrates in
+  one transaction; schema-v1 builds refuse a v2 file without modifying it.
+- **Storage maintenance yields to ingestion**: retention stops early while the
+  storage queue is over a quarter full, and the full-text compaction is
+  postponed (or interrupted past half full) and retried; after 60 s of
+  deferral it runs regardless, so cleanup always progresses.
+  `health.maintenance` reports yields, deferrals and forced runs.
+- `[privacy] allowed_project_dirs` and `excluded_file_globs` now resolve `.`
+  and `..` before matching, so `/work/../etc/passwd` no longer passes an
+  allowlist of `/work`.
+- The per-user data-directory helpers moved from `tailflow-storage` to
+  `tailflow-core::paths` (re-exported from the old location).
+- The `tailflow` binary no longer starts its async runtime for subcommands.
 
 ### Fixed
 
@@ -130,6 +182,13 @@ history is incomplete.
 - `url` 2.5.9 (RUSTSEC-2026-0592; not reachable from TailFlow), `tokio`
   1.51.6, `rustix` 1.1.6 and `anyhow` 1.0.103 (unsoundness advisories).
   `cargo audit` reports no vulnerabilities.
+
+- Agent capture adds **no network listener and no HTTP write endpoint**: hook
+  processes hand events to the daemon through an owner-only spool directory.
+  Redaction and collection boundaries run in the hook before anything reaches
+  disk, and again in the daemon. Prompts, assistant messages, tool output and
+  file contents are never recorded; command lines only in `redacted`/`full`
+  capture mode.
 
 ## [0.3.3] - 2026-08-19
 

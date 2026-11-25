@@ -342,7 +342,7 @@ fn list(json: bool) -> Result<()> {
         println!();
     }
     println!("Never recorded by default: prompts, assistant messages, tool output, file contents,");
-    println!("command arguments (only the program name). See docs/privacy.md.");
+    println!("command arguments (only the program name). See docs/agent-capture.md#privacy.");
     Ok(())
 }
 

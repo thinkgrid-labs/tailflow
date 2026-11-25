@@ -35,6 +35,12 @@ interface availability, and the evidence each feature can and cannot provide.
 Reference for the four MCP tools, reliable agent workflow patterns, the
 `tailflow-logs` CLI, cursor behavior, and HTTP response shapes.
 
+### [Agent capture](agent-capture.md)
+
+Recording Claude Code and Codex sessions, tool calls, commands and file edits
+through opt-in hooks: setup, verification, exactly what each integration can
+and cannot see, privacy, loss behavior, and uninstalling.
+
 ### [Durable history, retention, and privacy](storage.md)
 
 Where history is stored, durability and completeness guarantees, retention and

@@ -13,11 +13,23 @@ Nothing leaves your machine, and no account or external database is involved.
 | Every runtime log line the daemon ingests | `runtime.log`, `runtime.warning`, `runtime.error` | `runtime_observed` |
 | Collector lifecycle (process, file, Docker, stdin sources) | `system.collector.started`, `.stopped`, `.error` | `system_observed` |
 | Detected loss of events | `system.events.dropped` | `system_observed` |
+| Coding-agent activity, when [agent capture](agent-capture.md) is installed | `agent.*`, `command.*`, `file.*` | `agent_reported` |
 
-The event schema also defines `agent.*`, `file.*`, `command.*`, and `git.*`
-types. **No collector produces them yet.** They exist so future integrations
-write into a stable contract; `GET /api/v1/schema` lists every type and whether
-it is collected in this version.
+`git.*` types are defined but not produced (sessions record Git branch and HEAD
+as attributes instead). `GET /api/v1/schema` lists every type and whether it is
+collected in this version.
+
+Agent sessions are summarized in their own table (`agent_sessions`, schema v2),
+maintained in the same transaction as each agent event, and served by
+`GET /api/v1/sessions` and `tailflow sessions`. A session row is removed when
+all of its events have expired or were purged; a session whose oldest events
+expired reports `retention_truncated`. New gap reasons for agent capture:
+`agent_spool_overflow`, `agent_input_rejected`, `agent_spool_corrupt`.
+
+**Schema v2** (this release) adds `agent_sessions` and drops the unused
+`events_ts` index. The upgrade runs in one transaction on first open. A build
+that only knows schema v1 refuses a v2 database and runs memory-only; it never
+modifies it.
 
 Every event carries a `provenance` value saying how it was obtained:
 `agent_reported`, `filesystem_observed`, `runtime_observed`, or
