@@ -60,6 +60,8 @@ pub struct Pipeline {
     pub run_key: String,
     /// Cancelled when the daemon starts shutting down.
     pub shutdown: CancellationToken,
+    /// Agent spool ingestion status (shared with the ingest thread).
+    pub agent_ingest: crate::agent_ingest::SharedStatus,
 }
 
 /// Loss and throughput at the live ingestion point. These cover the ring,
@@ -114,6 +116,7 @@ pub struct AppState {
     /// ends would keep the daemon — and the storage drain behind it — from
     /// ever stopping.
     pub shutdown: CancellationToken,
+    pub agent_ingest: crate::agent_ingest::SharedStatus,
     sources: Mutex<HashMap<String, RuntimeSource>>,
     collectors: Arc<Mutex<HashMap<String, CollectorCounters>>>,
 }
@@ -198,6 +201,7 @@ impl AppState {
                 storage: StorageSlot::Disabled,
                 run_key: "memory".into(),
                 shutdown: CancellationToken::new(),
+                agent_ingest: crate::agent_ingest::disabled("memory-only state"),
             },
         )
         .0
@@ -217,6 +221,7 @@ impl AppState {
             storage,
             run_key,
             shutdown,
+            agent_ingest,
         } = pipeline;
         let state = Arc::new(AppState {
             tx: tx.clone(),
@@ -225,6 +230,7 @@ impl AppState {
             policy: policy.clone(),
             ingest: Arc::new(IngestStats::default()),
             shutdown,
+            agent_ingest,
             sources: Mutex::new(HashMap::new()),
             collectors: Arc::new(Mutex::new(HashMap::new())),
         });

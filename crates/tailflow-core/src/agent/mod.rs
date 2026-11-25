@@ -383,7 +383,12 @@ impl<'a> EventBuilder<'a> {
             ),
             None => {
                 self.seq = self.seq.saturating_add(1);
-                format!("agent:{kind}:n:{}:{}", self.ctx.nonce, self.seq)
+                // The type is part of the id so two contexts that share a
+                // nonce (only possible in tests) still cannot collide.
+                format!(
+                    "agent:{kind}:n:{}:{event_type}:{}",
+                    self.ctx.nonce, self.seq
+                )
             }
         };
         let mut e = ObservabilityEvent::new(

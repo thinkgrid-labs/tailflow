@@ -1886,6 +1886,7 @@ dependencies = [
  "clap",
  "http-body-util",
  "mime_guess",
+ "notify",
  "rust-embed",
  "serde",
  "serde_json",

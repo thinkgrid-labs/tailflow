@@ -1,3 +1,4 @@
+mod agent_cli;
 mod app;
 mod init;
 mod ui;
@@ -44,16 +45,66 @@ struct Cli {
 enum Command {
     /// Detect local sources and create tailflow.toml
     Init(init::InitArgs),
+    /// Coding-agent integrations: install, uninstall, status, list
+    Agent {
+        #[command(subcommand)]
+        command: agent_cli::AgentCommand,
+    },
+    /// List recorded coding-agent sessions (runs `tailflow-daemon sessions`)
+    #[command(disable_help_flag = true)]
+    Sessions {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show one coding-agent session (runs `tailflow-daemon session`)
+    #[command(disable_help_flag = true)]
+    Session {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Run `tailflow-daemon <sub> <args>`: the session commands live in the
+/// daemon binary, which links the SQLite store; this binary does not, so
+/// that the agent hook bridge (which shares it) stays small.
+fn forward_to_daemon(sub: &str, args: &[String]) -> Result<()> {
+    let name = if cfg!(windows) {
+        "tailflow-daemon.exe"
+    } else {
+        "tailflow-daemon"
+    };
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| std::fs::canonicalize(e).ok())
+        .and_then(|e| e.parent().map(|d| d.join(name)))
+        .filter(|p| p.is_file());
+    let program = sibling.unwrap_or_else(|| PathBuf::from(name));
+    let status = std::process::Command::new(&program)
+        .arg(sub)
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run {}: {e}", program.display()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    if let Some(Command::Init(args)) = cli.command {
-        return init::run(args);
+    match cli.command {
+        Some(Command::Init(args)) => return init::run(args),
+        // The hook path must not start a runtime or threads: it runs once
+        // per agent tool call.
+        Some(Command::Agent { command }) => return agent_cli::run(command),
+        Some(Command::Sessions { args }) => return forward_to_daemon("sessions", &args),
+        Some(Command::Session { args }) => return forward_to_daemon("session", &args),
+        None => {}
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_tui(cli))
+}
 
+async fn run_tui(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)

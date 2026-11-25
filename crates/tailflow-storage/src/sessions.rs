@@ -328,8 +328,12 @@ fn status_of(r: &Row, now_us: i64) -> &'static str {
 }
 
 /// Gaps that overlap a session by seq range, or (for agent losses, which
-/// are anchored where they were *recorded*) by time.
-fn session_gaps(c: &Connection, r: &Row) -> Result<Vec<GapView>> {
+/// are anchored where they were *recorded* and usually cannot name a
+/// session) by time. A session that has not ended is charged with agent
+/// loss up to now: an unparseable hook call after its last event may well
+/// have been its own.
+fn session_gaps(c: &Connection, r: &Row, ended: bool, now_us: i64) -> Result<Vec<GapView>> {
+    let until = if ended { r.last_at } else { now_us };
     let mut stmt = c.prepare_cached(
         "SELECT reason, count, first_at, last_at, from_seq, to_seq FROM gaps
          WHERE reason != 'session_deleted' AND (
@@ -337,21 +341,18 @@ fn session_gaps(c: &Connection, r: &Row) -> Result<Vec<GapView>> {
           OR (reason LIKE 'agent_%' AND first_at <= ?4 AND last_at >= ?3))
          ORDER BY id LIMIT 20",
     )?;
-    let rows = stmt.query_map(
-        params![r.first_seq, r.last_seq, r.first_at, r.last_at],
-        |g| {
-            Ok(GapView {
-                reason: g.get(0)?,
-                count: g
-                    .get::<_, Option<i64>>(1)?
-                    .and_then(|n| u64::try_from(n).ok()),
-                first_at: DateTime::from_timestamp_micros(g.get(2)?),
-                last_at: DateTime::from_timestamp_micros(g.get(3)?),
-                from_seq: u(g.get(4)?),
-                to_seq: u(g.get(5)?),
-            })
-        },
-    )?;
+    let rows = stmt.query_map(params![r.first_seq, r.last_seq, r.first_at, until], |g| {
+        Ok(GapView {
+            reason: g.get(0)?,
+            count: g
+                .get::<_, Option<i64>>(1)?
+                .and_then(|n| u64::try_from(n).ok()),
+            first_at: DateTime::from_timestamp_micros(g.get(2)?),
+            last_at: DateTime::from_timestamp_micros(g.get(3)?),
+            from_seq: u(g.get(4)?),
+            to_seq: u(g.get(5)?),
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -360,7 +361,7 @@ fn view(c: &Connection, r: Row, evicted: i64, now_us: i64) -> Result<SessionView
     let start_observed = r.starts > 0;
     let end_observed = r.ends > 0 && status == "ended";
     let truncated = r.first_seq <= evicted;
-    let gaps = session_gaps(c, &r)?;
+    let gaps = session_gaps(c, &r, status == "ended", now_us)?;
     let mut reasons = Vec::new();
     if !start_observed {
         reasons.push("start_not_observed");

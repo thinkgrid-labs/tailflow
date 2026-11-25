@@ -1053,6 +1053,26 @@ pub mod admin {
         db_stats(&open(path)?, path)
     }
 
+    /// A historical query read directly from the file (no daemon needed).
+    ///
+    /// # Errors
+    /// Open failure, invalid query, or SQLite failure.
+    pub fn query(path: &Path, q: &crate::EventQuery) -> Result<crate::EventPage> {
+        let mut conn = schema::open_reader(path)?;
+        let fts_enabled = schema::meta_get(&conn, "fts_enabled")?.as_deref() == Some("1");
+        let fts_from_seq = if fts_enabled {
+            schema::meta_get_i64(&conn, "fts_from_seq")?.max(1)
+        } else {
+            i64::MAX
+        };
+        let ctx = crate::query::QueryContext {
+            fts_enabled,
+            fts_from_seq,
+            pending_loss: 0,
+        };
+        crate::query::execute(&mut conn, q, &ctx)
+    }
+
     /// Agent sessions, read directly from the file (no daemon needed).
     ///
     /// # Errors

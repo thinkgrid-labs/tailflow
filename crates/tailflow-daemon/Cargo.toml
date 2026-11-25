@@ -30,6 +30,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Agent spool watcher (same version as tailflow-core's file collector)
+notify = "7"
+
 
 # Embed the built web UI into the binary
 rust-embed = { version = "8", features = ["mime-guess"] }

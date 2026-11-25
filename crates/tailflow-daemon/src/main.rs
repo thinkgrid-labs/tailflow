@@ -1,5 +1,7 @@
+mod agent_ingest;
 mod api_v1;
 mod routes;
+mod session_cli;
 mod state;
 mod storage_cli;
 
@@ -77,6 +79,16 @@ struct Cli {
     /// SQLite database for durable history (overrides `[storage] path`)
     #[arg(long, value_name = "PATH", global = true)]
     db: Option<PathBuf>,
+
+    /// Run even without log sources, to record coding-agent activity only.
+    /// (Implied when an agent integration is installed.)
+    #[arg(long, conflicts_with = "no_agents")]
+    agents: bool,
+
+    /// Do not ingest coding-agent hook events (they stay in the spool for
+    /// another daemon or `tailflow-daemon agent ingest`)
+    #[arg(long)]
+    no_agents: bool,
 }
 
 #[derive(Subcommand)]
@@ -87,6 +99,22 @@ enum Command {
         #[command(subcommand)]
         action: storage_cli::StorageAction,
     },
+    /// List recorded coding-agent sessions (works without a running daemon)
+    Sessions(session_cli::SessionsArgs),
+    /// Show one coding-agent session: lifecycle, tools, commands, files,
+    /// failures, and what the integration cannot see
+    Session(session_cli::SessionArgs),
+    /// Agent capture maintenance
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Move spooled agent hook events into the database now
+    Ingest,
 }
 
 /// The loaded config plus the directory it came from (the project root).
@@ -205,8 +233,16 @@ async fn run() -> Result<()> {
         storage_cfg.path = Some(db.clone());
     }
 
-    if let Some(Command::Storage { action }) = cli.command {
-        return storage_cli::run(action, &storage_cfg);
+    match cli.command {
+        Some(Command::Storage { action }) => return storage_cli::run(action, &storage_cfg),
+        Some(Command::Sessions(args)) => {
+            return session_cli::list(args, &storage_cfg, &privacy_cfg)
+        }
+        Some(Command::Session(args)) => return session_cli::show(args, &storage_cfg, &privacy_cfg),
+        Some(Command::Agent {
+            action: AgentAction::Ingest,
+        }) => return session_cli::ingest_now(&storage_cfg, &privacy_cfg),
+        None => {}
     }
 
     if cli.no_storage {
@@ -240,8 +276,15 @@ async fn run() -> Result<()> {
         sources.push(Box::new(StdinSource::new("stdin")));
     }
 
-    if sources.is_empty() {
-        eprintln!("tailflow-daemon: no sources. Add a tailflow.toml or use --docker / --file.");
+    let integrations_installed = tailflow_core::paths::default_agents_dir()
+        .and_then(|d| tailflow_core::agent::install::IntegrationState::load(&d).ok())
+        .is_some_and(|s| !s.integrations.is_empty());
+    let agents_wanted = !cli.no_agents && storage_cfg.enabled;
+    if sources.is_empty() && !(agents_wanted && (cli.agents || integrations_installed)) {
+        eprintln!(
+            "tailflow-daemon: no sources. Add a tailflow.toml or use --docker / --file \
+             (or --agents to record coding-agent activity only)."
+        );
         std::process::exit(1);
     }
 
@@ -271,6 +314,58 @@ async fn run() -> Result<()> {
         filter
     };
     let shutdown = CancellationToken::new();
+    let (agent_status, agent_handle) = match (&storage_handle, agents_wanted) {
+        (Some(storage), true) => match tailflow_core::agent::spool::Spool::default_location() {
+            Some(spool) => {
+                let status = std::sync::Arc::new(std::sync::Mutex::new(
+                    agent_ingest::IngestStatus::default(),
+                ));
+                match agent_ingest::spawn(storage.clone(), spool, &shutdown, status.clone()) {
+                    Ok(h) => (status, Some(h)),
+                    Err(e) => {
+                        eprintln!("tailflow-daemon: agent capture unavailable: {e}");
+                        (
+                            agent_ingest::disabled(&format!("spool unavailable: {e}")),
+                            None,
+                        )
+                    }
+                }
+            }
+            None => (
+                agent_ingest::disabled("no home directory for the agent spool"),
+                None,
+            ),
+        },
+        (None, true) => (
+            agent_ingest::disabled("durable storage is not available"),
+            None,
+        ),
+        (_, false) => (
+            agent_ingest::disabled(if cli.no_agents {
+                "--no-agents"
+            } else {
+                "storage disabled"
+            }),
+            None,
+        ),
+    };
+    let agents_line = if agent_handle.is_some() {
+        format!(
+            "recording coding-agent hooks{}",
+            if integrations_installed {
+                ""
+            } else {
+                " (none installed: `tailflow agent install claude|codex`)"
+            }
+        )
+    } else {
+        agent_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .disabled_reason
+            .clone()
+            .map_or_else(|| "off".into(), |r| format!("off ({r})"))
+    };
     let (shared, fanout) = state::AppState::with_pipeline(
         rx,
         state::RingLimits {
@@ -285,6 +380,7 @@ async fn run() -> Result<()> {
             storage: storage_slot,
             run_key,
             shutdown: shutdown.clone(),
+            agent_ingest: agent_status,
         },
     );
 
@@ -328,6 +424,7 @@ async fn run() -> Result<()> {
     eprintln!("  agent API   http://{addr}/api/errors");
     eprintln!("  history     {storage_line}");
     eprintln!("  privacy     capture = {}", policy.mode.as_str());
+    eprintln!("  agents      {agents_line}");
 
     let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
@@ -340,6 +437,13 @@ async fn run() -> Result<()> {
         })
         .await?;
     shutdown.cancel();
+    // Agent ingestion stops first: its in-flight pass flushes into a storage
+    // that is still running, and unfinished claims go back to the spool.
+    if let Some(h) = agent_handle {
+        if tokio::task::spawn_blocking(move || h.stop()).await.is_err() {
+            tracing::warn!("agent ingest shutdown task failed");
+        }
+    }
     if tokio::time::timeout(Duration::from_secs(5), async move {
         for task in source_tasks {
             if let Err(error) = task.await {
