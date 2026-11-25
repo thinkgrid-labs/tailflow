@@ -263,7 +263,7 @@ def sc_agents(binary, n, rate, seconds):
         events = c.execute("SELECT count(*) FROM events WHERE source_type = 'agent_hook'").fetchone()[0]
         size = sum(os.path.getsize(db + x) for x in ("", "-wal") if os.path.exists(db + x))
         try:
-            fts = c.execute("SELECT sum(pgsize) FROM dbstat WHERE name LIKE 'events_fts%'").fetchone()[0]
+            fts = c.execute("SELECT coalesce(sum(length(block)), 0) FROM events_fts_data").fetchone()[0]
         except sqlite3.Error:
             fts = None
         sessions = c.execute("SELECT count(*), sum(event_count) FROM agent_sessions").fetchone()
