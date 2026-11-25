@@ -117,12 +117,44 @@ fn config_path(
     }
 }
 
-/// The binary hooks should run: this one, by its canonical path.
+/// The binary hooks should run: this one, by the path it was launched as.
+/// Deliberately *not* canonicalized: a package manager's stable link
+/// (`/opt/homebrew/bin/tailflow`) survives upgrades, while the versioned
+/// target it points to (`…/Cellar/tailflow/0.4.0/bin/tailflow`) does not.
 fn hook_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("cannot determine TailFlow's own path")?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    Ok(exe)
+    if exe.is_absolute() {
+        Ok(exe)
+    } else {
+        Ok(std::env::current_dir()?.join(exe))
+    }
 }
+
+/// `claude --version`, bounded to 5 s, as `(major, minor, patch)`.
+fn detect_claude_version() -> Option<(u32, u32, u32)> {
+    let mut child = std::process::Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() > deadline {
+            let _kill_best_effort = child.kill();
+            let _reap = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    tailflow_core::agent::codex::parse_version(&out)
+}
+
+/// Oldest Claude Code version validated end to end (exec-form hooks).
+const CLAUDE_TESTED: (u32, u32, u32) = (2, 1, 331);
 
 fn looks_ephemeral(p: &Path) -> bool {
     let s = p.to_string_lossy();
@@ -174,6 +206,28 @@ pub fn run(cmd: AgentCommand) -> Result<()> {
                         "Codex version not detected (is `codex` on PATH?): installing only the \
                          events every hooks-capable release supports. Pass --codex-version to get more."
                     ),
+                }
+            }
+            if kind == AgentKind::ClaudeCode {
+                match detect_claude_version() {
+                    Some(v) if v < CLAUDE_TESTED => println!(
+                        "warning: Claude Code {}.{}.{} is older than the validated {}.{}.{}; \
+                         versions without exec-form hooks (`args`) will not run TailFlow's hook",
+                        v.0, v.1, v.2, CLAUDE_TESTED.0, CLAUDE_TESTED.1, CLAUDE_TESTED.2
+                    ),
+                    Some(_) => {}
+                    None => println!(
+                        "note: `claude` is not on PATH (fine for the IDE extensions); TailFlow is \
+                         validated with Claude Code {}.{}.{}+",
+                        CLAUDE_TESTED.0, CLAUDE_TESTED.1, CLAUDE_TESTED.2
+                    ),
+                }
+                if matches!(scope, Scope::Project) {
+                    println!(
+                        "warning: .claude/settings.json is shared through git, and the hook path \
+                         below is specific to this machine. Prefer --scope local unless every \
+                         teammate has TailFlow at the same path."
+                    );
                 }
             }
             let events = install::events_for(kind, version);
@@ -437,6 +491,11 @@ fn status(json: bool) -> Result<()> {
                 println!(
                     "             warning: duplicated handlers for {}",
                     i.duplicated.join(", ")
+                );
+            }
+            for b in &i.missing_binaries {
+                println!(
+                    "             ERROR: hook binary {b} does not exist; the hooks cannot run. Re-run install."
                 );
             }
             if i.hooks_disabled {

@@ -239,8 +239,23 @@ impl Spool {
         &self.dir
     }
 
+    /// Create the directory owner-only, and refuse one that others can
+    /// write to (a pre-created or shared `TAILFLOW_DATA_DIR`): a writable
+    /// spool would let another user plant records or symlinks.
     fn ensure(&self) -> io::Result<()> {
-        crate::paths::create_private_dir(&self.dir)
+        crate::paths::create_private_dir(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::symlink_metadata(&self.dir)?;
+            if !meta.is_dir() || meta.permissions().mode() & 0o022 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "agent spool directory is not an owner-only directory",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Write a record. Never blocks on another process except for the brief
@@ -256,10 +271,21 @@ impl Spool {
         self.ensure()?;
         let bytes = serde_json::to_vec(rec).map_err(|e| SpoolError::Corrupt(e.to_string()))?;
         let nonce = super::unique_nonce();
-        let full = bytes.len() > MAX_RECORD_BYTES || self.dir.join(FULL_MARKER).exists() || {
-            let sampled = super::fnv1a64(nonce.as_bytes(), 0) % COUNT_EVERY == 0;
+        let sampled = super::fnv1a64(nonce.as_bytes(), 0).is_multiple_of(COUNT_EVERY);
+        let marker = self.dir.join(FULL_MARKER);
+        let full = if bytes.len() > MAX_RECORD_BYTES {
+            true
+        } else if marker.exists() {
+            // Re-check on the sampled calls too, so a spool emptied by hand
+            // (or by an ingestor that crashed before clearing the marker)
+            // starts accepting records again.
+            !(sampled && self.count_pending(MAX_SPOOL_FILES)? < MAX_SPOOL_FILES && {
+                let _marker_best_effort = fs::remove_file(&marker);
+                true
+            })
+        } else {
             sampled && self.count_pending(MAX_SPOOL_FILES)? >= MAX_SPOOL_FILES && {
-                let _marker_best_effort = write_private(&self.dir.join(FULL_MARKER), b"");
+                let _marker_best_effort = write_private(&marker, b"");
                 true
             }
         };
@@ -305,7 +331,9 @@ impl Spool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            // Never follow a planted symlink: the counter is truncated on
+            // every update.
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         opts.open(self.dir.join(OVERFLOW_FILE))
     }
@@ -374,6 +402,104 @@ impl Spool {
         Ok(())
     }
 
+    /// The overflow counter without resetting it.
+    ///
+    /// # Errors
+    /// The counter file cannot be opened or locked.
+    pub fn peek_overflow(&self) -> io::Result<Option<Overflow>> {
+        if !self.dir.join(OVERFLOW_FILE).exists() {
+            return Ok(None);
+        }
+        let mut f = self.open_overflow()?;
+        f.lock()?;
+        let o = Self::read_overflow(&mut f);
+        let _unlock = f.unlock();
+        Ok((o.count > 0).then_some(o))
+    }
+
+    /// Subtract `n` recorded losses from the counter (after the gap that
+    /// records them was committed). Losses counted since the peek remain.
+    ///
+    /// # Errors
+    /// The counter file cannot be opened or locked.
+    pub fn consume_overflow(&self, n: u64) -> io::Result<()> {
+        let mut f = self.open_overflow()?;
+        f.lock()?;
+        let mut o = Self::read_overflow(&mut f);
+        o.count = o.count.saturating_sub(n);
+        if o.count == 0 {
+            o = Overflow::default();
+        }
+        let r = Self::store_overflow(&mut f, &o);
+        let _unlock = f.unlock();
+        r
+    }
+
+    /// Replace a claimed record's contents atomically (temp file + rename
+    /// in the same directory).
+    ///
+    /// # Errors
+    /// Serialization or I/O failure (the original is left in place).
+    pub fn rewrite(path: &Path, rec: &SpoolRecord) -> Result<(), SpoolError> {
+        let bytes = serde_json::to_vec(rec).map_err(|e| SpoolError::Corrupt(e.to_string()))?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let tmp = dir.join(format!(".tmp-rewrite-{}", super::unique_nonce()));
+        if let Err(e) = write_private(&tmp, &bytes) {
+            let _cleanup = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        fs::rename(&tmp, path).map_err(|e| {
+            let _cleanup = fs::remove_file(&tmp);
+            SpoolError::Io(e)
+        })
+    }
+
+    /// Move an unusable claimed record to `quarantine/` (kept for
+    /// inspection, never ingested). Removes it if it cannot be moved.
+    ///
+    /// # Errors
+    /// Neither moving nor removing worked.
+    pub fn quarantine(&self, path: &Path) -> io::Result<()> {
+        let q = self.dir.join("quarantine");
+        crate::paths::create_private_dir(&q)?;
+        let name = path.file_name().unwrap_or_default();
+        if fs::rename(path, q.join(name)).is_ok() {
+            return Ok(());
+        }
+        fs::remove_file(path)
+    }
+
+    /// Remove `.tmp-*` files older than `older_than` (left by a hook that
+    /// died between write and rename).
+    ///
+    /// # Errors
+    /// The directory cannot be read.
+    pub fn clean_temp_files(&self, older_than: Duration) -> io::Result<usize> {
+        let rd = match fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let now = SystemTime::now();
+        let mut n = 0usize;
+        for entry in rd.flatten() {
+            let is_tmp = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with(".tmp-"));
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= older_than);
+            if is_tmp && old && fs::remove_file(entry.path()).is_ok() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Take (and reset) the overflow counter. The caller must record it.
     ///
     /// # Errors
@@ -426,6 +552,9 @@ impl Spool {
         let mut names: Vec<String> = Vec::new();
         for entry in rd {
             let entry = entry?;
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue; // directories, symlinks, FIFOs named *.json
+            }
             if let Some(n) = entry.file_name().to_str().filter(|n| is_record(n)) {
                 names.push(n.to_string());
                 // Bound memory for a huge spool: keep a window, sort later.
@@ -773,6 +902,58 @@ mod tests {
             s.write(&record(1)).unwrap(),
             WriteOutcome::Written(_)
         ));
+    }
+
+    #[test]
+    fn overflow_is_consumed_only_by_what_was_recorded() {
+        let (_t, s) = spool();
+        let now = Utc::now();
+        s.add_overflow(4, now).unwrap();
+        let seen = s.peek_overflow().unwrap().unwrap();
+        s.add_overflow(1, now).unwrap(); // lost while the gap was being written
+        s.consume_overflow(seen.count).unwrap();
+        assert_eq!(
+            s.peek_overflow().unwrap().unwrap().count,
+            1,
+            "later loss is kept"
+        );
+    }
+
+    #[test]
+    fn rewrite_quarantine_and_temp_cleanup() {
+        let (_t, s) = spool();
+        let WriteOutcome::Written(p) = s.write(&record(2)).unwrap() else {
+            panic!()
+        };
+        let mut rec = Spool::read(&p).unwrap();
+        rec.events.truncate(1);
+        Spool::rewrite(&p, &rec).unwrap();
+        assert_eq!(Spool::read(&p).unwrap().events.len(), 1);
+        s.quarantine(&p).unwrap();
+        assert!(s.pending(10).unwrap().is_empty());
+        assert!(s
+            .dir()
+            .join("quarantine")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+        fs::write(s.dir().join(".tmp-dead"), b"x").unwrap();
+        assert_eq!(s.clean_temp_files(Duration::from_secs(3600)).unwrap(), 0);
+        assert_eq!(s.clean_temp_files(Duration::ZERO).unwrap(), 1);
+        // A directory named like a record is never listed.
+        fs::create_dir(s.dir().join("0-claude-code-dir.json")).unwrap();
+        assert!(s.pending(10).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_spool_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, s) = spool();
+        s.ensure().unwrap();
+        fs::set_permissions(s.dir(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(s.write(&record(1)).is_err());
     }
 
     #[test]

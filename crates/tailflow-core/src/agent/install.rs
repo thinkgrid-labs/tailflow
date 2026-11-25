@@ -185,40 +185,86 @@ fn desired_handler(kind: AgentKind, exe: &Path, event: &str) -> Value {
 }
 
 fn is_tailflow_exe(s: &str) -> bool {
-    let s = s.trim().trim_matches(|c| c == '\'' || c == '"');
     let base = s.rsplit(['/', '\\']).next().unwrap_or(s);
-    let stem = base.strip_suffix(".exe").unwrap_or(base);
-    stem == "tailflow"
+    let lower = base.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower) == "tailflow"
+}
+
+/// Split the first shell word off `s`: a bare word, or one built from
+/// `'…'` / `"…"` segments (and the `'\''` sequence `sh_quote` emits).
+/// Returns `(word, rest)`; `None` for unbalanced quotes or a word that
+/// contains shell metacharacters outside quotes.
+fn first_shell_word(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    let mut word = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(i, c)) = chars.peek() {
+        match c {
+            '\'' | '"' => {
+                chars.next();
+                let mut closed = false;
+                for (_, d) in chars.by_ref() {
+                    if d == c {
+                        closed = true;
+                        break;
+                    }
+                    word.push(d);
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '\\' if s.get(i + 1..i + 2) == Some("'") => {
+                chars.next();
+                chars.next();
+                word.push('\'');
+            }
+            c if c.is_whitespace() => return Some((word, s.get(i..).unwrap_or(""))),
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' | '$' | '`' | '=' => return None,
+            _ => {
+                chars.next();
+                word.push(c);
+            }
+        }
+    }
+    Some((word, ""))
+}
+
+/// The executable a TailFlow handler for `kind` runs, if `h` is one.
+///
+/// Recognized shapes only: `{"type":"command","command":"<…/tailflow>",
+/// "args":["agent","hook",<agent>]}` (exec form), or a `command` that is a
+/// single, possibly quoted, `tailflow` executable followed by exactly
+/// `agent hook <agent>` (shell form). A user's wrapper (`env X=1 tailflow …`,
+/// `log.sh && tailflow …`) is *not* TailFlow's and is never edited.
+pub fn owned_handler_exe(kind: AgentKind, h: &Value) -> Option<String> {
+    let obj = h.as_object()?;
+    if obj.get("type").and_then(Value::as_str) != Some("command") {
+        return None;
+    }
+    let command = obj.get("command").and_then(Value::as_str)?;
+    if let Some(args) = obj.get("args").and_then(Value::as_array) {
+        let args: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
+        let ok = args.len() == 3
+            && args.first() == Some(&"agent")
+            && args.get(1) == Some(&"hook")
+            && args.get(2).and_then(|a| AgentKind::parse(a)) == Some(kind)
+            && is_tailflow_exe(command);
+        return ok.then(|| command.to_string());
+    }
+    let (exe, rest) = first_shell_word(command)?;
+    let rest: Vec<&str> = rest.split_whitespace().collect();
+    let ok = rest.len() == 3
+        && rest.first() == Some(&"agent")
+        && rest.get(1) == Some(&"hook")
+        && rest.get(2).and_then(|a| AgentKind::parse(a)) == Some(kind)
+        && is_tailflow_exe(&exe);
+    ok.then_some(exe)
 }
 
 /// Whether `h` is a TailFlow handler for `kind` (any version, any path).
 pub fn is_owned_handler(kind: AgentKind, h: &Value) -> bool {
-    let Some(obj) = h.as_object() else {
-        return false;
-    };
-    let command = obj.get("command").and_then(Value::as_str).unwrap_or("");
-    if let Some(args) = obj.get("args").and_then(Value::as_array) {
-        let args: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
-        if args.len() == 3
-            && args[0] == "agent"
-            && args[1] == "hook"
-            && AgentKind::parse(args[2]) == Some(kind)
-            && is_tailflow_exe(command)
-        {
-            return true;
-        }
-    }
-    // Shell form: `<exe> agent hook <agent>`.
-    let words: Vec<&str> = command.split_whitespace().collect();
-    if words.len() >= 4 {
-        let n = words.len();
-        let exe = words[..n - 3].join(" ");
-        return words[n - 3] == "agent"
-            && words[n - 2] == "hook"
-            && AgentKind::parse(words[n - 1]) == Some(kind)
-            && is_tailflow_exe(&exe);
-    }
-    false
+    owned_handler_exe(kind, h).is_some()
 }
 
 /// The hook events TailFlow registers for `kind`. For Codex, only events
@@ -600,6 +646,9 @@ pub struct Inspection {
     pub duplicated: Vec<String>,
     /// Handlers pointing at a different TailFlow binary than this one.
     pub other_binary: Vec<String>,
+    /// Handler executables that do not exist (moved, upgraded away): these
+    /// hooks fail to start and nothing is recorded.
+    pub missing_binaries: Vec<String>,
     /// `disableAllHooks: true` in this file.
     pub hooks_disabled: bool,
     pub error: Option<String>,
@@ -649,6 +698,13 @@ pub fn inspect(kind: AgentKind, path: &Path, exe: &Path, events: &[&str]) -> Ins
                     .any(|h| **h != desired_handler(kind, exe, event))
                 {
                     out.other_binary.push((*event).to_string());
+                }
+                for h in &owned {
+                    if let Some(bin) = owned_handler_exe(kind, h) {
+                        if !Path::new(&bin).exists() && !out.missing_binaries.contains(&bin) {
+                            out.missing_binaries.push(bin);
+                        }
+                    }
                 }
             }
         }
@@ -978,6 +1034,48 @@ mod tests {
             AgentKind::Codex,
             &json!({"type":"command","command":"\"C:\\T F\\tailflow.exe\" agent hook codex"})
         ));
+    }
+
+    #[test]
+    fn user_wrappers_around_tailflow_are_not_owned() {
+        for cmd in [
+            "TAILFLOW_DATA_DIR=/x /usr/bin/tailflow agent hook codex",
+            "log.sh && ~/bin/tailflow agent hook codex",
+            "/usr/bin/tailflow agent hook codex --extra",
+            "'/a b/tailflow agent hook codex",
+            "$(which tailflow) agent hook codex",
+        ] {
+            let h = json!({"type":"command","command":cmd});
+            assert!(!is_owned_handler(AgentKind::Codex, &h), "{cmd}");
+        }
+        assert!(!is_owned_handler(
+            AgentKind::Codex,
+            &json!({"type":"http","command":"tailflow agent hook codex"})
+        ));
+        let quoted = json!({"type":"command","command":sh_quote("/it's here/tailflow") + " agent hook codex"});
+        assert_eq!(
+            owned_handler_exe(AgentKind::Codex, &quoted).as_deref(),
+            Some("/it's here/tailflow")
+        );
+        let upper = json!({"type":"command","command":"C:\\T\\TailFlow.EXE","args":["agent","hook","claude"]});
+        assert!(
+            is_owned_handler(AgentKind::ClaudeCode, &upper),
+            "case-insensitive .exe"
+        );
+    }
+
+    #[test]
+    fn a_missing_hook_binary_is_reported() {
+        let (_t, p) = file(existing());
+        let plan = plan_install(
+            AgentKind::ClaudeCode,
+            &p,
+            Path::new("/nonexistent/tailflow"),
+            &["Stop"],
+        );
+        apply(&plan.unwrap()).unwrap();
+        let ins = inspect(AgentKind::ClaudeCode, &p, &exe(), &["Stop"]);
+        assert_eq!(ins.missing_binaries, ["/nonexistent/tailflow"]);
     }
 
     #[test]

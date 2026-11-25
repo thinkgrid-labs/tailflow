@@ -256,6 +256,28 @@ mod tests {
             .all(|r| r.events.is_empty() && !r.rejected.is_empty()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_spool_fails_quietly() {
+        use std::os::unix::fs::PermissionsExt;
+        let (t, _, p) = setup();
+        let dir = t.path().join("ro");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root (e.g. a Docker CI container) can write anyway: probe first.
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            return;
+        }
+        let spool = Spool::at(dir.join("spool"));
+        let ok = r#"{"hook_event_name":"Stop","session_id":"s"}"#;
+        let r = run(AgentKind::ClaudeCode, &mut ok.as_bytes(), Ok(&p), &spool);
+        assert!(
+            r.outcome.is_err(),
+            "reported to the caller (which still exits 0)"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn ignored_events_write_nothing() {
         let (_t, s, p) = setup();

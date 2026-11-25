@@ -41,6 +41,11 @@ pub struct GitInfo {
 }
 
 fn read_small(path: &Path, cap: u64) -> Option<String> {
+    // Regular files only: opening a FIFO planted in an extracted tree would
+    // block the hook until the agent's timeout.
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let f = fs::File::open(path).ok()?;
     let mut s = String::new();
     f.take(cap.saturating_add(1)).read_to_string(&mut s).ok()?;

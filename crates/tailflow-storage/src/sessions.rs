@@ -69,8 +69,8 @@ pub(crate) fn upsert(c: &Connection, e: &ObservabilityEvent, seq: i64, ts: i64) 
             ?11, ?12, ?13, ?14, ?15, ?16, ?17,
             ?18, ?19, ?20, CASE WHEN ?7 THEN ?21 END, CASE WHEN ?9 THEN ?21 END, ?22, ?23)
          ON CONFLICT(session_key) DO UPDATE SET
-            project_id = coalesce(CASE WHEN excluded.git_root IS NOT NULL THEN excluded.project_id END,
-                                  project_id, excluded.project_id),
+            project_id = CASE WHEN excluded.git_root IS NOT NULL AND excluded.first_event_at >= max(coalesce(last_started_at, -1), coalesce(ended_at, -1))
+                              THEN excluded.project_id ELSE coalesce(project_id, excluded.project_id) END,
             working_directory = coalesce(working_directory, excluded.working_directory),
             first_seq = min(first_seq, excluded.first_seq),
             last_seq = max(last_seq, excluded.last_seq),
@@ -98,13 +98,23 @@ pub(crate) fn upsert(c: &Connection, e: &ObservabilityEvent, seq: i64, ts: i64) 
             subagents = subagents + excluded.subagents,
             turns = turns + excluded.turns,
             tokens_total = CASE WHEN excluded.tokens_total IS NULL THEN tokens_total
+                                WHEN coalesce(tokens_total, 0) > 9223372036854775807 - excluded.tokens_total
+                                THEN 9223372036854775807
                                 ELSE coalesce(tokens_total, 0) + excluded.tokens_total END,
-            git_root = coalesce(excluded.git_root, git_root),
-            git_branch = coalesce(excluded.git_branch, git_branch),
-            git_head_start = coalesce(git_head_start, excluded.git_head_start),
-            git_head_end = coalesce(excluded.git_head_end, git_head_end),
-            git_worktree = coalesce(excluded.git_worktree, git_worktree),
-            model = coalesce(excluded.model, model)",
+            git_root = CASE WHEN excluded.git_root IS NOT NULL AND excluded.first_event_at >= max(coalesce(last_started_at, -1), coalesce(ended_at, -1))
+                            THEN excluded.git_root ELSE coalesce(git_root, excluded.git_root) END,
+            git_branch = CASE WHEN excluded.git_root IS NOT NULL AND excluded.first_event_at >= max(coalesce(last_started_at, -1), coalesce(ended_at, -1))
+                              THEN excluded.git_branch ELSE coalesce(git_branch, excluded.git_branch) END,
+            git_worktree = CASE WHEN excluded.git_root IS NOT NULL AND excluded.first_event_at >= max(coalesce(last_started_at, -1), coalesce(ended_at, -1))
+                                THEN excluded.git_worktree ELSE coalesce(git_worktree, excluded.git_worktree) END,
+            git_head_start = CASE WHEN excluded.git_head_start IS NOT NULL
+                                   AND (started_at IS NULL OR excluded.started_at <= started_at)
+                                  THEN excluded.git_head_start ELSE git_head_start END,
+            git_head_end = CASE WHEN excluded.git_head_end IS NOT NULL
+                                 AND (ended_at IS NULL OR excluded.ended_at >= ended_at)
+                                THEN excluded.git_head_end ELSE git_head_end END,
+            model = CASE WHEN excluded.model IS NOT NULL AND excluded.first_event_at >= last_event_at
+                         THEN excluded.model ELSE coalesce(model, excluded.model) END",
     )?;
     stmt.execute(params![
         key,

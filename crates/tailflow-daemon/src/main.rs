@@ -315,6 +315,12 @@ async fn run() -> Result<()> {
     };
     let shutdown = CancellationToken::new();
     let (agent_status, agent_handle) = match (&storage_handle, agents_wanted) {
+        (Some(storage), true) if !agent_ingest::is_default_store(storage.path()) => (
+            agent_ingest::disabled(
+                "custom database; agent events are ingested only into the default per-user database",
+            ),
+            None,
+        ),
         (Some(storage), true) => match tailflow_core::agent::spool::Spool::default_location() {
             Some(spool) => {
                 let status = std::sync::Arc::new(std::sync::Mutex::new(
@@ -440,8 +446,13 @@ async fn run() -> Result<()> {
     // Agent ingestion stops first: its in-flight pass flushes into a storage
     // that is still running, and unfinished claims go back to the spool.
     if let Some(h) = agent_handle {
-        if tokio::task::spawn_blocking(move || h.stop()).await.is_err() {
-            tracing::warn!("agent ingest shutdown task failed");
+        // Bounded: a pass stops after its current event; anything still
+        // claimed is replayed later (deduplicated), never lost.
+        let stopping = tokio::task::spawn_blocking(move || h.stop());
+        match tokio::time::timeout(Duration::from_secs(10), stopping).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => tracing::warn!("agent ingest shutdown task failed"),
+            Err(_) => tracing::warn!("agent ingest did not stop within 10 s; continuing"),
         }
     }
     if tokio::time::timeout(Duration::from_secs(5), async move {

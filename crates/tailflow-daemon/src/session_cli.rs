@@ -66,6 +66,10 @@ pub fn ingest(cfg: &StorageConfig, privacy: &PrivacyConfig) -> Result<Option<Str
     let Some(spool) = Spool::default_location() else {
         return Ok(None);
     };
+    if !crate::agent_ingest::is_default_store(&tailflow_storage::resolve_path(cfg)?) {
+        // Agent events belong to the default per-user database only.
+        return Ok(None);
+    }
     let stats = spool.stats();
     if stats.pending_files == 0 && stats.overflow.count == 0 && stats.claimed_files == 0 {
         return Ok(None);

@@ -148,6 +148,11 @@ pub fn normalize(input: &Value, ctx: &HookContext) -> Result<Normalized, Adapter
     let subagent_type = safe_token(obj.get("agent_type"), 128);
 
     let mut out = Normalized::default();
+    if subagent.is_some() && matches!(hook.as_str(), "SessionStart" | "SessionEnd") {
+        // Never let a subagent's lifecycle start or end the parent session.
+        out.ignored = Some(format!("{hook} from subagent is not a session boundary"));
+        return Ok(out);
+    }
     match hook.as_str() {
         "SessionStart" => {
             let mut e = b.event("agent.session.started", None);
@@ -536,7 +541,10 @@ mod tests {
             "duplicate delivery of one tool call deduplicates"
         );
         assert_eq!(types(&a), ["agent.tool.completed", "file.read"]);
-        assert_eq!(a.events[1].path.as_deref(), Some("/w/a.rs"));
+        assert_eq!(
+            a.events[1].path.as_deref().map(Path::new),
+            Some(Path::new("/w/a.rs"))
+        );
     }
 
     #[test]
@@ -562,8 +570,8 @@ mod tests {
             "create_or_update"
         );
         assert_eq!(
-            unknown.events[1].path.as_deref(),
-            Some("/w/x.txt"),
+            unknown.events[1].path.as_deref().map(Path::new),
+            Some(Path::new("/w/x.txt")),
             "relative to cwd"
         );
         assert!(!serde_json::to_string(&unknown.events)
@@ -609,6 +617,37 @@ mod tests {
             "prompt_input_exit"
         );
         assert_eq!(end.events[0].path, None, "no cwd, no path");
+    }
+
+    #[test]
+    fn concurrent_subagents_keep_their_own_tool_calls() {
+        let call = |agent: &str, id: &str| {
+            run(
+                json!({"hook_event_name":"PostToolUse","session_id":SID,"cwd":"/w",
+                "agent_id":agent,"agent_type":"Explore","tool_name":"Grep","tool_use_id":id,"tool_input":{}}),
+            )
+        };
+        // Interleaved calls from two subagents and the main agent.
+        let a1 = call("sub-a", "ta1");
+        let b1 = call("sub-b", "tb1");
+        let main = run(
+            json!({"hook_event_name":"PostToolUse","session_id":SID,"cwd":"/w",
+            "tool_name":"Read","tool_use_id":"tm","tool_input":{"file_path":"x"}}),
+        );
+        let a2 = call("sub-a", "ta2");
+        let parent = |n: &Normalized| n.events[0].parent_operation_id.clone();
+        assert_eq!(parent(&a1).as_deref(), Some("subagent:sub-a"));
+        assert_eq!(parent(&a2).as_deref(), Some("subagent:sub-a"));
+        assert_eq!(parent(&b1).as_deref(), Some("subagent:sub-b"));
+        assert_eq!(
+            parent(&main),
+            None,
+            "the main agent's call belongs to no subagent"
+        );
+        assert_eq!(
+            a1.events[0].session_id, b1.events[0].session_id,
+            "one session"
+        );
     }
 
     #[test]

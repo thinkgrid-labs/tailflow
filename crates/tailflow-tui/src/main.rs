@@ -88,7 +88,19 @@ fn forward_to_daemon(sub: &str, args: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // On the hook path a usage error must still exit 0: exit 2 means
+            // "block this action" to both Claude Code and Codex (reachable
+            // through version skew between the config and the binary).
+            let argv: Vec<String> = std::env::args().collect();
+            if argv.windows(2).any(|w| w[0] == "agent" && w[1] == "hook") {
+                std::process::exit(0);
+            }
+            e.exit()
+        }
+    };
     match cli.command {
         Some(Command::Init(args)) => return init::run(args),
         // The hook path must not start a runtime or threads: it runs once

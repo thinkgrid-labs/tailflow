@@ -1193,7 +1193,15 @@ pub mod admin {
                 None,
                 None,
             )?;
-            Ok(Some((c.last_insert_rowid(), hi)))
+            let gap = c.last_insert_rowid();
+            // The summary goes in the same transaction as the gap: an
+            // interrupted purge can leave some of the session's events, but
+            // never a summary that still counts the deleted ones.
+            c.execute(
+                "DELETE FROM agent_sessions WHERE session_key = ?1",
+                [session],
+            )?;
+            Ok(Some((gap, hi)))
         })?;
         let Some((gap_id, hi)) = first else {
             conn.execute(
@@ -1232,10 +1240,6 @@ pub mod admin {
             }
             total += n;
         }
-        conn.execute(
-            "DELETE FROM agent_sessions WHERE session_key = ?1",
-            [session],
-        )?;
         Ok(total)
     }
 }

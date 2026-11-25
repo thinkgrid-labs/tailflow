@@ -170,6 +170,13 @@ pub fn normalize(input: &Value, ctx: &HookContext) -> Result<Normalized, Adapter
     let model = safe_token(obj.get("model"), 128);
 
     let mut out = Normalized::default();
+    if subagent.is_some() && matches!(hook.as_str(), "SessionStart" | "SessionEnd") {
+        // A subagent's own lifecycle reported under the parent's session id
+        // must not start or end the parent session; SubagentStart/Stop
+        // record the subagent.
+        out.ignored = Some(format!("{hook} from subagent is not a session boundary"));
+        return Ok(out);
+    }
     match hook.as_str() {
         "SessionStart" => {
             let mut e = b.event("agent.session.started", None);
@@ -283,18 +290,20 @@ fn model_request(
 ) {
     let request = safe_source_id(obj.get("request_id"));
     let attempt = obj.get("attempt_number").and_then(Value::as_u64);
-    let status = obj.get("status").and_then(Value::as_str);
+    let status = safe_token(obj.get("status"), 32);
     let derived = request.map(|r| format!("model:{r}:{}", attempt.unwrap_or(0)));
     let mut e = b.event("agent.model.completed", derived);
     e.parent_operation_id = subagent
         .map(|a| format!("subagent:{a}"))
         .or_else(|| turn.map(|t| format!("turn:{t}")));
-    let (st, sev) = match status {
-        Some("completed") => (EventStatus::Succeeded, LogLevel::Info),
-        Some("cancelled") => (EventStatus::Cancelled, LogLevel::Warn),
-        _ => (EventStatus::Failed, LogLevel::Error),
+    let (st, sev) = match status.as_deref() {
+        Some("completed") => (Some(EventStatus::Succeeded), LogLevel::Info),
+        Some("cancelled") => (Some(EventStatus::Cancelled), LogLevel::Warn),
+        Some("failed") => (Some(EventStatus::Failed), LogLevel::Error),
+        // Missing or unknown: no outcome is claimed.
+        _ => (None, LogLevel::Info),
     };
-    e.status = Some(st);
+    e.status = st;
     e.severity = sev;
     put(&mut e.attributes, "model.name", model.clone());
     put(
@@ -319,7 +328,11 @@ fn model_request(
             ("reasoning_output_tokens", "tokens.reasoning_output"),
             ("total_tokens", "tokens.total"),
         ] {
-            let v = usage.get(src).and_then(Value::as_u64);
+            // Clamped: a sum of hostile values must stay an SQLite integer.
+            let v = usage
+                .get(src)
+                .and_then(Value::as_u64)
+                .map(|n| n.min(1_000_000_000_000));
             if src == "total_tokens" {
                 total = v;
             }
@@ -335,9 +348,9 @@ fn model_request(
     e.message = Some(match total {
         Some(t) => format!(
             "model request {} ({t} tokens)",
-            status.unwrap_or("finished")
+            status.as_deref().unwrap_or("finished")
         ),
-        None => format!("model request {}", status.unwrap_or("finished")),
+        None => format!("model request {}", status.as_deref().unwrap_or("finished")),
     });
     out.events.push(e);
 }
@@ -400,12 +413,16 @@ fn tool_events(
     );
     e.operation_id.clone_from(&tool_op);
     e.parent_operation_id.clone_from(&parent);
-    // "completed" = the call returned output; Codex reports no tool failure.
-    e.status = Some(if post {
-        EventStatus::Succeeded
+    // A returned call has no reported outcome: Codex has no failure hook and
+    // runs PostToolUse after failed commands too.
+    e.status = if post {
+        None
     } else {
-        EventStatus::Started
-    });
+        Some(EventStatus::Started)
+    };
+    if post {
+        put(&mut e.attributes, "tool.outcome", Some("not_reported"));
+    }
     e.message = Some(format!(
         "{tool} {}",
         if post { "returned" } else { "started" }
@@ -602,10 +619,15 @@ mod tests {
                 "file.deleted"
             ]
         );
-        assert_eq!(n.events[2].path.as_deref(), Some("/w/p/src/moved.rs"));
         assert_eq!(
-            n.events[2].attributes["file.renamed_from"],
-            "/w/p/src/old.rs"
+            n.events[2].path.as_deref().map(Path::new),
+            Some(Path::new("/w/p/src/moved.rs"))
+        );
+        assert_eq!(
+            n.events[2].attributes["file.renamed_from"]
+                .as_str()
+                .map(Path::new),
+            Some(Path::new("/w/p/src/old.rs"))
         );
         assert!(!serde_json::to_string(&n.events).unwrap().contains("fn x()"));
         let pre = run(
@@ -674,6 +696,41 @@ mod tests {
         assert_eq!(sa.events[0].parent_operation_id.as_deref(), Some("turn:t9"));
         let e = run(json!({"hook_event_name":"SessionEnd","session_id":"s","reason":"other"}));
         assert_eq!(e.events[0].session_id.as_deref(), Some("codex:s"));
+    }
+
+    #[test]
+    fn unreported_outcomes_are_not_invented() {
+        let post = run(
+            json!({"hook_event_name":"PostToolUse","session_id":"s","cwd":"/w",
+            "tool_name":"Bash","tool_use_id":"c","tool_input":{"command":"false"},"tool_response":"x"}),
+        );
+        assert_eq!(
+            post.events[0].status, None,
+            "PostToolUse runs after failures too"
+        );
+        assert_eq!(post.events[0].attributes["tool.outcome"], "not_reported");
+        let m = run(
+            json!({"hook_event_name":"PostModelRequest","session_id":"s","cwd":"/w",
+            "request_id":"r","status":"weird status; DROP","token_usage":null}),
+        );
+        assert_eq!(m.events[0].status, None);
+        assert!(!m.events[0].message.as_deref().unwrap().contains("DROP"));
+        let big = run(
+            json!({"hook_event_name":"PostModelRequest","session_id":"s","cwd":"/w",
+            "request_id":"r2","status":"completed","token_usage":{"total_tokens":u64::MAX}}),
+        );
+        assert_eq!(
+            big.events[0].attributes["tokens.total"],
+            1_000_000_000_000_u64
+        );
+    }
+
+    #[test]
+    fn subagent_lifecycle_never_ends_the_parent_session() {
+        let n = run(
+            json!({"hook_event_name":"SessionEnd","session_id":"s","agent_id":"sub1","reason":"other"}),
+        );
+        assert!(n.events.is_empty() && n.ignored.is_some());
     }
 
     #[test]

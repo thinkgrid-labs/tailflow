@@ -21,8 +21,9 @@ use crate::{Storage, Submitted};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tailflow_core::agent::spool::{RejectReason, Spool, SpoolError, LATE_AFTER};
 
@@ -33,6 +34,8 @@ pub const STALE_CLAIM: Duration = Duration::from_secs(300);
 /// How long one event may wait for queue space.
 const SUBMIT_WAIT: Duration = Duration::from_secs(10);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Temp files older than this are leftovers of a hook that died mid-write.
+const STALE_TEMP: Duration = Duration::from_secs(3600);
 /// Attempts before a record whose events keep being dropped is given up
 /// (its loss is already counted and recorded by storage).
 const MAX_ATTEMPTS: u8 = 3;
@@ -57,6 +60,7 @@ pub struct SpoolIngestor {
     spool: Spool,
     owner: String,
     attempts: Mutex<HashMap<PathBuf, u8>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl SpoolIngestor {
@@ -65,11 +69,36 @@ impl SpoolIngestor {
             spool,
             owner: owner.into(),
             attempts: Mutex::new(HashMap::new()),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn spool(&self) -> &Spool {
         &self.spool
+    }
+
+    /// A flag that makes a pass in progress stop after the current event
+    /// (shutdown). Unfinished records stay claimed and are released or
+    /// replayed later; their events are deduplicated.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Note a failed attempt on `path`; true when it should be given up.
+    fn give_up(&self, path: &Path) -> bool {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
+        let n = attempts.entry(path.to_path_buf()).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n >= MAX_ATTEMPTS {
+            attempts.remove(path);
+            true
+        } else {
+            false
+        }
     }
 
     /// One bounded pass. Blocking (waits for queue space and a flush).
@@ -79,19 +108,27 @@ impl SpoolIngestor {
             Ok(n) => r.recovered_claims = n,
             Err(e) => r.errors.push(format!("recovering claims: {e}")),
         }
-        match self.spool.take_overflow() {
-            Ok(Some(o)) => {
-                let now = Utc::now();
-                storage.record_agent_loss(
-                    LossReason::AgentSpoolOverflow,
-                    o.count,
-                    o.first_at.unwrap_or(now),
-                    o.last_at.unwrap_or(now),
-                );
-                r.overflow = o.count;
+        if let Err(e) = self.spool.clean_temp_files(STALE_TEMP) {
+            r.errors.push(format!("cleaning temp files: {e}"));
+        }
+        // Read the hook-side overflow counter now, but consume it only after
+        // the gap that records it has been committed (below).
+        let overflow = match self.spool.peek_overflow() {
+            Ok(o) => o,
+            Err(e) => {
+                r.errors.push(format!("reading overflow: {e}"));
+                None
             }
-            Ok(None) => {}
-            Err(e) => r.errors.push(format!("reading overflow: {e}")),
+        };
+        if let Some(o) = &overflow {
+            let now = Utc::now();
+            storage.record_agent_loss(
+                LossReason::AgentSpoolOverflow,
+                o.count,
+                o.first_at.unwrap_or(now),
+                o.last_at.unwrap_or(now),
+            );
+            r.overflow = o.count;
         }
 
         let mut claimed: Vec<PathBuf> = match self.spool.own_claims(&self.owner) {
@@ -102,12 +139,16 @@ impl SpoolIngestor {
             }
         };
         let room = BATCH_FILES.saturating_sub(claimed.len());
+        let mut newly_claimed = 0usize;
         match self.spool.pending(room.saturating_add(1)) {
             Ok(pending) => {
                 r.more = pending.len() > room;
                 for p in pending.into_iter().take(room) {
                     match self.spool.claim(&p, &self.owner) {
-                        Ok(Some(c)) => claimed.push(c),
+                        Ok(Some(c)) => {
+                            claimed.push(c);
+                            newly_claimed += 1;
+                        }
                         Ok(None) => {} // another daemon took it
                         Err(e) => r.errors.push(format!("claiming: {e}")),
                     }
@@ -115,19 +156,21 @@ impl SpoolIngestor {
             }
             Err(e) => r.errors.push(format!("listing spool: {e}")),
         }
-        if claimed.is_empty() {
-            if let Err(e) = self.spool.refresh_full_marker() {
-                r.errors
-                    .push(format!("clearing the spool-full marker: {e}"));
-            }
-            return r;
+        if newly_claimed == 0 {
+            // Nothing could be claimed this pass (all taken, or claiming
+            // fails): do not report `more`, so the caller backs off instead
+            // of spinning on a directory it cannot make progress on.
+            r.more = false;
         }
 
         let now = Utc::now();
         let mut done: Vec<PathBuf> = Vec::new();
         for path in claimed {
+            if self.stopping() {
+                break;
+            }
             r.files += 1;
-            let rec = match Spool::read(&path) {
+            let mut rec = match Spool::read(&path) {
                 Ok(rec) => rec,
                 Err(SpoolError::Corrupt(m)) => {
                     // Count unknown; at least one hook call is lost.
@@ -139,24 +182,48 @@ impl SpoolIngestor {
                 }
                 Err(SpoolError::Io(e)) => {
                     r.errors.push(format!("reading spool record: {e}"));
+                    if self.give_up(&path) {
+                        // Persistently unreadable (a directory, permissions):
+                        // record it as loss and move it aside, so it cannot
+                        // occupy a batch slot forever.
+                        storage.record_agent_loss(LossReason::AgentSpoolCorrupt, 1, now, now);
+                        r.corrupt_files += 1;
+                        if let Err(e) = self.spool.quarantine(&path) {
+                            r.errors
+                                .push(format!("quarantining unreadable record: {e}"));
+                        }
+                    }
                     continue;
                 }
             };
-            if rec.excluded > 0 {
-                storage.add_excluded(u64::from(rec.excluded));
-                r.excluded += u64::from(rec.excluded);
-            }
-            for rej in &rec.rejected {
-                storage.record_agent_loss(
-                    LossReason::AgentInputRejected,
-                    u64::from(rej.count),
-                    rec.written_at,
-                    rec.written_at,
-                );
-                r.rejected += u64::from(rej.count);
-                if rej.reason == RejectReason::InvalidConfig {
-                    r.errors
-                        .push("agent capture config is invalid; events were not recorded".into());
+            // Exclusions and rejections are counted once per record: after
+            // counting, the claimed file is rewritten without them, so a
+            // replay (retry, crash, stale claim) counts only its events,
+            // which storage deduplicates. A crash between the two steps
+            // double counts, which over-reports loss rather than hiding it.
+            if rec.excluded > 0 || !rec.rejected.is_empty() {
+                if rec.excluded > 0 {
+                    storage.add_excluded(u64::from(rec.excluded));
+                    r.excluded += u64::from(rec.excluded);
+                }
+                for rej in &rec.rejected {
+                    storage.record_agent_loss(
+                        LossReason::AgentInputRejected,
+                        u64::from(rej.count),
+                        rec.written_at,
+                        rec.written_at,
+                    );
+                    r.rejected += u64::from(rej.count);
+                    if rej.reason == RejectReason::InvalidConfig {
+                        r.errors.push(
+                            "agent capture config is invalid; events were not recorded".into(),
+                        );
+                    }
+                }
+                rec.excluded = 0;
+                rec.rejected.clear();
+                if let Err(e) = Spool::rewrite(&path, &rec) {
+                    r.errors.push(format!("marking record counted: {e}"));
                 }
             }
             let late = now
@@ -165,6 +232,10 @@ impl SpoolIngestor {
                 .is_ok_and(|age| age > LATE_AFTER);
             let mut dropped = false;
             for mut e in rec.events {
+                if self.stopping() {
+                    dropped = true; // unfinished: keep the claim, replay later
+                    break;
+                }
                 e.observed_at = Utc::now();
                 if late {
                     e.attributes
@@ -179,20 +250,20 @@ impl SpoolIngestor {
                     }
                 }
             }
-            if dropped {
-                let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
-                let n = attempts.entry(path.clone()).or_insert(0);
-                *n = n.saturating_add(1);
-                if *n < MAX_ATTEMPTS {
-                    continue; // keep the claim; replayed next pass (deduplicated)
-                }
-                attempts.remove(&path);
+            if dropped && (self.stopping() || !self.give_up(&path)) {
+                continue; // keep the claim; replayed next pass (deduplicated)
             }
             done.push(path);
         }
         // Delete only what storage has committed.
         match storage.flush(FLUSH_TIMEOUT) {
             Ok(()) => {
+                if let Some(o) = &overflow {
+                    if let Err(e) = self.spool.consume_overflow(o.count) {
+                        r.errors
+                            .push(format!("resetting the overflow counter: {e}"));
+                    }
+                }
                 for p in done {
                     if let Err(e) = Spool::complete(&p) {
                         r.errors.push(format!("removing ingested record: {e}"));
@@ -228,7 +299,7 @@ impl SpoolIngestor {
             total.recovered_claims += r.recovered_claims;
             total.errors.extend(r.errors);
             total.more = r.more;
-            if !r.more || Instant::now() >= deadline || r.files == 0 {
+            if !r.more || Instant::now() >= deadline || r.files == 0 || self.stopping() {
                 return total;
             }
         }

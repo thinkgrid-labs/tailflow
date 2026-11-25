@@ -387,7 +387,13 @@ async fn get_session(
 
 /// Agent integrations as this daemon sees them: ingestion state, the spool,
 /// and each integration's capability matrix.
-async fn agents_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn agents_status(
+    State(state): State<Arc<AppState>>,
+    params: Result<AxumQuery<NoParams>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, V1Error> {
+    params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
     let ingest = state
         .agent_ingest
         .lock()
@@ -408,11 +414,11 @@ async fn agents_status(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             })
         })
         .collect();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "ingest": ingest,
         "spool": stats,
         "agents": agents,
-    }))
+    })))
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────

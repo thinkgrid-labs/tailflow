@@ -485,7 +485,10 @@ impl Writer {
                 .maintenance_yields
                 .fetch_add(1, Ordering::Relaxed);
             self.deferred_since.get_or_insert_with(Instant::now);
-        } else if !self.fts_owed {
+        } else if !self.fts_owed && !report.more_work {
+            // Only a *finished* cycle ends the deferral: a forced pass that
+            // ran out of time keeps the cycle forced until it completes, so
+            // sustained pressure cannot hold cleanup to one slice per minute.
             self.deferred_since = None;
         }
         if report.fts_compaction_due {

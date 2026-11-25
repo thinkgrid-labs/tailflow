@@ -11,6 +11,7 @@
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +39,7 @@ pub struct IngestStatus {
     pub overflow: u64,
     pub last_pass_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_error: Option<String>,
+    pub last_error_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Why ingestion is off, when it is.
     pub disabled_reason: Option<String>,
 }
@@ -55,6 +57,7 @@ impl IngestStatus {
         self.last_pass_at = Some(chrono::Utc::now());
         if let Some(e) = r.errors.last() {
             self.last_error = Some(e.clone());
+            self.last_error_at = self.last_pass_at;
         }
     }
 }
@@ -90,11 +93,14 @@ fn is_inbox_record(dirs: &[PathBuf], p: &Path) -> bool {
 pub struct Handle {
     thread: std::thread::JoinHandle<()>,
     stop: mpsc::Sender<Wake>,
+    flag: Arc<AtomicBool>,
 }
 
 impl Handle {
-    /// Stop after the current pass and release unfinished claims. Blocking.
+    /// Stop: a pass in progress ends after its current event and flushes
+    /// what it submitted; unfinished claims are released. Blocking.
     pub fn stop(self) {
+        self.flag.store(true, Ordering::SeqCst);
         let _thread_may_be_gone = self.stop.send(Wake::Stop);
         if self.thread.join().is_err() {
             tracing::warn!("agent ingest thread panicked");
@@ -117,13 +123,6 @@ pub fn spawn(
         s.enabled = true;
         s.spool_dir = Some(spool.dir().display().to_string());
     }
-    // Wake the thread as soon as the daemon starts stopping.
-    let stop_tx = tx.clone();
-    let token = shutdown.clone();
-    tokio::spawn(async move {
-        token.cancelled().await;
-        let _thread_may_be_gone = stop_tx.send(Wake::Stop);
-    });
     let dir: PathBuf = spool.dir().to_path_buf();
     let fs_tx = tx.clone();
     let mut watch_dirs = vec![dir.clone()];
@@ -152,6 +151,19 @@ pub fn spawn(
         }
     };
     let ingestor = SpoolIngestor::new(spool, storage.run_key().to_string());
+    let flag = ingestor.stop_flag();
+    {
+        // Stop a pass in progress as soon as the daemon starts stopping.
+        let flag = flag.clone();
+        let tx = tx.clone();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            flag.store(true, Ordering::SeqCst);
+            let _thread_may_be_gone = tx.send(Wake::Stop);
+        });
+    }
+    let thread_flag = flag.clone();
     let thread = std::thread::Builder::new()
         .name("tailflow-agent-ingest".into())
         .spawn(move || {
@@ -173,7 +185,7 @@ pub fn spawn(
             };
             // Whatever accumulated while no daemon was running.
             let mut more = pass(&status);
-            loop {
+            while !thread_flag.load(Ordering::SeqCst) {
                 let wait = if more {
                     Duration::ZERO
                 } else {
@@ -198,5 +210,28 @@ pub fn spawn(
             }
             ingestor.release();
         })?;
-    Ok(Handle { thread, stop: tx })
+    Ok(Handle {
+        thread,
+        stop: tx,
+        flag,
+    })
+}
+
+/// Whether `path` is the per-user default database — the only store agent
+/// events are ingested into. Daemons with *different* databases would
+/// otherwise split one spool between them, each holding part of a session
+/// that could even look complete.
+pub fn is_default_store(path: &Path) -> bool {
+    let Some(default) = tailflow_core::paths::default_db_path() else {
+        return false;
+    };
+    if path == default {
+        return true;
+    }
+    // The file may not exist yet: compare canonical parent directories.
+    let canon = |p: &Path| {
+        let dir = p.parent().and_then(|d| std::fs::canonicalize(d).ok());
+        dir.zip(p.file_name()).map(|(d, n)| d.join(n))
+    };
+    matches!((canon(path), canon(&default)), (Some(a), Some(b)) if a == b)
 }

@@ -159,7 +159,10 @@ fn hook_payloads_become_a_complete_session() {
     assert_eq!(v.end_reason.as_deref(), Some("prompt_input_exit"));
     assert_eq!(v.start_source.as_deref(), Some("startup"));
     assert_eq!(v.model.as_deref(), Some("claude-opus-5-5"));
-    assert_eq!(v.working_directory.as_deref(), Some("/work/app"));
+    assert_eq!(
+        v.working_directory.as_deref().map(Path::new),
+        Some(Path::new("/work/app"))
+    );
     assert_eq!(v.counts.tool_calls, 2);
     assert_eq!(v.counts.tool_failures, 1);
     assert_eq!(v.counts.commands, 1);
@@ -187,7 +190,10 @@ fn hook_payloads_become_a_complete_session() {
             .exit_code,
         Some(101)
     );
-    assert_eq!(d.files[0].path, "/work/app/src/lib.rs");
+    assert_eq!(
+        Path::new(&d.files[0].path),
+        Path::new("/work/app/src/lib.rs")
+    );
     assert_eq!(d.files[0].last_event_type, "file.modified");
 
     // Chronological inspection through the existing events API.
@@ -560,6 +566,125 @@ fn retention_and_purge_remove_session_rows() {
             .unwrap()
             .sessions
             .is_empty()
+    );
+}
+
+#[test]
+fn a_saturated_queue_applies_backpressure_instead_of_dropping() {
+    let r = rig();
+    for i in 0..600 {
+        r.hook(
+            AgentKind::ClaudeCode,
+            &claude(
+                "PostToolUse",
+                S1,
+                json!({"tool_name":"Grep",
+            "tool_use_id":format!("q{i}"),"tool_input":{}}),
+            ),
+        );
+    }
+    let mut cfg = config(&r.db);
+    cfg.queue_capacity = 256;
+    let s = Storage::open(&cfg, opts(&PrivacyConfig::default())).unwrap();
+    // Stall the writer while the ingestor pushes 600 events into a 256 queue.
+    let locker = rusqlite::Connection::open(&r.db).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ing = SpoolIngestor::new(r.spool.clone(), s.run_key().to_string());
+    let report = std::thread::scope(|sc| {
+        let h = sc.spawn(|| ing.drain(&s, Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(1500));
+        locker.execute_batch("COMMIT").unwrap();
+        h.join().unwrap()
+    });
+    s.flush(T).unwrap();
+    assert_eq!(report.events_dropped, 0, "{report:?}");
+    assert_eq!(
+        s.health().events_dropped.queue_full,
+        0,
+        "the ingestor waited"
+    );
+    assert_eq!(count_rows(&r.db), 600);
+}
+
+#[test]
+fn exclusions_and_rejections_are_counted_once_per_record() {
+    let r = rig_with(PrivacyConfig {
+        excluded_file_globs: vec!["**/.env".into()],
+        ..PrivacyConfig::default()
+    });
+    r.hook(
+        AgentKind::ClaudeCode,
+        &claude(
+            "PostToolUse",
+            S1,
+            json!({"tool_name":"Read",
+        "tool_use_id":"r","tool_input":{"file_path":"/work/app/.env"}}),
+        ),
+    );
+    // A store whose writer has stopped: the event cannot be committed, so
+    // the record stays claimed for a retry — the case that re-reads it.
+    let stopped = open(&r.db);
+    stopped.shutdown(T).unwrap();
+    let owner = "fixed-owner";
+    let ing = SpoolIngestor::new(r.spool.clone(), owner);
+    let first = ing.drain_once(&stopped);
+    assert_eq!(first.excluded, 1);
+    let kept = r.spool.own_claims(owner).unwrap();
+    assert_eq!(kept.len(), 1, "unfinished record kept for replay");
+    let rec = tailflow_core::agent::spool::Spool::read(&kept[0]).unwrap();
+    assert_eq!(
+        rec.excluded, 0,
+        "marked counted before its events were submitted"
+    );
+    assert_eq!(rec.events.len(), 1);
+    // The retry against a working store counts the exclusion no second time.
+    let s = open(&r.db);
+    let again = ing.drain_once(&s);
+    assert_eq!(again.excluded, 0);
+    assert_eq!(again.events_submitted, 1);
+    s.flush(T).unwrap();
+    assert_eq!(s.health().events_excluded, 0);
+    assert!(r.spool.own_claims(owner).unwrap().is_empty());
+}
+
+#[test]
+fn late_boundaries_do_not_overwrite_newer_git_facts() {
+    let r = rig();
+    let s = open(&r.db);
+    let mk = |ty: &str, head: &str, branch: &str, ago_s: i64| {
+        let mut e = agent_event(
+            &format!("agent:claude-code:x:{ty}:{head}"),
+            ty,
+            "claude-code:g1",
+        );
+        e.source_type = "agent_hook".into();
+        e.agent_name = Some("claude-code".into());
+        e.timestamp = chrono::Utc::now() - chrono::Duration::seconds(ago_s);
+        e.attributes.insert("git.root".into(), "/work/app".into());
+        e.attributes.insert("git.head".into(), head.into());
+        e.attributes.insert("git.branch".into(), branch.into());
+        e
+    };
+    // Arrival order: end (newest), then a start, then an *older* start.
+    for e in [
+        mk("agent.session.ended", "cccc", "feature", 0),
+        mk("agent.session.started", "bbbb", "feature", 60),
+        mk("agent.session.started", "aaaa", "main", 120),
+    ] {
+        assert_eq!(s.submit(e), tailflow_storage::Submitted::Enqueued);
+    }
+    s.flush(T).unwrap();
+    let v = s.session("claude-code:g1").unwrap().unwrap().session;
+    assert_eq!(
+        v.git.head_at_start.as_deref(),
+        Some("aaaa"),
+        "earliest start wins"
+    );
+    assert_eq!(v.git.head_at_end.as_deref(), Some("cccc"));
+    assert_eq!(
+        v.git.branch.as_deref(),
+        Some("feature"),
+        "latest boundary wins"
     );
 }
 

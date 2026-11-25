@@ -436,13 +436,12 @@ mod tests {
     #[test]
     fn paths_normalize_lexically() {
         let base = Path::new("/home/u/proj");
-        let n = |s| normalize_path(s, Some(base)).map(|p| p.display().to_string());
-        assert_eq!(n("src/lib.rs").as_deref(), Some("/home/u/proj/src/lib.rs"));
-        assert_eq!(n("./a/../b").as_deref(), Some("/home/u/proj/b"));
-        assert_eq!(
-            n("/home/u/proj/../../../etc/passwd").as_deref(),
-            Some("/etc/passwd")
-        );
+        // Compared as paths: Windows renders the same path with `\`.
+        let n = |s| normalize_path(s, Some(base));
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(n("src/lib.rs"), p("/home/u/proj/src/lib.rs"));
+        assert_eq!(n("./a/../b"), p("/home/u/proj/b"));
+        assert_eq!(n("/home/u/proj/../../../etc/passwd"), p("/etc/passwd"));
         assert_eq!(n("/../x"), None, "cannot climb above the root");
         assert_eq!(normalize_path("rel", None), None);
         assert_eq!(n(""), None);

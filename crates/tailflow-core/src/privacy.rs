@@ -64,6 +64,7 @@ pub enum PrivacyError {
     UnknownBuiltinRule(String),
     InvalidGlob { glob: String, reason: String },
     InvalidEventType(String),
+    InvalidAgent(String),
 }
 
 impl fmt::Display for PrivacyError {
@@ -87,6 +88,10 @@ impl fmt::Display for PrivacyError {
             PrivacyError::InvalidEventType(t) => write!(
                 f,
                 "excluded_event_types entry {t:?} is not a known type or `prefix.*` pattern"
+            ),
+            PrivacyError::InvalidAgent(a) => write!(
+                f,
+                "excluded_agents entry {a:?} is not a supported agent (claude-code, codex)"
             ),
         }
     }
@@ -228,7 +233,12 @@ impl CompiledRule {
         match self.needles {
             None => true,
             Some((needles, false)) => needles.iter().any(|n| text.contains(n)),
-            Some((needles, true)) => needles.iter().any(|n| contains_ci(text, n)),
+            // `(?i)` in the regex crate folds Unicode (`ſ` matches `s`, the
+            // Kelvin sign matches `k`), which an ASCII comparison misses:
+            // non-ASCII text always runs the rule.
+            Some((needles, true)) => {
+                !text.is_ascii() || needles.iter().any(|n| contains_ci(text, n))
+            }
         }
     }
 }
@@ -622,7 +632,17 @@ impl CapturePolicy {
             redactor,
             excluded_types,
             excluded_prefixes,
-            excluded_agents: config.excluded_agents.clone(),
+            // Canonical names, so the `claude` alias excludes `claude-code`
+            // events instead of silently excluding nothing.
+            excluded_agents: config
+                .excluded_agents
+                .iter()
+                .map(|a| {
+                    crate::agent::AgentKind::parse(a)
+                        .map(|k| k.as_str().to_string())
+                        .ok_or_else(|| PrivacyError::InvalidAgent(a.clone()))
+                })
+                .collect::<Result<_, _>>()?,
             allowed_dirs: config
                 .allowed_project_dirs
                 .iter()
@@ -662,6 +682,26 @@ impl CapturePolicy {
             .is_some_and(|a| self.excluded_agents.iter().any(|x| x == a))
         {
             return Err(Exclusion::Agent);
+        }
+        // An agent event with no location cannot be shown to be inside the
+        // allowlist, so it is not recorded (runtime lines carry no path and
+        // are not subject to the allowlist).
+        if !self.allowed_dirs.is_empty()
+            && event.path.is_none()
+            && event.source_type == crate::agent::SOURCE_TYPE
+        {
+            return Err(Exclusion::PathOutsideAllowedDirs);
+        }
+        // Path-like attributes are held to the same boundaries as `path`.
+        if let Some(from) = event
+            .attributes
+            .get("file.renamed_from")
+            .and_then(serde_json::Value::as_str)
+        {
+            let mut probe = event.clone();
+            probe.attributes.clear();
+            probe.path = Some(from.to_string());
+            self.admit(&probe)?;
         }
         if let Some(path) = event.path.as_deref() {
             // Resolve `.` and `..` lexically first: `/work/../etc/passwd`
@@ -867,9 +907,89 @@ mod tests {
             }
             corpus.push(line);
         }
+        // Unicode case folding under `(?i)`: `ſ` folds to `s`, U+212A to `k`.
+        corpus.push("PA\u{17f}SWORD=hunter2".into());
+        corpus.push("api_\u{212a}ey=abcdef".into());
+        corpus.push("Authori\u{17a}ation: x".into());
         for text in &corpus {
             assert_eq!(lazy.redact(text), eager.redact(text), "{text:?}");
         }
+        assert!(lazy.redact("PA\u{17f}SWORD=hunter2").is_some());
+    }
+
+    #[test]
+    fn agent_exclusions_use_canonical_names_and_reject_typos() {
+        use crate::event::Provenance;
+        let p = CapturePolicy::from_config(&PrivacyConfig {
+            excluded_agents: vec!["claude".into()],
+            ..PrivacyConfig::default()
+        })
+        .unwrap();
+        let mut e = ObservabilityEvent::new(
+            "i",
+            "agent.tool.started",
+            Provenance::AgentReported,
+            "agent_hook",
+            "claude-code",
+            chrono::Utc::now(),
+        );
+        e.agent_name = Some("claude-code".into());
+        e.path = Some("/w".into());
+        assert_eq!(
+            p.admit(&e),
+            Err(Exclusion::Agent),
+            "the alias excludes claude-code"
+        );
+        assert!(matches!(
+            CapturePolicy::from_config(&PrivacyConfig {
+                excluded_agents: vec!["cluade".into()],
+                ..PrivacyConfig::default()
+            }),
+            Err(PrivacyError::InvalidAgent(_))
+        ));
+    }
+
+    #[test]
+    fn allowlist_covers_rename_sources_and_pathless_agent_events() {
+        use crate::event::Provenance;
+        let p = CapturePolicy::from_config(&PrivacyConfig {
+            allowed_project_dirs: vec!["/work".into()],
+            ..PrivacyConfig::default()
+        })
+        .unwrap();
+        let mut e = ObservabilityEvent::new(
+            "i",
+            "file.renamed",
+            Provenance::AgentReported,
+            "agent_hook",
+            "codex",
+            chrono::Utc::now(),
+        );
+        e.path = Some("/work/a".into());
+        assert_eq!(p.admit(&e), Ok(()));
+        e.attributes
+            .insert("file.renamed_from".into(), "/home/me/secret.txt".into());
+        assert_eq!(p.admit(&e), Err(Exclusion::PathOutsideAllowedDirs));
+        e.attributes.clear();
+        e.path = None;
+        assert_eq!(
+            p.admit(&e),
+            Err(Exclusion::PathOutsideAllowedDirs),
+            "no location, no admission"
+        );
+        let runtime = ObservabilityEvent::new(
+            "r",
+            "runtime.log",
+            Provenance::RuntimeObserved,
+            "process",
+            "api",
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            p.admit(&runtime),
+            Ok(()),
+            "runtime lines are not path-bearing"
+        );
     }
 
     #[test]
@@ -1099,7 +1219,7 @@ mod tests {
             allowed_project_dirs: vec![PathBuf::from("/work/app")],
             excluded_file_globs: vec!["**/.env".into(), "**/secrets/**".into()],
             excluded_event_types: vec!["git.*".into(), "file.read".into()],
-            excluded_agents: vec!["cursor".into()],
+            excluded_agents: vec!["codex".into()],
             ..PrivacyConfig::default()
         };
         let p = CapturePolicy::from_config(&cfg).unwrap();
@@ -1141,7 +1261,7 @@ mod tests {
         assert_eq!(p.admit(&event("git.commit")), Err(Exclusion::EventType));
         assert_eq!(p.admit(&event("file.read")), Err(Exclusion::EventType));
         let mut agent = event("agent.tool.started");
-        agent.agent_name = Some("cursor".into());
+        agent.agent_name = Some("codex".into());
         assert_eq!(p.admit(&agent), Err(Exclusion::Agent));
     }
 
