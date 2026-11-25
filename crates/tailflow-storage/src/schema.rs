@@ -18,7 +18,7 @@ use tailflow_core::config::SyncMode;
 pub const APPLICATION_ID: i32 = 0x5446_4c57;
 
 /// Highest schema version this build understands.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// How long a connection waits on a lock held by another connection or
 /// process before reporting `SQLITE_BUSY`.
@@ -113,11 +113,76 @@ INSERT INTO meta(key, value) VALUES ('evicted_through_seq', '0');
 INSERT INTO meta(key, value) VALUES ('payload_expired_through_seq', '0');
 ";
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial event store",
-    sql: V1,
-}];
+/// Schema v2 (M2): agent sessions, and the `events_ts` index dropped.
+///
+/// - `events_ts` was never chosen by the planner (M1.5 SQLITE-OPTIMIZATION
+///   §6: every time filter is translated into a seq window first); dropping
+///   it saves 5–8 % WAL bytes per event. `DROP INDEX` only frees pages, so
+///   the migration needs no extra disk space.
+/// - `agent_sessions` is a per-session summary maintained by the writer in
+///   the same transaction as each agent event insert (duplicates excluded),
+///   so listing sessions never scans `events`. Session keys are
+///   `<agent>:<source id>`. Rows outlive partial expiry of their events
+///   (readers compare `first_seq` with `evicted_through_seq`) and are
+///   deleted when every event they summarize has expired or was purged.
+///
+/// Rollback: a build that only knows v1 refuses a v2 file (`NewerSchema`)
+/// and runs memory-only; it never modifies it. A v1 daemon that keeps a
+/// database open while a v2 daemon migrates it continues to append events
+/// (it does not ingest agent events, so `agent_sessions` stays correct; its
+/// retention leaves expired session rows behind, which readers filter out).
+const V2: &str = r"
+DROP INDEX IF EXISTS events_ts;
+
+CREATE TABLE agent_sessions (
+    session_key       TEXT PRIMARY KEY,
+    agent_name        TEXT    NOT NULL,
+    project_id        TEXT,
+    working_directory TEXT,
+    first_seq         INTEGER NOT NULL,
+    last_seq          INTEGER NOT NULL,
+    first_event_at    INTEGER NOT NULL,
+    last_event_at     INTEGER NOT NULL,
+    event_count       INTEGER NOT NULL DEFAULT 0,
+    started_at        INTEGER,
+    last_started_at   INTEGER,
+    start_count       INTEGER NOT NULL DEFAULT 0,
+    start_source      TEXT,
+    ended_at          INTEGER,
+    end_count         INTEGER NOT NULL DEFAULT 0,
+    end_reason        TEXT,
+    tool_calls        INTEGER NOT NULL DEFAULT 0,
+    tool_failures     INTEGER NOT NULL DEFAULT 0,
+    commands          INTEGER NOT NULL DEFAULT 0,
+    command_failures  INTEGER NOT NULL DEFAULT 0,
+    file_events       INTEGER NOT NULL DEFAULT 0,
+    subagents         INTEGER NOT NULL DEFAULT 0,
+    turns             INTEGER NOT NULL DEFAULT 0,
+    tokens_total      INTEGER,
+    git_root          TEXT,
+    git_branch        TEXT,
+    git_head_start    TEXT,
+    git_head_end      TEXT,
+    git_worktree      TEXT,
+    model             TEXT
+) WITHOUT ROWID;
+
+CREATE INDEX agent_sessions_recent   ON agent_sessions(last_event_at);
+CREATE INDEX agent_sessions_last_seq ON agent_sessions(last_seq);
+";
+
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial event store",
+        sql: V1,
+    },
+    Migration {
+        version: 2,
+        name: "agent sessions; drop unused events_ts index",
+        sql: V2,
+    },
+];
 
 /// Open (creating if needed) a read-write connection and bring the schema
 /// up to date.
@@ -441,7 +506,7 @@ mod tests {
     fn interrupted_migration_rolls_back_completely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
-        drop(open_writer(&path, SyncMode::Normal).unwrap());
+        drop(open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..1]).unwrap());
         let broken = [
             MIGRATIONS[0].clone_ref(),
             Migration {
@@ -465,6 +530,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 0, "partial DDL must be rolled back");
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        {
+            let c = open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..1]).unwrap();
+            c.execute(
+                "INSERT INTO events (event_id, schema_version, ts, observed_at, event_type, provenance,
+                 source_type, source_id, severity, run_id)
+                 VALUES ('e1', 1, 1, 1, 'runtime.log', 'runtime_observed', 'p', 's', 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let c = open_writer(&path, SyncMode::Normal).unwrap();
+        let v: i32 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "existing history is kept");
+        let idx: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'events_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 0, "unused index dropped");
+        let t: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'agent_sessions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(t, 1);
+        assert!(integrity_problems(&c, true).unwrap().is_empty());
+        // A v1-only build refuses the upgraded file without touching it.
+        drop(c);
+        let err = open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..1]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::NewerSchema {
+                    found: 2,
+                    supported: 1
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

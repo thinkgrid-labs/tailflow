@@ -1,0 +1,21 @@
+{
+  "session_id": "00000002-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/da10b16d-6111-46d6-a954-22cb3f387f55.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "prompt_id": "a60bfb59-23e2-4a02-933f-7f659fcf1711",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "exit 3",
+    "description": "Run exit 3 to confirm non-zero exit"
+  },
+  "tool_use_id": "toolu_01VP5RzTYdpJj4qNEHPj6aSu",
+  "error": "Exit code 3",
+  "is_interrupt": false,
+  "duration_ms": 3762
+}

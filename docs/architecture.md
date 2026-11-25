@@ -61,6 +61,12 @@ Each source implements the same asynchronous lifecycle and receives a
 cancellation token. That lets the TUI and daemon shut down file watchers,
 container streams, and spawned process trees consistently.
 
+Its `agent` module holds the coding-agent integrations: adapters that turn
+Claude Code and Codex hook payloads into `ObservabilityEvent`s, the owner-only
+spool that hands them to a daemon, the hook installer, and read-only Git
+discovery. It does not depend on SQLite, so the hook bridge in the `tailflow`
+binary stays free of it.
+
 ### `tailflow-storage`
 
 The durable event store: one writer thread owning a read-write SQLite
@@ -140,6 +146,22 @@ even after deletes. The writer keeps `observed_at` non-decreasing in `seq`
 order and clamps future source timestamps, so a `since` bound translates into
 an exact seq bound. See [durable history](storage.md) for the full contract.
 
+## Agent capture path
+
+```text
+agent ── hook (stdin JSON) ──▶ tailflow agent hook <agent>
+                                 normalize → privacy → spool file (rename)
+                                                  │
+              tailflow-daemon ingest thread ◀─────┘ (watcher + 30 s rescan)
+                 claim by rename → submit with backpressure → flush → delete
+                                                  ▼
+                                  events + agent_sessions (same transaction)
+```
+
+The hook bridge never touches the database or the network, never prints to
+stdout and always exits 0. The spool is the only IPC: there is still no HTTP
+endpoint that writes. See [agent capture](agent-capture.md).
+
 ## Design invariants
 
 ### Loss is never silent
@@ -198,7 +220,7 @@ accidental bind-address change.
 ```text
 tailflow/
 ├── crates/
-│   ├── tailflow-core/      ingestion, processing, query store
+│   ├── tailflow-core/      ingestion, processing, query store, agent adapters
 │   ├── tailflow-tui/       interactive terminal UI
 │   ├── tailflow-storage/   SQLite event store, retention, queries
 │   ├── tailflow-daemon/    HTTP/SSE server and embedded web UI

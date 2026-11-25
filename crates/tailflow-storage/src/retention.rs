@@ -97,7 +97,7 @@ fn should_compact(cycle: Cycle, deleted_now: bool, more_work: bool) -> bool {
 /// merge was rejected: it regroups every segment into one whole-index merge
 /// that ordinary inserts then keep continuing through automerge, so its cost
 /// grows with the index and lands on ingestion (≈3× slower cycles measured).
-fn compact_fts(conn: &Connection) -> Result<()> {
+pub(crate) fn compact_fts(conn: &Connection) -> Result<()> {
     immediate(conn, |c| {
         c.execute(
             "INSERT INTO events_fts(events_fts, rank) VALUES ('deletemerge', ?1)",
@@ -136,6 +136,12 @@ pub struct RetentionReport {
     /// This pass ran the bounded full-text compaction (the cleanup cycle had
     /// deleted events and completed, or ran long).
     pub fts_compacted: bool,
+    /// The cycle owes a full-text compaction; the writer runs it unless the
+    /// ingestion queue is deep (then it is deferred, see `writer`).
+    #[serde(skip)]
+    pub fts_compaction_due: bool,
+    /// The pass stopped early because the ingestion queue was deep.
+    pub yielded: bool,
     pub used_bytes_after: u64,
     pub age_ms: f64,
     pub payload_ms: f64,
@@ -253,6 +259,7 @@ pub(crate) fn delete_seq_range(c: &Connection, lo: i64, hi: i64) -> Result<u64> 
     meta_add(c, "event_count", -n)?;
     meta_max(c, "evicted_through_seq", hi)?;
     meta_max(c, "payload_expired_through_seq", hi)?;
+    crate::sessions::delete_expired(c, hi)?;
     // Strictly below `hi`: a loss anchored *at* the last deleted seq
     // describes events that would follow it, which may still be retained.
     c.execute("DELETE FROM gaps WHERE to_seq < ?1", [hi])?;
@@ -271,11 +278,39 @@ pub fn run(
     budget: Duration,
     cycle: Cycle,
 ) -> Result<RetentionReport> {
+    let mut report = run_with_pressure(conn, policy, now_us, budget, cycle, &|| false)?;
+    if report.fts_compaction_due {
+        match compact_fts(conn) {
+            Ok(()) => report.fts_compacted = true,
+            Err(e) => tracing::warn!(err = %e, "full-text compaction skipped"),
+        }
+    }
+    Ok(report)
+}
+
+/// [`run`], yielding to ingestion: before every chunk, `under_pressure` is
+/// asked whether the ingestion queue is deep; if so the pass stops with
+/// `more_work` and `yielded` set and resumes after the next batch. The
+/// routine full-text merge is skipped under pressure too. The writer
+/// passes a closure that answers `false` once maintenance has been
+/// deferred for too long, so cleanup always eventually progresses.
+pub fn run_with_pressure(
+    conn: &Connection,
+    policy: &RetentionPolicy,
+    now_us: i64,
+    budget: Duration,
+    cycle: Cycle,
+    under_pressure: &dyn Fn() -> bool,
+) -> Result<RetentionReport> {
     let started = Instant::now();
     let mut report = RetentionReport::default();
     let out_of_time = |r: &mut RetentionReport| {
         if started.elapsed() > budget {
             r.more_work = true;
+            true
+        } else if under_pressure() {
+            r.more_work = true;
+            r.yielded = true;
             true
         } else {
             false
@@ -383,7 +418,7 @@ pub fn run(
     // committed, and a failed merge (e.g. BUSY from a concurrent CLI
     // command) must not fail the pass, drop its report or skip the
     // checkpoint below. The next cycle tries again.
-    if deleted {
+    if deleted && !under_pressure() {
         // Routine bounded merging (~64 pages) of same-level segments.
         if let Err(e) = conn.execute(
             "INSERT INTO events_fts(events_fts, rank) VALUES ('merge', 64)",
@@ -392,12 +427,9 @@ pub fn run(
             tracing::warn!(err = %e, "full-text merge skipped");
         }
     }
-    if should_compact(cycle, deleted, report.more_work) {
-        match compact_fts(conn) {
-            Ok(()) => report.fts_compacted = true,
-            Err(e) => tracing::warn!(err = %e, "full-text compaction skipped"),
-        }
-    }
+    // The targeted compaction can take seconds on a bloated index (5.4 s
+    // measured once on 2 GB); the writer decides when to run it.
+    report.fts_compaction_due = should_compact(cycle, deleted, report.more_work);
     if report.expired_by_age + report.evicted_by_size + report.payloads_cleared > 0
         || report.vacuumed_pages > 0
     {
@@ -452,6 +484,60 @@ mod tests {
             .query_row("SELECT count(*) FROM gaps", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "once history past it expires, the gap goes too");
+    }
+
+    #[test]
+    fn maintenance_yields_under_queue_pressure_and_resumes_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open_writer(&dir.path().join("e.db"), SyncMode::Normal).unwrap();
+        immediate(&c, |c| {
+            for i in 1..=100 {
+                c.execute(
+                    "INSERT INTO events (event_id, schema_version, ts, observed_at, event_type, provenance,
+                     source_type, source_id, severity, run_id)
+                     VALUES (?1, 1, ?2, ?2, 'runtime.log', 'runtime_observed', 'p', 's', 0, 1)",
+                    rusqlite::params![format!("e{i}"), i],
+                )?;
+            }
+            crate::schema::meta_add(c, "event_count", 100)?;
+            Ok(())
+        })
+        .unwrap();
+        let policy = RetentionPolicy {
+            max_age_days: Some(1),
+            payload_max_age_days: 1,
+            max_bytes: u64::MAX,
+        };
+        let now = 10 * 86_400_000_000;
+        let pressed = run_with_pressure(
+            &c,
+            &policy,
+            now,
+            Duration::from_secs(5),
+            Cycle::default(),
+            &|| true,
+        )
+        .unwrap();
+        assert!(pressed.yielded && pressed.more_work);
+        assert_eq!(
+            pressed.expired_by_age, 0,
+            "nothing deleted while the queue is deep"
+        );
+        let calm = run_with_pressure(
+            &c,
+            &policy,
+            now,
+            Duration::from_secs(5),
+            Cycle::default(),
+            &|| false,
+        )
+        .unwrap();
+        assert!(!calm.yielded);
+        assert_eq!(calm.expired_by_age, 100);
+        assert!(
+            calm.fts_compaction_due,
+            "the writer owes a compaction after deleting"
+        );
     }
 
     #[test]

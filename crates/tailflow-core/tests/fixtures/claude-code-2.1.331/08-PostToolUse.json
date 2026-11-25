@@ -1,0 +1,91 @@
+{
+  "session_id": "00000001-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/215327d6-696e-46e6-be8b-9b72e3872ef3.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "prompt_id": "cff04583-2c10-4cb5-aedc-7f837c8289c3",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "List files in project directory",
+    "prompt": "List the files in the directory /work/proj (include hidden files, and note subdirectories). Do not modify anything. Report back the list of file paths, one per line.",
+    "subagent_type": "Explore",
+    "run_in_background": false
+  },
+  "tool_response": {
+    "status": "completed",
+    "prompt": "List the files in the directory /work/proj (include hidden files, and note subdirectories). Do not modify anything. Report back the list of file paths, one per line.",
+    "agentId": "acdbe37b1e9c5c6a2",
+    "agentType": "Explore",
+    "toolsUsed": [
+      "Bash"
+    ],
+    "harnessNoteCount": 1,
+    "harnessTailCount": 0,
+    "harnessSectionHash": "dae37fd478ce510f",
+    "content": [
+      {
+        "type": "text",
+        "text": "<tools-used-before-summary>Bash</tools-used-before-summary>\n"
+      },
+      {
+        "type": "text",
+        "text": "Contents of `/work/proj` (hidden entries included; subdirectories end in `/`):\n\n```\n/work/proj/.git/\n/work/proj/.git/COMMIT_EDITMSG\n/work/proj/.git/HEAD\n/work/proj/.git/config\n/work/proj/.git/description\n/work/proj/.git/hooks/\n/work/proj/.git/hooks/applypatch-msg.sample\n/work/proj/.git/hooks/commit-msg.sample\n/work/proj/.git/hooks/fsmonitor-watchman.sample\n/work/proj/.git/hooks/post-update.sample\n/work/proj/.git/hooks/pre-applypatch.sample\n/work/proj/.git/hooks/pre-commit.sample\n/work/proj/.git/hooks/pre-merge-commit.sample\n/work/proj/.git/hooks/pre-push.sample\n/work/proj/.git/hooks/pre-rebase.sample\n/work/proj/.git/hooks/pre-receive.sample\n/work/proj/.git/hooks/prepare-commit-msg.sample\n/work/proj/.git/hooks/push-to-checkout.sample\n/work/proj/.git/hooks/sendemail-validate.sample\n/work/proj/.git/hooks/update.sample\n/work/proj/.git/index\n/work/proj/.git/info/\n/work/proj/.git/info/exclude\n/work/proj/.git/logs/\n/work/proj/.git/logs/HEAD\n/work/proj/.git/logs/refs/\n/work/proj/.git/logs/refs/heads/\n/work/proj/.git/logs/refs/heads/main\n/work/proj/.git/objects/\n/work/proj/.git/objects/06/\n/work/proj/.git/objects/06/5ac99d70752b423adaeb617b52d4894ecd2b01\n/work/proj/.git/objects/b5/\n/work/proj/.git/objects/b5/50fc71d49ef72b8b9ac7b911e8513a7f8a7ec4\n/work/proj/.git/objects/ce/\n/work/proj/.git/objects/ce/013625030ba8dba906f756967f9e9ca394464a\n/work/proj/.git/objects/info/\n/work/proj/.git/objects/pack/\n/work/proj/.git/refs/\n/work/proj/.git/refs/heads/\n/work/proj/.git/refs/heads/main\n/work/proj/.git/refs/tags/\n/work/proj/hello.py\n/work/proj/notes.txt\n```\n\nSummary: the project has two top-level files (`hello.py`, `notes.txt`) and one top-level hidden directory, `.git/`, which holds the repository internals and contains its own subdirectories (`hooks/`, `info/`, `logs/`, `objects/`, `refs/`, and the nested object/ref folders). Nothing was modified."
+      }
+    ],
+    "resolvedModel": "claude-haiku-5-5",
+    "totalDurationMs": 18204,
+    "totalTokens": 20058,
+    "totalToolUseCount": 1,
+    "usage": {
+      "output_tokens_details": {
+        "thinking_tokens": 614
+      },
+      "input_tokens": 2,
+      "cache_creation_input_tokens": 2329,
+      "cache_read_input_tokens": 13189,
+      "output_tokens": 4538,
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 2329
+      },
+      "inference_geo": "global",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 4538,
+          "cache_read_input_tokens": 13189,
+          "cache_creation_input_tokens": 2329,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 2329,
+            "ephemeral_1h_input_tokens": 0
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "toolStats": {
+      "readCount": 0,
+      "searchCount": 0,
+      "bashCount": 1,
+      "editFileCount": 0,
+      "linesAdded": 0,
+      "linesRemoved": 0,
+      "otherToolCount": 0
+    },
+    "canContinueAgent": true
+  },
+  "tool_use_id": "toolu_01W4mqLjojLSEQmnzYYhwN45",
+  "duration_ms": 18218
+}

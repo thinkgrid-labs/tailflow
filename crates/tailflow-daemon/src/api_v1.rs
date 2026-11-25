@@ -36,6 +36,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/collectors/status", get(collectors_status))
         .route("/api/v1/schema", get(schema))
         .route("/api/v1/privacy", get(privacy))
+        .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/sessions/{id}", get(get_session))
+        .route("/api/v1/agents/status", get(agents_status))
 }
 
 pub struct V1Error {
@@ -311,6 +314,113 @@ async fn get_event(
     }
 }
 
+// ── GET /api/v1/sessions ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NoParams {}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SessionParams {
+    agent: Option<String>,
+    project: Option<String>,
+    /// active | ended | unterminated (comma-separated).
+    status: Option<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    params: Result<AxumQuery<SessionParams>, QueryRejection>,
+) -> Result<Json<tailflow_storage::sessions::SessionPage>, V1Error> {
+    let AxumQuery(p) = params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    let since = p
+        .since
+        .as_deref()
+        .map(|s| {
+            parse_since(s).ok_or_else(|| {
+                V1Error::bad_request(format!(
+                    "invalid `since`: {s:?} (expected RFC 3339 or 30s|5m|2h|1d)"
+                ))
+            })
+        })
+        .transpose()?;
+    let q = tailflow_storage::sessions::SessionQuery {
+        agents: list(p.agent.as_ref()),
+        projects: list(p.project.as_ref()),
+        statuses: list(p.status.as_ref()),
+        since,
+        limit: p.limit.unwrap_or(50),
+    };
+    let storage = storage_of(&state)?.clone();
+    let page = blocking(move || storage.sessions(&q).map_err(V1Error::from)).await?;
+    Ok(Json(page))
+}
+
+async fn get_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    params: Result<AxumQuery<NoParams>, QueryRejection>,
+) -> Result<Json<tailflow_storage::sessions::SessionDetail>, V1Error> {
+    // No parameters are defined; reject any, like every other endpoint.
+    params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    if id.is_empty() || id.len() > tailflow_core::event::MAX_ID_LEN {
+        return Err(V1Error::bad_request("invalid session id"));
+    }
+    let storage = storage_of(&state)?.clone();
+    let key = id.clone();
+    let found = blocking(move || storage.session(&key).map_err(V1Error::from)).await?;
+    found.map(Json).ok_or_else(|| V1Error {
+        status: StatusCode::NOT_FOUND,
+        kind: "not_found",
+        message: format!(
+            "no session {id:?} (ids look like claude-code:<uuid>; expired sessions are not listed)"
+        ),
+    })
+}
+
+/// Agent integrations as this daemon sees them: ingestion state, the spool,
+/// and each integration's capability matrix.
+async fn agents_status(
+    State(state): State<Arc<AppState>>,
+    params: Result<AxumQuery<NoParams>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, V1Error> {
+    params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    let ingest = state
+        .agent_ingest
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let spool = tailflow_core::agent::spool::Spool::default_location();
+    let stats = tokio::task::spawn_blocking(move || spool.map(|s| s.stats()))
+        .await
+        .ok()
+        .flatten();
+    let agents: Vec<serde_json::Value> = tailflow_core::agent::AgentKind::ALL
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "agent": k.as_str(),
+                "name": k.display_name(),
+                "capabilities": tailflow_core::agent::capabilities(*k),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "ingest": ingest,
+        "spool": stats,
+        "agents": agents,
+    })))
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 
 /// Storage status for any slot state. Shared with `/health` and the dashboard.
@@ -497,6 +607,7 @@ mod tests {
                 storage,
                 run_key: "testrun".into(),
                 shutdown: tokio_util::sync::CancellationToken::new(),
+                agent_ingest: crate::agent_ingest::disabled("test"),
             },
         );
         Harness {
@@ -557,6 +668,83 @@ mod tests {
         let json = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn agent_sessions_are_listed_and_detailed() {
+        let h = harness(PrivacyConfig::default(), true);
+        let storage = h.state.storage.storage().unwrap().clone();
+        let ctx = tailflow_core::agent::HookContext::now();
+        for v in [
+            serde_json::json!({"hook_event_name":"SessionStart","session_id":"abc-1","cwd":"/work/app","source":"startup"}),
+            serde_json::json!({"hook_event_name":"PostToolUseFailure","session_id":"abc-1","cwd":"/work/app",
+                "tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"make"},"error":"Exit code 2"}),
+            serde_json::json!({"hook_event_name":"SessionEnd","session_id":"abc-1","reason":"clear"}),
+        ] {
+            let n = tailflow_core::agent::normalize(
+                tailflow_core::agent::AgentKind::ClaudeCode,
+                &v,
+                &ctx,
+            )
+            .unwrap();
+            for e in n.events {
+                assert_eq!(storage.submit(e), tailflow_storage::Submitted::Enqueued);
+            }
+        }
+        h.flush().await;
+        let (status, body) = h.get("/api/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let s = &body["sessions"][0];
+        assert_eq!(s["session_id"], "claude-code:abc-1");
+        assert_eq!(s["status"], "ended");
+        assert_eq!(s["counts"]["command_failures"], 1);
+        assert_eq!(s["coverage"]["history"], "complete");
+
+        let (status, d) = h.get("/api/v1/sessions/claude-code:abc-1").await;
+        assert_eq!(status, StatusCode::OK, "{d}");
+        assert_eq!(d["failures"][0]["exit_code"], 2);
+        let (status, _) = h.get("/api/v1/sessions/claude-code:nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = h.get("/api/v1/sessions?bogus=1").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown parameters are 400"
+        );
+        let (status, _) = h.get("/api/v1/sessions?status=finished").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = h.get("/api/v1/sessions/claude-code:abc-1?x=1").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = h.get("/api/v1/sessions?agent=codex").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["sessions"].as_array().unwrap().is_empty());
+
+        let (status, a) = h.get("/api/v1/agents/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(a["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(a["ingest"]["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_is_explicit_without_storage() {
+        let h = harness(PrivacyConfig::default(), false);
+        let (status, body) = h.get("/api/v1/sessions").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["kind"], "storage_disabled");
+    }
+
+    #[tokio::test]
+    async fn agent_endpoints_are_read_only() {
+        let h = harness(PrivacyConfig::default(), true);
+        for uri in [
+            "/api/v1/sessions",
+            "/api/v1/agents/status",
+            "/api/v1/sessions/x",
+        ] {
+            let (status, _) =
+                send(h.state.clone(), Request::builder().method("POST").uri(uri)).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -710,6 +898,7 @@ mod tests {
                 },
                 run_key: "m".into(),
                 shutdown: tokio_util::sync::CancellationToken::new(),
+                agent_ingest: crate::agent_ingest::disabled("test"),
             },
         );
         let (status, body) = send(state.clone(), Request::builder().uri("/api/v1/events")).await;

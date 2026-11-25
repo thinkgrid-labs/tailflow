@@ -264,12 +264,27 @@ That an event was received and committed — or, when `complete` is `false`,
 exactly that the record is known to be incomplete. History does not prove what
 happened while no daemon was running. See [durable history](storage.md).
 
+## Agent capture (next release)
+
+**What it does.** `tailflow agent install claude|codex` adds observe-only hooks
+to the agent's configuration. Each hook call becomes normalized events
+(`agent.session.*`, `agent.tool.*`, `command.*`, `file.*`, subagents, turns),
+grouped into sessions with lifecycle status and coverage. Inspect them with
+`tailflow sessions` / `tailflow session <id>` or `GET /api/v1/sessions`.
+
+**What it proves.** That the agent's hook reported the activity. A tool
+failure with an exit code, a file the Write tool created, a subagent that ran.
+It does not prove that a file changed on disk, and it cannot see what the
+agent did through the shell beyond the command line itself. Every session says
+whether its history is `complete`, `partial` or `unknown`, and why.
+
 ## Feature boundaries
 
 TailFlow observes text emitted by local software. It does not collect metrics,
-traces, profiles, internal application state, or production history, and it
-does not yet collect coding-agent activity (sessions, tool calls, file edits,
-commands) — the event schema for those exists, the collectors do not.
+traces, profiles, internal application state, or production history.
+Coding-agent activity is recorded only through the opt-in Claude Code and Codex
+hooks, and only as far as those hooks report it (see
+[agent capture](agent-capture.md)).
 Classification, grouping, and redaction are heuristics, and all retained
 evidence is bounded.
 

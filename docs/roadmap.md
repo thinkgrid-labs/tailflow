@@ -58,15 +58,17 @@ Roadmap work should preserve four properties:
 - [x] Explicit horizons, gaps, and completeness on every history response.
 - [x] Redaction before display and storage; capture modes.
 
-### Agent observability (next)
+### Agent observability
 
 TailFlow's direction is local observability for coding agents — what an agent
 did, which files and commands it touched, and whether the result was verified
 against the running application.
 
-- M2: opt-in agent collectors (sessions, tool calls, file and command events)
-  writing the existing event schema, with explicit provenance.
-- M3: an agent-activity dashboard built on the v1 query API.
+- [x] M2 (on `dev`): opt-in Claude Code and Codex hooks; sessions, tool calls,
+  command and file events in the existing schema with explicit provenance and
+  coverage; `tailflow sessions`; `/api/v1/sessions`.
+- M3 (next): an agent-activity dashboard built on the v1 query and session APIs.
+- Later: filesystem-verified file changes, before/after diffs, more agents.
 - A human-readable query language (`agent:claude type:file.modified since:24h`)
   compiling to the existing structured filters.
 

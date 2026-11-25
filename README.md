@@ -35,9 +35,11 @@ a local stack. It runs as one small Rust daemon, needs no account, and sends
 nothing off your machine.
 
 > [!NOTE]
-> Today TailFlow records the **runtime output** of your stack. Recording the
-> agent's **own actions** (sessions, tool calls, file edits, commands) is the
-> next milestone and is not available yet. See the [roadmap](#roadmap).
+> TailFlow records the **runtime output** of your stack and, with opt-in hooks
+> for **Claude Code** and **Codex**, the agent's **own actions**: sessions, tool
+> calls, shell commands and the files its tools report reading or editing.
+> Agent capture is on `dev` and ships in the next release. It records what the
+> agent's hooks report, metadata only by default, and says what it cannot see.
 
 ## Why TailFlow?
 
@@ -55,8 +57,9 @@ TailFlow puts that output in one place that both you and the agent can query:
 | What new error appeared after the edit? | Yes — a cursor baseline separates new output from old |
 | Is this one failure, or the same crash 400 times? | Yes — errors are grouped by fingerprint with counts |
 | When did the error occur, and what came right after it? | Yes — timestamps plus trailing stack-trace context |
-| What happened during yesterday's session? | Runtime output only, from durable history (next release) |
-| Which files did the agent change? Which commands and tools did it run? | Planned — agent activity collectors |
+| What happened during yesterday's session? | Runtime output and agent sessions, from durable history (next release) |
+| Which tools and commands did the agent run, and which failed? | Next release — Claude Code and Codex hooks (`tailflow sessions`) |
+| Which files did the agent change? | Next release — as *reported by the agent's file tools*; shell edits are not seen and nothing is verified on disk |
 | How much CPU or memory did that activity use? | Not collected — on the exploring list |
 
 ## Features
@@ -78,6 +81,7 @@ merged on `dev` and ships in the next version.
 | **Configurable retention** | 30 days and a 2 GB cap by default, set in `[storage]` | Next release |
 | **Secret redaction** | Common credential formats are redacted before display and storage | Next release |
 | **Loss reporting** | Every history response says whether it is complete; dropped events are recorded, not hidden | Next release |
+| **Agent capture** | Opt-in Claude Code and Codex hooks record sessions, tool calls, commands and reported file edits; `tailflow sessions` / `tailflow session <id>` | Next release |
 | **Lightweight Rust binaries** | Prebuilt binaries via npm or GitHub releases; no Rust toolchain or database server to install | Released |
 
 The [feature guide](docs/features.md) explains each capability and what its
@@ -86,7 +90,7 @@ results do and do not prove.
 ## How it works
 
 <p align="center">
-  <img src="assets/branding/tailflow-architecture.svg" width="100%" alt="TailFlow architecture: dev processes, Docker containers, log files, and piped stdin flow into tailflow-daemon, which detects severity, groups errors, redacts secrets, and keeps a live buffer and local SQLite history. The daemon serves the web dashboard, an HTTP and SSE API, tailflow-mcp for MCP clients such as Claude Code, and the tailflow-logs shell CLI. Agent activity collectors are shown as planned.">
+  <img src="assets/branding/tailflow-architecture.svg" width="100%" alt="TailFlow architecture: dev processes, Docker containers, log files, and piped stdin flow into tailflow-daemon, which detects severity, groups errors, redacts secrets, and keeps a live buffer and local SQLite history. Opt-in Claude Code and Codex hooks add agent sessions, tool calls, commands and file edits. The daemon serves the web dashboard, an HTTP and SSE API, tailflow-mcp for MCP clients such as Claude Code, and the tailflow-logs shell CLI.">
 </p>
 
 1. **Collect.** `tailflow-daemon` follows the sources in `tailflow.toml` or on
@@ -170,48 +174,50 @@ configuration, Docker and file sources, custom ports, and troubleshooting.
 | **Overhead** | Measured on a 2018 4-core laptop: idle CPU stays at 0%, and history adds about 35 µs of CPU per stored event, roughly 2% of one core at 100 events/s. See [resource cost](docs/storage.md#resource-cost). |
 | **When it runs** | The daemon runs while you keep it open. `tailflow-mcp` runs while your MCP client is connected. `tailflow-logs` exits after each query. |
 
-Durable history, retention, and redaction ship in the next release. Read
+Durable history, retention, redaction, and agent capture ship in the next release. Read
 [durable history and privacy](docs/storage.md) and
 [limitations](docs/limitations.md) before using TailFlow with sensitive logs.
 TailFlow has no authentication, so do not expose the daemon to a network.
 
 ## Supported coding agents
 
-TailFlow connects to agents in two ways: as an **MCP server** that the agent
-calls, or as a **shell CLI** that the agent runs. In both cases the agent reads
-your stack's runtime output. TailFlow does not yet instrument the agent itself.
+TailFlow works with agents in two directions. The agent can **read** your
+stack's runtime output (MCP server or shell CLI), and, with opt-in hooks,
+TailFlow can **record the agent's own actions**.
 
-| Agent | How it connects | Status | Recording the agent's own actions |
-|---|---|---|---|
-| Claude Code | MCP: `claude mcp add tailflow -- tailflow-mcp` | Supported | Planned |
-| Codex CLI, Gemini CLI, and other MCP clients | Register `tailflow-mcp` as a stdio MCP server | Experimental: standard MCP, not tested against each client | Planned |
-| Any agent with shell access | `tailflow-logs` with `--json` | Supported | Planned |
+| Agent | Reads runtime output | Records its actions (next release) |
+|---|---|---|
+| Claude Code | MCP: `claude mcp add tailflow -- tailflow-mcp` | `tailflow agent install claude`: sessions, prompts (count only), every tool call with duration, shell commands with exit status on failure, files reported by Read/Write/Edit, subagents. Validated against Claude Code 2.1.331. |
+| Codex CLI | Register `tailflow-mcp` as a stdio MCP server | `tailflow agent install codex` (Codex ≥ 0.124, trust the hooks in `/hooks`): sessions, turns, tool calls, shell commands (no exit status), `apply_patch` file changes, subagents, token counts (0.171+). Built from the published hook schemas; not yet run against a live Codex. |
+| Gemini CLI and other MCP clients | Register `tailflow-mcp` (standard MCP, not tested per client) | Not supported |
+| Any agent with shell access | `tailflow-logs` with `--json` | Not supported |
 
-When agent activity collectors arrive, each event will record its source as
-either **agent-reported** (from agent hooks or integrations) or
-**filesystem-observed** (watched by TailFlow). The event schema already defines
-these fields. No collector writes them yet.
+Every recorded agent event is marked **agent-reported**: it is what the
+agent's hook said, not something TailFlow verified. `tailflow agent list`
+prints each integration's capability matrix, and every session says whether
+its history is complete. See [agent capture](docs/agent-capture.md) for setup,
+privacy, and exactly what each integration can and cannot see.
 
 ## Roadmap
 
 **Implemented:** runtime collection across processes, Docker, files, and stdin;
 MCP and shell access; error grouping; server-side waits; dashboard and TUI;
 guided setup; and, on `dev`, durable SQLite history with retention, redaction,
-and loss reporting.
+and loss reporting, plus opt-in Claude Code and Codex activity capture with
+session tracking.
 
 **Next:**
 
-- Agent activity collectors (opt-in): sessions, tool calls, file changes, and
-  commands, recorded in the existing event schema
-- An agent activity view in the dashboard, built on the history API
+- An agent activity view in the dashboard, built on the history and session APIs
 - A readable query language, such as `agent:claude type:file.modified since:24h`
 - “What is failing now that was not failing before?” comparisons against a baseline
 - Docker Compose–aware source discovery and container filters
 - MCP served directly from the daemon, and optional daemon auto-start
 
-**Exploring:** multi-agent session correlation, git-change correlation,
-request and trace correlation, resource usage per session, exports and
-diagnostics bundles, and browser-side analysis of history.
+**Exploring:** more agent integrations, before/after diffs for agent edits,
+filesystem-verified file changes, request and trace correlation, resource usage
+per session, exports and diagnostics bundles, and browser-side analysis of
+history.
 
 None of these are commitments. The [full roadmap](docs/roadmap.md) lists
 priorities and non-goals.
@@ -223,6 +229,7 @@ priorities and non-goals.
 | [Getting started](docs/getting-started.md) | Installation, configuration recipes, and troubleshooting |
 | [Features](docs/features.md) | Each capability, its use cases, and what it proves |
 | [TailFlow for agents](docs/agents.md) | MCP tools, shell client, workflow patterns, and HTTP API |
+| [Agent capture](docs/agent-capture.md) | Recording Claude Code and Codex sessions: setup, coverage, privacy, uninstall |
 | [Architecture](docs/architecture.md) | Components, data flow, and design invariants |
 | [Durable history](docs/storage.md) | SQLite history, retention, privacy, and the v1 API |
 | [Limitations](docs/limitations.md) | Security, retention, and source boundaries |

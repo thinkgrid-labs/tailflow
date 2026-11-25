@@ -1,0 +1,43 @@
+{
+  "session_id": "00000002-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/da10b16d-6111-46d6-a954-22cb3f387f55.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "prompt_id": "a60bfb59-23e2-4a02-933f-7f659fcf1711",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/work/proj/second.txt",
+    "old_string": "abc",
+    "new_string": "xyz",
+    "replace_all": false
+  },
+  "tool_response": {
+    "filePath": "/work/proj/second.txt",
+    "oldString": "abc",
+    "newString": "xyz",
+    "originalFile": "abc",
+    "structuredPatch": [
+      {
+        "oldStart": 1,
+        "oldLines": 1,
+        "newStart": 1,
+        "newLines": 1,
+        "lines": [
+          "-abc",
+          "\\ No newline at end of file",
+          "+xyz",
+          "\\ No newline at end of file"
+        ]
+      }
+    ],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_01Tr2FuSpKAaziNtFBExTz2B",
+  "duration_ms": 6
+}

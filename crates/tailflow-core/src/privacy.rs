@@ -64,6 +64,7 @@ pub enum PrivacyError {
     UnknownBuiltinRule(String),
     InvalidGlob { glob: String, reason: String },
     InvalidEventType(String),
+    InvalidAgent(String),
 }
 
 impl fmt::Display for PrivacyError {
@@ -87,6 +88,10 @@ impl fmt::Display for PrivacyError {
             PrivacyError::InvalidEventType(t) => write!(
                 f,
                 "excluded_event_types entry {t:?} is not a known type or `prefix.*` pattern"
+            ),
+            PrivacyError::InvalidAgent(a) => write!(
+                f,
+                "excluded_agents entry {a:?} is not a supported agent (claude-code, codex)"
             ),
         }
     }
@@ -150,22 +155,106 @@ pub const BUILTIN_RULES: &[(&str, &str)] = &[
 
 const PLACEHOLDER_PREFIX: &str = "[REDACTED";
 
+/// Literals one of which every match of a built-in rule must contain, and
+/// whether they are compared ASCII-case-insensitively. A lazy redactor
+/// compiles a rule only when its text contains one of them; a test checks
+/// that the lazy and eager redactors agree on every case.
+const BUILTIN_NEEDLES: &[(&str, &[&str], bool)] = &[
+    ("private_key", &["PRIVATE KEY"], false),
+    ("aws_access_key", &["AKIA", "ASIA"], false),
+    (
+        "github_token",
+        &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"],
+        false,
+    ),
+    ("slack_token", &["xox"], false),
+    ("stripe_key", &["k_live_", "k_test_"], false),
+    ("anthropic_key", &["sk-ant-"], false),
+    ("openai_key", &["sk-"], false),
+    ("google_api_key", &["AIza"], false),
+    ("jwt", &["eyJ"], false),
+    ("authorization_header", &["authorization"], true),
+    ("bearer_token", &["bearer"], true),
+    ("url_credentials", &["://"], false),
+    (
+        "secret_assignment",
+        &[
+            "pass",
+            "secret",
+            "token",
+            "api",
+            "access",
+            "private",
+            "credential",
+        ],
+        true,
+    ),
+];
+
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 struct CompiledRule {
     name: String,
-    regex: Regex,
-    has_secret_group: bool,
+    pattern: String,
+    /// `None` for user rules: always evaluated.
+    needles: Option<(&'static [&'static str], bool)>,
+    /// `(regex, has_secret_group)`, compiled on first use in a lazy
+    /// redactor and at construction otherwise.
+    compiled: std::sync::OnceLock<(Regex, bool)>,
+}
+
+impl CompiledRule {
+    fn eager(name: String, regex: Regex) -> Self {
+        let has = regex.capture_names().any(|n| n == Some("secret"));
+        let pattern = regex.as_str().to_string();
+        let compiled = std::sync::OnceLock::new();
+        let _fresh_cell_is_empty = compiled.set((regex, has));
+        Self {
+            name,
+            pattern,
+            needles: None,
+            compiled,
+        }
+    }
+
+    fn regex(&self) -> &(Regex, bool) {
+        self.compiled.get_or_init(|| {
+            let r = Regex::new(&self.pattern)
+                .expect("built-in redaction rules are covered by tests and compile");
+            let has = r.capture_names().any(|n| n == Some("secret"));
+            (r, has)
+        })
+    }
+
+    fn may_match(&self, text: &str) -> bool {
+        match self.needles {
+            None => true,
+            Some((needles, false)) => needles.iter().any(|n| text.contains(n)),
+            // `(?i)` in the regex crate folds Unicode (`ſ` matches `s`, the
+            // Kelvin sign matches `k`), which an ASCII comparison misses:
+            // non-ASCII text always runs the rule.
+            Some((needles, true)) => {
+                !text.is_ascii() || needles.iter().any(|n| contains_ci(text, n))
+            }
+        }
+    }
 }
 
 /// A stateless, shareable set of compiled rules.
 pub struct Redactor {
     rules: Vec<CompiledRule>,
-    set: RegexSet,
+    /// Prefilter of the eager redactor; `None` in a lazy one.
+    set: Option<RegexSet>,
 }
 
 impl fmt::Debug for Redactor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Redactor")
             .field("rules", &self.rule_names())
+            .field("lazy", &self.set.is_none())
             .finish()
     }
 }
@@ -180,6 +269,29 @@ impl Redactor {
     /// # Errors
     /// An unknown name in `disabled`, or a custom rule that does not compile.
     pub fn new(disabled: &[String], custom: &[RedactionRuleConfig]) -> Result<Self, PrivacyError> {
+        Self::build(disabled, custom, false)
+    }
+
+    /// As [`Redactor::new`], for short-lived processes that redact a few
+    /// strings (the agent hook bridge): built-in rules are compiled only
+    /// when a string contains one of their required literals, instead of
+    /// all of them (~8 ms) up front. Results are identical. Custom rules are
+    /// still compiled — and rejected if invalid — immediately.
+    ///
+    /// # Errors
+    /// As [`Redactor::new`].
+    pub fn new_lazy(
+        disabled: &[String],
+        custom: &[RedactionRuleConfig],
+    ) -> Result<Self, PrivacyError> {
+        Self::build(disabled, custom, true)
+    }
+
+    fn build(
+        disabled: &[String],
+        custom: &[RedactionRuleConfig],
+        lazy: bool,
+    ) -> Result<Self, PrivacyError> {
         for name in disabled {
             if !BUILTIN_RULES.iter().any(|(n, _)| n == name) {
                 return Err(PrivacyError::UnknownBuiltinRule(name.clone()));
@@ -190,15 +302,23 @@ impl Redactor {
             if disabled.iter().any(|d| d == name) {
                 continue;
             }
+            if lazy {
+                rules.push(CompiledRule {
+                    name: (*name).to_string(),
+                    pattern: (*pattern).to_string(),
+                    needles: BUILTIN_NEEDLES
+                        .iter()
+                        .find(|(n, _, _)| n == name)
+                        .map(|(_, needles, ci)| (*needles, *ci)),
+                    compiled: std::sync::OnceLock::new(),
+                });
+                continue;
+            }
             let regex = Regex::new(pattern).map_err(|e| PrivacyError::InvalidRule {
                 name: (*name).to_string(),
                 reason: e.to_string(),
             })?;
-            rules.push(CompiledRule {
-                name: (*name).to_string(),
-                has_secret_group: regex.capture_names().any(|n| n == Some("secret")),
-                regex,
-            });
+            rules.push(CompiledRule::eager((*name).to_string(), regex));
         }
         for rule in custom {
             if rule.name.is_empty()
@@ -225,18 +345,20 @@ impl Redactor {
                     reason: "pattern matches the empty string and would redact everything".into(),
                 });
             }
-            rules.push(CompiledRule {
-                name: rule.name.clone(),
-                has_secret_group: regex.capture_names().any(|n| n == Some("secret")),
-                regex,
-            });
+            rules.push(CompiledRule::eager(rule.name.clone(), regex));
         }
-        let set = RegexSet::new(rules.iter().map(|r| r.regex.as_str())).map_err(|e| {
-            PrivacyError::InvalidRule {
-                name: "<set>".into(),
-                reason: e.to_string(),
-            }
-        })?;
+        let set = if lazy {
+            None
+        } else {
+            Some(
+                RegexSet::new(rules.iter().map(|r| r.pattern.as_str())).map_err(|e| {
+                    PrivacyError::InvalidRule {
+                        name: "<set>".into(),
+                        reason: e.to_string(),
+                    }
+                })?,
+            )
+        };
         Ok(Self { rules, set })
     }
 
@@ -252,13 +374,30 @@ impl Redactor {
     /// Redact `text`. Returns `None` when nothing matched (the common case,
     /// with no allocation).
     pub fn redact(&self, text: &str) -> Option<(String, RedactionInfo)> {
-        let hits = self.set.matches(text);
-        if !hits.matched_any() {
+        // Which rules match the *original* text (as the eager RegexSet
+        // decides), then apply them in rule order to the evolving output.
+        let hits: Vec<usize> = match &self.set {
+            Some(set) => {
+                let m = set.matches(text);
+                if !m.matched_any() {
+                    return None;
+                }
+                m.iter().collect()
+            }
+            None => self
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.may_match(text) && r.regex().0.is_match(text))
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        if hits.is_empty() {
             return None;
         }
         let mut out = text.to_string();
         let mut info = RedactionInfo::default();
-        for idx in hits.iter() {
+        for idx in hits {
             let Some(rule) = self.rules.get(idx) else {
                 continue;
             };
@@ -273,11 +412,12 @@ impl Redactor {
 }
 
 fn apply_rule(rule: &CompiledRule, text: &str) -> (String, u32) {
+    let (regex, has_secret_group) = rule.regex();
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     let mut count: u32 = 0;
-    for caps in rule.regex.captures_iter(text) {
-        let target = if rule.has_secret_group {
+    for caps in regex.captures_iter(text) {
+        let target = if *has_secret_group {
             caps.name("secret")
         } else {
             caps.get(0)
@@ -445,7 +585,24 @@ impl CapturePolicy {
     /// # Errors
     /// Any invalid rule, glob, or event-type pattern.
     pub fn from_config(config: &PrivacyConfig) -> Result<Self, PrivacyError> {
-        let redactor = Redactor::new(&config.disabled_rules, &config.redaction_rules)?;
+        Self::build(config, false)
+    }
+
+    /// [`CapturePolicy::from_config`] with a lazy redactor
+    /// ([`Redactor::new_lazy`]) for short-lived processes.
+    ///
+    /// # Errors
+    /// As [`CapturePolicy::from_config`].
+    pub fn from_config_lazy(config: &PrivacyConfig) -> Result<Self, PrivacyError> {
+        Self::build(config, true)
+    }
+
+    fn build(config: &PrivacyConfig, lazy: bool) -> Result<Self, PrivacyError> {
+        let redactor = if lazy {
+            Redactor::new_lazy(&config.disabled_rules, &config.redaction_rules)?
+        } else {
+            Redactor::new(&config.disabled_rules, &config.redaction_rules)?
+        };
         let mut excluded_types = Vec::new();
         let mut excluded_prefixes = Vec::new();
         for t in &config.excluded_event_types {
@@ -475,8 +632,25 @@ impl CapturePolicy {
             redactor,
             excluded_types,
             excluded_prefixes,
-            excluded_agents: config.excluded_agents.clone(),
-            allowed_dirs: config.allowed_project_dirs.clone(),
+            // Canonical names, so the `claude` alias excludes `claude-code`
+            // events instead of silently excluding nothing.
+            excluded_agents: config
+                .excluded_agents
+                .iter()
+                .map(|a| {
+                    crate::agent::AgentKind::parse(a)
+                        .map(|k| k.as_str().to_string())
+                        .ok_or_else(|| PrivacyError::InvalidAgent(a.clone()))
+                })
+                .collect::<Result<_, _>>()?,
+            allowed_dirs: config
+                .allowed_project_dirs
+                .iter()
+                .map(|d| {
+                    crate::agent::normalize_path(&d.to_string_lossy(), None)
+                        .unwrap_or_else(|| d.clone())
+                })
+                .collect(),
             excluded_globs,
         })
     }
@@ -509,8 +683,42 @@ impl CapturePolicy {
         {
             return Err(Exclusion::Agent);
         }
+        // An agent event with no location cannot be shown to be inside the
+        // allowlist, so it is not recorded (runtime lines carry no path and
+        // are not subject to the allowlist).
+        if !self.allowed_dirs.is_empty()
+            && event.path.is_none()
+            && event.source_type == crate::agent::SOURCE_TYPE
+        {
+            return Err(Exclusion::PathOutsideAllowedDirs);
+        }
+        // Path-like attributes are held to the same boundaries as `path`.
+        if let Some(from) = event
+            .attributes
+            .get("file.renamed_from")
+            .and_then(serde_json::Value::as_str)
+        {
+            let mut probe = event.clone();
+            probe.attributes.clear();
+            probe.path = Some(from.to_string());
+            self.admit(&probe)?;
+        }
         if let Some(path) = event.path.as_deref() {
-            let p = Path::new(path);
+            // Resolve `.` and `..` lexically first: `/work/../etc/passwd`
+            // must not pass an allowlist of `/work`. A rooted path that
+            // climbs above the root cannot be placed anywhere.
+            let normalized_buf = if Path::new(path).has_root() {
+                match crate::agent::normalize_path(path, None) {
+                    Some(n) => Some(n),
+                    None if !self.allowed_dirs.is_empty() => {
+                        return Err(Exclusion::PathOutsideAllowedDirs)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let p = normalized_buf.as_deref().unwrap_or_else(|| Path::new(path));
             // `has_root`, not `is_absolute`: on Windows `\Windows\x` or
             // `/etc/passwd` has no drive prefix, so it is not "absolute",
             // yet it names a location outside the project as surely as
@@ -521,7 +729,7 @@ impl CapturePolicy {
             {
                 return Err(Exclusion::PathOutsideAllowedDirs);
             }
-            let normalized = path.replace('\\', "/");
+            let normalized = p.to_string_lossy().replace('\\', "/");
             if self.excluded_globs.iter().any(|g| g.is_match(&normalized)) {
                 return Err(Exclusion::PathExcluded);
             }
@@ -651,6 +859,137 @@ mod tests {
         shared()
             .redact(text)
             .map_or_else(|| text.to_string(), |(s, _)| s)
+    }
+
+    #[test]
+    fn lazy_and_eager_redactors_agree() {
+        let lazy = Redactor::new_lazy(&[], &[]).unwrap();
+        let eager = shared();
+        assert_eq!(
+            BUILTIN_NEEDLES.len(),
+            BUILTIN_RULES.len(),
+            "every rule has needles"
+        );
+        let mut corpus: Vec<String> = vec![
+            "key AKIAIOSFODNN7EXAMPLE used".into(),
+            "token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789".into(),
+            "Authorization: Bearer abc.def.ghijklmnop".into(),
+            "AUTHORIZATION=token xyz12345".into(),
+            "curl -H 'authorization: Basic dXNlcjpwYXNz'".into(),
+            "DATABASE_URL=postgres://app:hunter22@db:5432/app".into(),
+            "password=s3cr3t! PASSWD: x1 Api-Key=k2 ACCESS_KEY=k3 private_key=k4 credentials: c5".into(),
+            r#"{"password": "s3cr3t", "token": "t0k3n"}"#.into(),
+            concat!("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc").into(),
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz and sk-proj-abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            "AIzaSyA-1234567890abcdefghijklmnopqrstu".into(),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U".into(),
+            "xoxb-123456789012-abcdefghijkl".into(),
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----".into(),
+            "DB_PASS=correcthorse bypass=fine".into(),
+            "nothing to see here".into(),
+            "Bash completed in 12 ms".into(),
+            "command `cargo` failed (exit 101)".into(),
+        ];
+        // Pseudo-random mixes of fragments, deterministic.
+        let frags = [
+            "pass", "=", "Bearer ", "sk-", "AKIA", "://u:p@h", "eyJ", "token: ", "x", " ",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..2_000 {
+            let mut line = String::new();
+            for _ in 0..12 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let f = frags[usize::try_from(seed % frags.len() as u64).unwrap()];
+                line.push_str(f);
+                line.push_str(&format!("{:x}", seed % 0xffff_ffff));
+            }
+            corpus.push(line);
+        }
+        // Unicode case folding under `(?i)`: `ſ` folds to `s`, U+212A to `k`.
+        corpus.push("PA\u{17f}SWORD=hunter2".into());
+        corpus.push("api_\u{212a}ey=abcdef".into());
+        corpus.push("Authori\u{17a}ation: x".into());
+        for text in &corpus {
+            assert_eq!(lazy.redact(text), eager.redact(text), "{text:?}");
+        }
+        assert!(lazy.redact("PA\u{17f}SWORD=hunter2").is_some());
+    }
+
+    #[test]
+    fn agent_exclusions_use_canonical_names_and_reject_typos() {
+        use crate::event::Provenance;
+        let p = CapturePolicy::from_config(&PrivacyConfig {
+            excluded_agents: vec!["claude".into()],
+            ..PrivacyConfig::default()
+        })
+        .unwrap();
+        let mut e = ObservabilityEvent::new(
+            "i",
+            "agent.tool.started",
+            Provenance::AgentReported,
+            "agent_hook",
+            "claude-code",
+            chrono::Utc::now(),
+        );
+        e.agent_name = Some("claude-code".into());
+        e.path = Some("/w".into());
+        assert_eq!(
+            p.admit(&e),
+            Err(Exclusion::Agent),
+            "the alias excludes claude-code"
+        );
+        assert!(matches!(
+            CapturePolicy::from_config(&PrivacyConfig {
+                excluded_agents: vec!["cluade".into()],
+                ..PrivacyConfig::default()
+            }),
+            Err(PrivacyError::InvalidAgent(_))
+        ));
+    }
+
+    #[test]
+    fn allowlist_covers_rename_sources_and_pathless_agent_events() {
+        use crate::event::Provenance;
+        let p = CapturePolicy::from_config(&PrivacyConfig {
+            allowed_project_dirs: vec!["/work".into()],
+            ..PrivacyConfig::default()
+        })
+        .unwrap();
+        let mut e = ObservabilityEvent::new(
+            "i",
+            "file.renamed",
+            Provenance::AgentReported,
+            "agent_hook",
+            "codex",
+            chrono::Utc::now(),
+        );
+        e.path = Some("/work/a".into());
+        assert_eq!(p.admit(&e), Ok(()));
+        e.attributes
+            .insert("file.renamed_from".into(), "/home/me/secret.txt".into());
+        assert_eq!(p.admit(&e), Err(Exclusion::PathOutsideAllowedDirs));
+        e.attributes.clear();
+        e.path = None;
+        assert_eq!(
+            p.admit(&e),
+            Err(Exclusion::PathOutsideAllowedDirs),
+            "no location, no admission"
+        );
+        let runtime = ObservabilityEvent::new(
+            "r",
+            "runtime.log",
+            Provenance::RuntimeObserved,
+            "process",
+            "api",
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            p.admit(&runtime),
+            Ok(()),
+            "runtime lines are not path-bearing"
+        );
     }
 
     #[test]
@@ -880,7 +1219,7 @@ mod tests {
             allowed_project_dirs: vec![PathBuf::from("/work/app")],
             excluded_file_globs: vec!["**/.env".into(), "**/secrets/**".into()],
             excluded_event_types: vec!["git.*".into(), "file.read".into()],
-            excluded_agents: vec!["cursor".into()],
+            excluded_agents: vec!["codex".into()],
             ..PrivacyConfig::default()
         };
         let p = CapturePolicy::from_config(&cfg).unwrap();
@@ -922,7 +1261,7 @@ mod tests {
         assert_eq!(p.admit(&event("git.commit")), Err(Exclusion::EventType));
         assert_eq!(p.admit(&event("file.read")), Err(Exclusion::EventType));
         let mut agent = event("agent.tool.started");
-        agent.agent_name = Some("cursor".into());
+        agent.agent_name = Some("codex".into());
         assert_eq!(p.admit(&agent), Err(Exclusion::Agent));
     }
 

@@ -1,22 +1,22 @@
 {
-  "_comment": "Deterministic resource budgets for scripts/bench/check_budgets.py. Binary sizes are measured release builds (Cargo.toml [profile.release]) plus binary_headroom_pct. Memory ceilings are generous: only a leak or an unbounded buffer should exceed them on any runner. Update the sizes deliberately when a change is expected to grow a binary. Linux sizes measured with Rust 1.98 (rust:1.98-bookworm); macOS with Rust 1.90.",
+  "_comment": "Deterministic resource budgets for scripts/bench/check_budgets.py. Binary sizes are measured release builds (Cargo.toml [profile.release]) plus binary_headroom_pct. Memory ceilings are generous: only a leak or an unbounded buffer should exceed them on any runner. Update the sizes deliberately when a change is expected to grow a binary. Linux sizes measured with Rust 1.98 (rust:1.98-bookworm); macOS with Rust 1.90. M2 (agent capture): tailflow +12.0 % (hook bridge links the privacy/redaction engine the TUI never called) and tailflow-daemon +8.1 % (sessions, spool ingestion, notify); macOS measured, Linux scaled by the same ratios.",
   "binary_headroom_pct": 10,
   "binary_bytes": {
     "darwin-x86_64": {
-      "tailflow": 5009392,
-      "tailflow-daemon": 7703240,
+      "tailflow": 5610000,
+      "tailflow-daemon": 8330000,
       "tailflow-mcp": 1177376,
       "tailflow-logs": 1066184
     },
     "linux-x86_64": {
-      "tailflow": 5308000,
-      "tailflow-daemon": 8288464,
+      "tailflow": 5944000,
+      "tailflow-daemon": 8963000,
       "tailflow-mcp": 1200856,
       "tailflow-logs": 1084848
     },
     "linux-aarch64": {
-      "tailflow": 4792096,
-      "tailflow-daemon": 7494888,
+      "tailflow": 5367000,
+      "tailflow-daemon": 8105000,
       "tailflow-mcp": 1119104,
       "tailflow-logs": 988008
     }

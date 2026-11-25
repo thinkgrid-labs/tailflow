@@ -13,7 +13,7 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 | Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
 | Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
 | Redaction | Heuristic credential patterns | Not every secret is detected |
-| Agent activity | Schema only | No agent, file, command, or git collectors yet |
+| Agent activity | Opt-in Claude Code and Codex hooks (next release) | Only what the agent's hooks report; shell side effects, Claude Code tokens and agent versions are not seen; file events are not verified on disk |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
@@ -154,6 +154,38 @@ after the process exits unless another source also writes it to a file.
   that no retained/new line matched before the deadline.
 - The MCP output is optimized for bounded context, so callers needing exact data
   should request JSON or use the HTTP API.
+
+## Agent capture boundaries
+
+See [agent capture](agent-capture.md#what-tailflow-cannot-see) for the full
+matrix. In short:
+
+- Events are **agent-reported**. A `file.modified` means the agent's file tool
+  reported an edit, not that TailFlow saw the file change. Edits made through
+  the shell (`sed -i`, `>`, `mv`, build scripts) are not recorded.
+- **Claude Code** reports a shell command's exit code only when it fails
+  (parsed from the documented `Exit code N` error text). **Codex** documents
+  no exit code at all, so its commands have no recorded outcome unless the
+  response happens to carry one.
+- Codex runs hooks only after you trust them in `/hooks`; Claude Code
+  interactive sessions run hooks only in trusted folders; managed policy can
+  disable user hooks entirely. TailFlow reports what it can detect but cannot
+  override any of these.
+- A hook call costs the agent about 15 ms (two per Claude Code tool call),
+  almost all of it process start.
+- Without a running daemon, hook calls wait in the spool (about 20,000 calls).
+  Beyond that they are dropped and counted as a recorded gap.
+- Git association reads `.git` metadata at session start and end. A HEAD that
+  moved during a session is reported as inferred, low confidence, and never
+  attributed to the agent.
+- Codex support is built from Codex's published hook schemas and synthetic
+  fixtures; it has not yet been exercised against a live Codex install.
+- Codex runs hooks through your login shell (`$SHELL -lc`). Anything your shell
+  profile prints at startup becomes hook output, which Codex adds to the
+  model's context on `SessionStart`. TailFlow cannot prevent that; keep the
+  profile quiet for non-interactive shells.
+- Agent events are ingested only into the default per-user database; a daemon
+  with a custom `[storage] path` / `--db` does not ingest them.
 
 ## Non-goals
 

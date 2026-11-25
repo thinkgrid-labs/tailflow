@@ -1,0 +1,8 @@
+{
+  "session_id": "00000002-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/da10b16d-6111-46d6-a954-22cb3f387f55.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "hook_event_name": "SessionStart",
+  "source": "startup"
+}

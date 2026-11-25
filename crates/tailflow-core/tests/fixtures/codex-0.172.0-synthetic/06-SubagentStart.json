@@ -1,0 +1,11 @@
+{
+  "session_id": "019a0000-0000-7000-8000-000000000001",
+  "transcript_path": null,
+  "cwd": "/work/proj",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "hook_event_name": "SubagentStart",
+  "turn_id": "turn-1",
+  "agent_id": "agent-1",
+  "agent_type": "worker"
+}

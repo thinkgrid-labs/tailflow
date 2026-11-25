@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="t d">
 <title id="t">TailFlow architecture</title>
-<desc id="d">Sources (dev processes, Docker containers, log files, piped stdin) flow into tailflow-daemon, a Rust process on 127.0.0.1 that detects severity, groups errors, redacts secrets, and keeps a live in-memory buffer plus local SQLite history. The daemon serves a web dashboard, an HTTP and SSE API, the tailflow-mcp server for MCP clients such as Claude Code, and the tailflow-logs shell CLI. Agent activity collectors are planned and not yet available.</desc>
+<desc id="d">Sources (dev processes, Docker containers, log files, piped stdin) flow into tailflow-daemon, a Rust process on 127.0.0.1 that detects severity, groups errors, redacts secrets, and keeps a live in-memory buffer plus local SQLite history. The daemon serves a web dashboard, an HTTP and SSE API, the tailflow-mcp server for MCP clients such as Claude Code, and the tailflow-logs shell CLI. Agent activity (Claude Code and Codex sessions, tool calls, commands, file edits) arrives through opt-in agent hooks.</desc>
 <defs>
 <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0 1L9 5L0 9z" fill="#9ca3af"/></marker>
 </defs>
@@ -51,7 +51,7 @@
 <text x="652" y="390" font-size="21">Live buffer</text>
 <text x="828" y="390" font-size="21">History</text>
 </g>
-<text x="270" y="530" fill="#22d3ee" font-size="15" font-weight="700" letter-spacing="1.5">PLANNED</text>
+<text x="270" y="530" fill="#22d3ee" font-size="15" font-weight="700" letter-spacing="1.5">OPT-IN</text>
 <g fill="#9ca3af" font-size="18">
 <text x="96" y="160">stdout + stderr of commands it runs</text>
 <text x="96" y="252">every container on the local daemon</text>
@@ -74,7 +74,7 @@
 <text x="632" y="516" font-size="16">Runs on your machine. History is one</text>
 <text x="632" y="538" font-size="16">events.db in your user data directory;</text>
 <text x="632" y="560" font-size="16">nothing is uploaded.</text>
-<text x="72" y="660" font-size="17">Solid boxes are implemented; dashed boxes are planned. The tailflow TUI reads sources directly and keeps no history.</text>
+<text x="72" y="660" font-size="17">Dashed: opt-in agent hooks (tailflow agent install). The tailflow TUI reads sources directly and keeps no history.</text>
 </g>
 </g>
 <g font-family="ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="700" fill="#f5f5f5">

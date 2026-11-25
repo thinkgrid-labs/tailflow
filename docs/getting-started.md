@@ -304,6 +304,20 @@ configured services even when they have not printed a log line yet.
 See [TailFlow for agents](agents.md) for the four tools and recommended
 verification workflows.
 
+### Record what the agent does (opt-in)
+
+MCP lets the agent read your stack's output. To also record the agent's own
+sessions, tool calls, commands and file edits, install TailFlow's hooks:
+
+```bash
+tailflow agent install claude    # or: codex
+tailflow agent status
+# … use the agent …
+tailflow sessions
+```
+
+See [agent capture](agent-capture.md) for coverage, privacy and uninstalling.
+
 ## Use TailFlow without MCP
 
 An agent with shell access can use the same capabilities:

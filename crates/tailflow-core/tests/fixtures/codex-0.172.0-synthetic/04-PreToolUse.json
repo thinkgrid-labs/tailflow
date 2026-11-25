@@ -1,0 +1,14 @@
+{
+  "session_id": "019a0000-0000-7000-8000-000000000001",
+  "transcript_path": null,
+  "cwd": "/work/proj",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "turn_id": "turn-1",
+  "tool_name": "apply_patch",
+  "tool_use_id": "call_a2",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** Add File: src/new.rs\n+x\n*** End Patch"
+  }
+}

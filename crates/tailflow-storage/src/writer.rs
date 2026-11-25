@@ -24,6 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tailflow_core::event::{ObservabilityEvent, Provenance};
 
+/// An interrupted statement (the progress handler returned `true`); the
+/// error conversion reports it as a time-budget overrun.
+fn is_interrupt(e: &StorageError) -> bool {
+    matches!(e, StorageError::QueryTimeout)
+}
+
 pub(crate) enum Command {
     Event(Box<ObservabilityEvent>),
     /// Ack once everything enqueued before this command is committed (or
@@ -80,7 +86,22 @@ pub(crate) struct WriterConfig {
     pub heartbeat_interval: Duration,
     /// Wall-clock budget for one retention pass between batches.
     pub retention_budget: Duration,
+    /// Storage queue capacity: maintenance yields above a fraction of it.
+    pub queue_capacity: usize,
 }
+
+/// Queue depth (fraction of capacity) above which maintenance yields to
+/// ingestion: a quarter keeps three quarters of the queue as headroom for
+/// a burst that arrives while a chunk or merge step is running.
+const YIELD_DEPTH_DEN: i64 = 4;
+/// Queue depth above which a running full-text compaction is interrupted.
+const INTERRUPT_DEPTH_DEN: i64 = 2;
+/// Maintenance deferred for longer than this runs regardless of pressure:
+/// under sustained load the size cap and the index must still be enforced.
+/// A forced step is bounded like any other (chunks, a 64-page merge).
+pub(crate) const MAX_MAINTENANCE_DEFERRAL: Duration = Duration::from_secs(60);
+/// How soon an owed compaction is retried after being deferred.
+const COMPACTION_RETRY: Duration = Duration::from_secs(5);
 
 /// Backoff between commit attempts for one batch. After the last, the batch
 /// is counted as lost and recorded as a gap.
@@ -99,6 +120,10 @@ pub(crate) struct Writer {
     pub cycle: retention::Cycle,
     /// Query connections; their idle caches are released on heartbeat ticks.
     pub readers: Arc<crate::ReaderPool>,
+    /// A completed cleanup cycle's full-text compaction has not run yet.
+    pub fts_owed: bool,
+    /// Since when maintenance (deletion or compaction) has been yielding.
+    pub deferred_since: Option<Instant>,
 }
 
 struct Outcome {
@@ -186,6 +211,8 @@ impl Writer {
                 self.next_cleanup = Instant::now()
                     + if more {
                         Duration::from_millis(50)
+                    } else if self.fts_owed {
+                        COMPACTION_RETRY
                     } else {
                         self.cfg.cleanup_interval
                     };
@@ -361,15 +388,90 @@ impl Writer {
         Ok(())
     }
 
+    /// Whether maintenance must run now even under pressure.
+    fn maintenance_forced(&self) -> bool {
+        self.deferred_since
+            .is_some_and(|t| t.elapsed() >= MAX_MAINTENANCE_DEFERRAL)
+    }
+
+    fn queue_deep(&self, den: i64) -> bool {
+        let cap = i64::try_from(self.cfg.queue_capacity).unwrap_or(i64::MAX);
+        self.shared.health.queue_depth.load(Ordering::Relaxed) > cap / den
+    }
+
+    /// Run an owed full-text compaction unless ingestion is under pressure.
+    /// A compaction that starts is interrupted (and rolled back, to be
+    /// retried) if the queue fills past half while it runs — unless it was
+    /// already deferred too long.
+    fn maybe_compact(&mut self, report: &mut RetentionReport) {
+        if !self.fts_owed {
+            return;
+        }
+        let forced = self.maintenance_forced();
+        let h = &self.shared.health;
+        if !forced && self.queue_deep(YIELD_DEPTH_DEN) {
+            h.fts_compaction_deferred.fetch_add(1, Ordering::Relaxed);
+            self.deferred_since.get_or_insert_with(Instant::now);
+            return;
+        }
+        if forced {
+            h.fts_compaction_forced.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let health = self.shared.health.clone();
+            let cap = i64::try_from(self.cfg.queue_capacity).unwrap_or(i64::MAX);
+            let installed = self.conn.progress_handler(
+                10_000,
+                Some(move || {
+                    health.queue_depth.load(Ordering::Relaxed) > cap / INTERRUPT_DEPTH_DEN
+                }),
+            );
+            if let Err(e) = installed {
+                // Without the handler the step cannot be interrupted; defer it.
+                tracing::warn!(err = %e, "could not arm compaction interrupt; deferring");
+                h.fts_compaction_deferred.fetch_add(1, Ordering::Relaxed);
+                self.deferred_since.get_or_insert_with(Instant::now);
+                return;
+            }
+        }
+        let result = retention::compact_fts(&self.conn);
+        if !forced {
+            if let Err(e) = self.conn.progress_handler(0, None::<fn() -> bool>) {
+                tracing::warn!(err = %e, "could not remove the compaction interrupt");
+            }
+        }
+        match result {
+            Ok(()) => {
+                report.fts_compacted = true;
+                self.fts_owed = false;
+                self.deferred_since = None;
+            }
+            Err(e) if is_interrupt(&e) => {
+                h.fts_compaction_deferred.fetch_add(1, Ordering::Relaxed);
+                self.deferred_since.get_or_insert_with(Instant::now);
+            }
+            Err(e) => {
+                // BUSY from a concurrent CLI command, for example: retry with
+                // the next cycle, never fail the pass.
+                tracing::warn!(err = %e, "full-text compaction skipped");
+            }
+        }
+    }
+
     fn retention(&mut self) -> Result<RetentionReport> {
-        let result = retention::run(
+        let forced = self.maintenance_forced();
+        let health = self.shared.health.clone();
+        let cap = i64::try_from(self.cfg.queue_capacity).unwrap_or(i64::MAX);
+        let under_pressure =
+            move || !forced && health.queue_depth.load(Ordering::Relaxed) > cap / YIELD_DEPTH_DEN;
+        let result = retention::run_with_pressure(
             &self.conn,
             &self.cfg.policy,
             Utc::now().timestamp_micros(),
             self.cfg.retention_budget,
             self.cycle,
+            &under_pressure,
         );
-        let report = match result {
+        let mut report = match result {
             Ok(r) => r,
             Err(e) => {
                 // The cycle is abandoned; the next one starts afresh.
@@ -377,6 +479,22 @@ impl Writer {
                 return Err(e);
             }
         };
+        if report.yielded {
+            self.shared
+                .health
+                .maintenance_yields
+                .fetch_add(1, Ordering::Relaxed);
+            self.deferred_since.get_or_insert_with(Instant::now);
+        } else if !self.fts_owed && !report.more_work {
+            // Only a *finished* cycle ends the deferral: a forced pass that
+            // ran out of time keeps the cycle forced until it completes, so
+            // sustained pressure cannot hold cleanup to one slice per minute.
+            self.deferred_since = None;
+        }
+        if report.fts_compaction_due {
+            self.fts_owed = true;
+        }
+        self.maybe_compact(&mut report);
         self.cycle = self.cycle.after(
             report.expired_by_age + report.evicted_by_size > 0,
             report.more_work,
@@ -640,6 +758,7 @@ pub(crate) fn insert_event(
     }
     let seq = c.last_insert_rowid();
     *floor = observed;
+    crate::sessions::upsert(c, e, seq, ts)?;
     if fts {
         if let Some(message) = &e.message {
             c.prepare_cached("INSERT INTO events_fts(rowid, message) VALUES (?1, ?2)")?
