@@ -45,6 +45,14 @@ pub const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 pub const LATE_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 const OVERFLOW_FILE: &str = "overflow.json";
+/// Present while the spool is at its cap: one `stat` tells a hook to
+/// overflow without listing the directory. Removed by the ingestor.
+const FULL_MARKER: &str = ".full";
+/// A hook lists the directory to check the cap on one call in this many
+/// (chosen by its nonce). Listing 20,000 entries costs ~40 ms; sampling
+/// keeps the common case O(1) while bounding overshoot to a few dozen
+/// records past the cap in expectation.
+const COUNT_EVERY: u64 = 16;
 const CLAIMED_DIR: &str = "claimed";
 const RECORD_EXT: &str = "json";
 
@@ -178,6 +186,8 @@ pub struct SpoolStats {
     pub oldest_pending_at: Option<DateTime<Utc>>,
     pub claimed_files: usize,
     pub overflow: Overflow,
+    /// The spool is at its cap: new hook calls are counted as lost.
+    pub full: bool,
 }
 
 /// A spool directory.
@@ -245,16 +255,22 @@ impl Spool {
         }
         self.ensure()?;
         let bytes = serde_json::to_vec(rec).map_err(|e| SpoolError::Corrupt(e.to_string()))?;
-        if bytes.len() > MAX_RECORD_BYTES || self.count_pending(MAX_SPOOL_FILES)? >= MAX_SPOOL_FILES
-        {
+        let nonce = super::unique_nonce();
+        let full = bytes.len() > MAX_RECORD_BYTES || self.dir.join(FULL_MARKER).exists() || {
+            let sampled = super::fnv1a64(nonce.as_bytes(), 0) % COUNT_EVERY == 0;
+            sampled && self.count_pending(MAX_SPOOL_FILES)? >= MAX_SPOOL_FILES && {
+                let _marker_best_effort = write_private(&self.dir.join(FULL_MARKER), b"");
+                true
+            }
+        };
+        if full {
             self.add_overflow(1, rec.written_at)?;
             return Ok(WriteOutcome::Overflowed);
         }
         let stem = format!(
-            "{:x}-{}-{}",
+            "{:x}-{}-{nonce}",
             rec.written_at.timestamp_micros().max(0),
             rec.agent.as_str(),
-            super::unique_nonce()
         );
         let tmp = self.dir.join(format!(".tmp-{stem}"));
         let path = self.dir.join(format!("{stem}.{RECORD_EXT}"));
@@ -340,6 +356,22 @@ impl Spool {
         let r = Self::store_overflow(&mut f, &o);
         let _unlock = f.unlock();
         r
+    }
+
+    /// Clear the "spool full" marker once the inbox is below the cap again.
+    /// Called by the ingestor after a drain.
+    ///
+    /// # Errors
+    /// The directory cannot be listed.
+    pub fn refresh_full_marker(&self) -> io::Result<()> {
+        let marker = self.dir.join(FULL_MARKER);
+        if marker.exists() && self.count_pending(MAX_SPOOL_FILES)? < MAX_SPOOL_FILES {
+            match fs::remove_file(&marker) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Take (and reset) the overflow counter. The caller must record it.
@@ -597,6 +629,7 @@ impl Spool {
         if let Ok(mut f) = fs::File::open(self.dir.join(OVERFLOW_FILE)) {
             s.overflow = Self::read_overflow(&mut f);
         }
+        s.full = self.dir.join(FULL_MARKER).exists();
         s
     }
 }
@@ -693,6 +726,53 @@ mod tests {
         assert_eq!(s.write(&rec).unwrap(), WriteOutcome::Overflowed);
         assert_eq!(s.stats().overflow.count, 1);
         assert_eq!(s.stats().pending_files, 0);
+    }
+
+    #[test]
+    fn a_full_spool_overflows_cheaply_and_recovers() {
+        let (_t, s) = spool();
+        s.ensure().unwrap();
+        for i in 0..MAX_SPOOL_FILES {
+            fs::write(
+                s.dir().join(format!("{i:012x}-claude-code-x{i}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        // Sampled counting: within a bounded number of calls the cap is seen.
+        let mut written = 0;
+        for _ in 0..(COUNT_EVERY * 20) {
+            match s.write(&record(1)).unwrap() {
+                WriteOutcome::Written(_) => written += 1,
+                WriteOutcome::Overflowed => {}
+                WriteOutcome::Empty => unreachable!(),
+            }
+        }
+        assert!(
+            s.stats().full,
+            "the marker is set once a sampled count sees the cap"
+        );
+        assert!(
+            written < 200,
+            "overshoot past the cap stays small ({written})"
+        );
+        let lost = s.stats().overflow.count;
+        assert!(lost > 0);
+        assert_eq!(
+            s.write(&record(1)).unwrap(),
+            WriteOutcome::Overflowed,
+            "marker = O(1) refusal"
+        );
+        // The ingestor drains, then clears the marker.
+        for p in s.pending(MAX_SPOOL_FILES + 500).unwrap() {
+            fs::remove_file(p).unwrap();
+        }
+        s.refresh_full_marker().unwrap();
+        assert!(!s.stats().full);
+        assert!(matches!(
+            s.write(&record(1)).unwrap(),
+            WriteOutcome::Written(_)
+        ));
     }
 
     #[test]

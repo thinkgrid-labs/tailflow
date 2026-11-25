@@ -205,7 +205,9 @@ pub fn list(args: SessionsArgs, cfg: &StorageConfig, privacy: &PrivacyConfig) ->
             local(v.started_at.or(v.first_event_at)),
             duration(v),
             v.counts.tool_calls,
-            v.counts.tool_failures + v.counts.command_failures,
+            // A failed shell call is one tool failure *and* one command
+            // failure; count the incident once.
+            v.counts.tool_failures,
             v.counts.commands,
             v.coverage.history,
             project_label(v)

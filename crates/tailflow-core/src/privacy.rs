@@ -150,22 +150,101 @@ pub const BUILTIN_RULES: &[(&str, &str)] = &[
 
 const PLACEHOLDER_PREFIX: &str = "[REDACTED";
 
+/// Literals one of which every match of a built-in rule must contain, and
+/// whether they are compared ASCII-case-insensitively. A lazy redactor
+/// compiles a rule only when its text contains one of them; a test checks
+/// that the lazy and eager redactors agree on every case.
+const BUILTIN_NEEDLES: &[(&str, &[&str], bool)] = &[
+    ("private_key", &["PRIVATE KEY"], false),
+    ("aws_access_key", &["AKIA", "ASIA"], false),
+    (
+        "github_token",
+        &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"],
+        false,
+    ),
+    ("slack_token", &["xox"], false),
+    ("stripe_key", &["k_live_", "k_test_"], false),
+    ("anthropic_key", &["sk-ant-"], false),
+    ("openai_key", &["sk-"], false),
+    ("google_api_key", &["AIza"], false),
+    ("jwt", &["eyJ"], false),
+    ("authorization_header", &["authorization"], true),
+    ("bearer_token", &["bearer"], true),
+    ("url_credentials", &["://"], false),
+    (
+        "secret_assignment",
+        &[
+            "pass",
+            "secret",
+            "token",
+            "api",
+            "access",
+            "private",
+            "credential",
+        ],
+        true,
+    ),
+];
+
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 struct CompiledRule {
     name: String,
-    regex: Regex,
-    has_secret_group: bool,
+    pattern: String,
+    /// `None` for user rules: always evaluated.
+    needles: Option<(&'static [&'static str], bool)>,
+    /// `(regex, has_secret_group)`, compiled on first use in a lazy
+    /// redactor and at construction otherwise.
+    compiled: std::sync::OnceLock<(Regex, bool)>,
+}
+
+impl CompiledRule {
+    fn eager(name: String, regex: Regex) -> Self {
+        let has = regex.capture_names().any(|n| n == Some("secret"));
+        let pattern = regex.as_str().to_string();
+        let compiled = std::sync::OnceLock::new();
+        let _fresh_cell_is_empty = compiled.set((regex, has));
+        Self {
+            name,
+            pattern,
+            needles: None,
+            compiled,
+        }
+    }
+
+    fn regex(&self) -> &(Regex, bool) {
+        self.compiled.get_or_init(|| {
+            let r = Regex::new(&self.pattern)
+                .expect("built-in redaction rules are covered by tests and compile");
+            let has = r.capture_names().any(|n| n == Some("secret"));
+            (r, has)
+        })
+    }
+
+    fn may_match(&self, text: &str) -> bool {
+        match self.needles {
+            None => true,
+            Some((needles, false)) => needles.iter().any(|n| text.contains(n)),
+            Some((needles, true)) => needles.iter().any(|n| contains_ci(text, n)),
+        }
+    }
 }
 
 /// A stateless, shareable set of compiled rules.
 pub struct Redactor {
     rules: Vec<CompiledRule>,
-    set: RegexSet,
+    /// Prefilter of the eager redactor; `None` in a lazy one.
+    set: Option<RegexSet>,
 }
 
 impl fmt::Debug for Redactor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Redactor")
             .field("rules", &self.rule_names())
+            .field("lazy", &self.set.is_none())
             .finish()
     }
 }
@@ -180,6 +259,29 @@ impl Redactor {
     /// # Errors
     /// An unknown name in `disabled`, or a custom rule that does not compile.
     pub fn new(disabled: &[String], custom: &[RedactionRuleConfig]) -> Result<Self, PrivacyError> {
+        Self::build(disabled, custom, false)
+    }
+
+    /// As [`Redactor::new`], for short-lived processes that redact a few
+    /// strings (the agent hook bridge): built-in rules are compiled only
+    /// when a string contains one of their required literals, instead of
+    /// all of them (~8 ms) up front. Results are identical. Custom rules are
+    /// still compiled — and rejected if invalid — immediately.
+    ///
+    /// # Errors
+    /// As [`Redactor::new`].
+    pub fn new_lazy(
+        disabled: &[String],
+        custom: &[RedactionRuleConfig],
+    ) -> Result<Self, PrivacyError> {
+        Self::build(disabled, custom, true)
+    }
+
+    fn build(
+        disabled: &[String],
+        custom: &[RedactionRuleConfig],
+        lazy: bool,
+    ) -> Result<Self, PrivacyError> {
         for name in disabled {
             if !BUILTIN_RULES.iter().any(|(n, _)| n == name) {
                 return Err(PrivacyError::UnknownBuiltinRule(name.clone()));
@@ -190,15 +292,23 @@ impl Redactor {
             if disabled.iter().any(|d| d == name) {
                 continue;
             }
+            if lazy {
+                rules.push(CompiledRule {
+                    name: (*name).to_string(),
+                    pattern: (*pattern).to_string(),
+                    needles: BUILTIN_NEEDLES
+                        .iter()
+                        .find(|(n, _, _)| n == name)
+                        .map(|(_, needles, ci)| (*needles, *ci)),
+                    compiled: std::sync::OnceLock::new(),
+                });
+                continue;
+            }
             let regex = Regex::new(pattern).map_err(|e| PrivacyError::InvalidRule {
                 name: (*name).to_string(),
                 reason: e.to_string(),
             })?;
-            rules.push(CompiledRule {
-                name: (*name).to_string(),
-                has_secret_group: regex.capture_names().any(|n| n == Some("secret")),
-                regex,
-            });
+            rules.push(CompiledRule::eager((*name).to_string(), regex));
         }
         for rule in custom {
             if rule.name.is_empty()
@@ -225,18 +335,20 @@ impl Redactor {
                     reason: "pattern matches the empty string and would redact everything".into(),
                 });
             }
-            rules.push(CompiledRule {
-                name: rule.name.clone(),
-                has_secret_group: regex.capture_names().any(|n| n == Some("secret")),
-                regex,
-            });
+            rules.push(CompiledRule::eager(rule.name.clone(), regex));
         }
-        let set = RegexSet::new(rules.iter().map(|r| r.regex.as_str())).map_err(|e| {
-            PrivacyError::InvalidRule {
-                name: "<set>".into(),
-                reason: e.to_string(),
-            }
-        })?;
+        let set = if lazy {
+            None
+        } else {
+            Some(
+                RegexSet::new(rules.iter().map(|r| r.pattern.as_str())).map_err(|e| {
+                    PrivacyError::InvalidRule {
+                        name: "<set>".into(),
+                        reason: e.to_string(),
+                    }
+                })?,
+            )
+        };
         Ok(Self { rules, set })
     }
 
@@ -252,13 +364,30 @@ impl Redactor {
     /// Redact `text`. Returns `None` when nothing matched (the common case,
     /// with no allocation).
     pub fn redact(&self, text: &str) -> Option<(String, RedactionInfo)> {
-        let hits = self.set.matches(text);
-        if !hits.matched_any() {
+        // Which rules match the *original* text (as the eager RegexSet
+        // decides), then apply them in rule order to the evolving output.
+        let hits: Vec<usize> = match &self.set {
+            Some(set) => {
+                let m = set.matches(text);
+                if !m.matched_any() {
+                    return None;
+                }
+                m.iter().collect()
+            }
+            None => self
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.may_match(text) && r.regex().0.is_match(text))
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        if hits.is_empty() {
             return None;
         }
         let mut out = text.to_string();
         let mut info = RedactionInfo::default();
-        for idx in hits.iter() {
+        for idx in hits {
             let Some(rule) = self.rules.get(idx) else {
                 continue;
             };
@@ -273,11 +402,12 @@ impl Redactor {
 }
 
 fn apply_rule(rule: &CompiledRule, text: &str) -> (String, u32) {
+    let (regex, has_secret_group) = rule.regex();
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     let mut count: u32 = 0;
-    for caps in rule.regex.captures_iter(text) {
-        let target = if rule.has_secret_group {
+    for caps in regex.captures_iter(text) {
+        let target = if *has_secret_group {
             caps.name("secret")
         } else {
             caps.get(0)
@@ -445,7 +575,24 @@ impl CapturePolicy {
     /// # Errors
     /// Any invalid rule, glob, or event-type pattern.
     pub fn from_config(config: &PrivacyConfig) -> Result<Self, PrivacyError> {
-        let redactor = Redactor::new(&config.disabled_rules, &config.redaction_rules)?;
+        Self::build(config, false)
+    }
+
+    /// [`CapturePolicy::from_config`] with a lazy redactor
+    /// ([`Redactor::new_lazy`]) for short-lived processes.
+    ///
+    /// # Errors
+    /// As [`CapturePolicy::from_config`].
+    pub fn from_config_lazy(config: &PrivacyConfig) -> Result<Self, PrivacyError> {
+        Self::build(config, true)
+    }
+
+    fn build(config: &PrivacyConfig, lazy: bool) -> Result<Self, PrivacyError> {
+        let redactor = if lazy {
+            Redactor::new_lazy(&config.disabled_rules, &config.redaction_rules)?
+        } else {
+            Redactor::new(&config.disabled_rules, &config.redaction_rules)?
+        };
         let mut excluded_types = Vec::new();
         let mut excluded_prefixes = Vec::new();
         for t in &config.excluded_event_types {
@@ -672,6 +819,57 @@ mod tests {
         shared()
             .redact(text)
             .map_or_else(|| text.to_string(), |(s, _)| s)
+    }
+
+    #[test]
+    fn lazy_and_eager_redactors_agree() {
+        let lazy = Redactor::new_lazy(&[], &[]).unwrap();
+        let eager = shared();
+        assert_eq!(
+            BUILTIN_NEEDLES.len(),
+            BUILTIN_RULES.len(),
+            "every rule has needles"
+        );
+        let mut corpus: Vec<String> = vec![
+            "key AKIAIOSFODNN7EXAMPLE used".into(),
+            "token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789".into(),
+            "Authorization: Bearer abc.def.ghijklmnop".into(),
+            "AUTHORIZATION=token xyz12345".into(),
+            "curl -H 'authorization: Basic dXNlcjpwYXNz'".into(),
+            "DATABASE_URL=postgres://app:hunter22@db:5432/app".into(),
+            "password=s3cr3t! PASSWD: x1 Api-Key=k2 ACCESS_KEY=k3 private_key=k4 credentials: c5".into(),
+            r#"{"password": "s3cr3t", "token": "t0k3n"}"#.into(),
+            concat!("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc").into(),
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz and sk-proj-abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            "AIzaSyA-1234567890abcdefghijklmnopqrstu".into(),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U".into(),
+            "xoxb-123456789012-abcdefghijkl".into(),
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----".into(),
+            "DB_PASS=correcthorse bypass=fine".into(),
+            "nothing to see here".into(),
+            "Bash completed in 12 ms".into(),
+            "command `cargo` failed (exit 101)".into(),
+        ];
+        // Pseudo-random mixes of fragments, deterministic.
+        let frags = [
+            "pass", "=", "Bearer ", "sk-", "AKIA", "://u:p@h", "eyJ", "token: ", "x", " ",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..2_000 {
+            let mut line = String::new();
+            for _ in 0..12 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let f = frags[usize::try_from(seed % frags.len() as u64).unwrap()];
+                line.push_str(f);
+                line.push_str(&format!("{:x}", seed % 0xffff_ffff));
+            }
+            corpus.push(line);
+        }
+        for text in &corpus {
+            assert_eq!(lazy.redact(text), eager.redact(text), "{text:?}");
+        }
     }
 
     #[test]

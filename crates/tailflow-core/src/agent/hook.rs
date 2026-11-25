@@ -51,7 +51,9 @@ pub fn load_policy(agents_dir: &Path) -> Result<CapturePolicy, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => AgentConfig::default(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    CapturePolicy::from_config(&cfg.privacy).map_err(|e| format!("{}: {e}", path.display()))
+    // Lazy: a hook process redacts a handful of short strings; compiling
+    // every rule up front would dominate its run time.
+    CapturePolicy::from_config_lazy(&cfg.privacy).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// What one hook call did (for tests and `TAILFLOW_HOOK_DEBUG`).

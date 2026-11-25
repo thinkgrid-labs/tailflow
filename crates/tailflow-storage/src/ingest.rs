@@ -116,6 +116,10 @@ impl SpoolIngestor {
             Err(e) => r.errors.push(format!("listing spool: {e}")),
         }
         if claimed.is_empty() {
+            if let Err(e) = self.spool.refresh_full_marker() {
+                r.errors
+                    .push(format!("clearing the spool-full marker: {e}"));
+            }
             return r;
         }
 
@@ -198,6 +202,12 @@ impl SpoolIngestor {
             Err(e) => r
                 .errors
                 .push(format!("flush failed; records kept for replay: {e}")),
+        }
+        if !r.more {
+            if let Err(e) = self.spool.refresh_full_marker() {
+                r.errors
+                    .push(format!("clearing the spool-full marker: {e}"));
+            }
         }
         r
     }

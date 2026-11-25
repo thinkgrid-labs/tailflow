@@ -131,7 +131,9 @@ def start(binary, extra, workdir, cfg):
     p = subprocess.Popen(
         [binary, "--config", cfg, "--port", str(port), *extra],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env={**os.environ, "RUST_LOG": "error"}, cwd=workdir,
+        # TAILFLOW_DATA_DIR: from M2 a daemon ingests the per-user agent
+        # spool; a benchmark must never touch the developer's real one.
+        env={**os.environ, "RUST_LOG": "error", "TAILFLOW_DATA_DIR": workdir}, cwd=workdir,
     )
     deadline = time.time() + 30
     while time.time() < deadline:

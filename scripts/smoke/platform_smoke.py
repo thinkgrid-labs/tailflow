@@ -90,7 +90,7 @@ def start(binary, cfg, d):
     p = subprocess.Popen([binary, "--config", cfg, "--port", str(port)], cwd=d,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=open(os.path.join(d, f"daemon-{port}.log"), "w"),
-                         env={**os.environ, "RUST_LOG": "warn"}, **kwargs)
+                         env={**os.environ, "RUST_LOG": "warn", "TAILFLOW_DATA_DIR": d}, **kwargs)
     LIVE.append(p)
     t0 = time.time()
     while time.time() - t0 < 60:

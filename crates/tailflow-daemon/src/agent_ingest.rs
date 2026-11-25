@@ -73,8 +73,12 @@ enum Wake {
     Stop,
 }
 
-fn is_inbox_record(dir: &Path, p: &Path) -> bool {
-    p.parent() == Some(dir)
+/// `dirs` holds the spool directory as configured and canonicalized: macOS
+/// FSEvents reports resolved paths (`/private/var/…` for `/var/…`), so a
+/// comparison against the configured spelling alone never matches there.
+fn is_inbox_record(dirs: &[PathBuf], p: &Path) -> bool {
+    p.parent()
+        .is_some_and(|parent| dirs.iter().any(|d| d == parent))
         && p.extension().is_some_and(|e| e == "json")
         && p.file_name()
             .and_then(|n| n.to_str())
@@ -122,10 +126,15 @@ pub fn spawn(
     });
     let dir: PathBuf = spool.dir().to_path_buf();
     let fs_tx = tx.clone();
-    let watch_dir = dir.clone();
+    let mut watch_dirs = vec![dir.clone()];
+    if let Ok(c) = std::fs::canonicalize(&dir) {
+        if c != dir {
+            watch_dirs.push(c);
+        }
+    }
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
-            if ev.paths.iter().any(|p| is_inbox_record(&watch_dir, p)) {
+            if ev.paths.iter().any(|p| is_inbox_record(&watch_dirs, p)) {
                 let _thread_may_be_gone = fs_tx.send(Wake::Fs);
             }
         }
