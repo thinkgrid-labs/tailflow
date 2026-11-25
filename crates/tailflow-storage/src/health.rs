@@ -31,6 +31,14 @@ pub enum LossReason {
     SessionDeleted,
     /// Failed schema validation after sanitizing (e.g. an oversized id).
     InvalidEvent,
+    /// Agent hook calls not spooled because the spool was full (or a
+    /// record could not be written). Counted by the hook, recorded here.
+    AgentSpoolOverflow,
+    /// Agent hook input the bridge could not use: malformed, oversized,
+    /// invalid after sanitizing, or refused by an invalid agent config.
+    AgentInputRejected,
+    /// A spool record that could not be read or parsed. Count unknown.
+    AgentSpoolCorrupt,
 }
 
 impl LossReason {
@@ -43,6 +51,9 @@ impl LossReason {
             LossReason::UncleanShutdown => "unclean_shutdown",
             LossReason::SessionDeleted => "session_deleted",
             LossReason::InvalidEvent => "invalid_event",
+            LossReason::AgentSpoolOverflow => "agent_spool_overflow",
+            LossReason::AgentInputRejected => "agent_input_rejected",
+            LossReason::AgentSpoolCorrupt => "agent_spool_corrupt",
         }
     }
 }
@@ -151,6 +162,16 @@ pub struct Health {
     pub(crate) last_event_at_us: AtomicI64,
     pub(crate) last_commit_at_us: AtomicI64,
     pub(crate) last_commit_latency_us: AtomicI64,
+    /// Agent losses recorded from the spool (overflow, rejected, corrupt).
+    pub(crate) dropped_agent: AtomicU64,
+    /// Retention passes that stopped early because the ingestion queue was
+    /// deep (the remaining work resumes after the next batch).
+    pub(crate) maintenance_yields: AtomicU64,
+    /// Full-text compactions postponed or interrupted under queue pressure.
+    pub(crate) fts_compaction_deferred: AtomicU64,
+    /// Compactions that ran despite pressure because they had been deferred
+    /// too long (cleanup must eventually progress).
+    pub(crate) fts_compaction_forced: AtomicU64,
     state: AtomicU8,
     pub(crate) last_error: Mutex<Option<(DateTime<Utc>, String)>>,
 }
@@ -183,6 +204,7 @@ impl Health {
             storage_error: load(&self.dropped_storage_error),
             writer_stopped: load(&self.dropped_writer_stopped),
             invalid: load(&self.invalid),
+            agent: load(&self.dropped_agent),
         };
         let last_error = self
             .last_error
@@ -213,6 +235,11 @@ impl Health {
                 let ms = us as f64 / 1000.0;
                 (us > 0).then_some(ms)
             },
+            maintenance: MaintenanceCounters {
+                yields: load(&self.maintenance_yields),
+                fts_compaction_deferred: load(&self.fts_compaction_deferred),
+                fts_compaction_forced: load(&self.fts_compaction_forced),
+            },
             last_error_at: last_error.as_ref().map(|(t, _)| *t),
             last_error: last_error.map(|(_, m)| m),
         }
@@ -226,6 +253,17 @@ pub struct DroppedCounts {
     pub storage_error: u64,
     pub writer_stopped: u64,
     pub invalid: u64,
+    /// Agent hook calls lost before reaching storage (spool overflow,
+    /// rejected input, corrupt records), as recorded from the spool.
+    pub agent: u64,
+}
+
+/// Retention/full-text maintenance under ingestion pressure.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MaintenanceCounters {
+    pub yields: u64,
+    pub fts_compaction_deferred: u64,
+    pub fts_compaction_forced: u64,
 }
 
 impl DroppedCounts {
@@ -235,6 +273,7 @@ impl DroppedCounts {
             .saturating_add(self.storage_error)
             .saturating_add(self.writer_stopped)
             .saturating_add(self.invalid)
+            .saturating_add(self.agent)
     }
 }
 
@@ -264,6 +303,7 @@ pub struct HealthSnapshot {
     pub last_event_at: Option<DateTime<Utc>>,
     pub last_commit_at: Option<DateTime<Utc>>,
     pub last_commit_latency_ms: Option<f64>,
+    pub maintenance: MaintenanceCounters,
     pub last_error_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }

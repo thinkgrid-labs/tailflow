@@ -14,10 +14,12 @@
 
 pub mod error;
 pub mod health;
+pub mod ingest;
 pub mod paths;
 pub mod query;
 pub mod retention;
 pub mod schema;
+pub mod sessions;
 mod writer;
 
 pub use error::{Result, StorageError};
@@ -409,6 +411,7 @@ impl Storage {
             cleanup_interval: Duration::from_secs(config.cleanup_interval_secs),
             heartbeat_interval: HEARTBEAT,
             retention_budget: Duration::from_millis(250),
+            queue_capacity: config.queue_capacity,
         };
         let writer = Writer {
             conn,
@@ -422,6 +425,8 @@ impl Storage {
             resuming_cleanup: false,
             cycle: retention::Cycle::default(),
             readers: readers.clone(),
+            fts_owed: false,
+            deferred_since: None,
         };
         let handle = std::thread::Builder::new()
             .name("tailflow-storage".into())
@@ -505,7 +510,21 @@ impl Storage {
     /// Applies the capture policy (collection boundaries, capture mode,
     /// redaction) **before** the event enters the queue, so nothing
     /// unredacted can reach disk regardless of the caller.
-    pub fn submit(&self, mut event: ObservabilityEvent) -> Submitted {
+    pub fn submit(&self, event: ObservabilityEvent) -> Submitted {
+        self.submit_inner(event, None)
+    }
+
+    /// [`Storage::submit`] for producers that can wait (the agent spool
+    /// ingestor): when the queue is full it retries until `deadline` instead
+    /// of dropping at once, so a burst of replayed agent events applies
+    /// backpressure to the spool rather than becoming loss. Blocking: call
+    /// from a blocking context. Loss after the deadline is counted and
+    /// recorded exactly as for `submit`.
+    pub fn submit_backpressured(&self, event: ObservabilityEvent, deadline: Instant) -> Submitted {
+        self.submit_inner(event, Some(deadline))
+    }
+
+    fn submit_inner(&self, mut event: ObservabilityEvent, wait: Option<Instant>) -> Submitted {
         let h = &self.inner.shared.health;
         h.received.fetch_add(1, Ordering::Relaxed);
         h.last_event_at_us
@@ -538,7 +557,20 @@ impl Storage {
         // Counted before the send so the writer's final drain can see that
         // something is still in flight.
         h.queue_depth.fetch_add(1, Ordering::SeqCst);
-        match self.inner.tx.try_send(Command::Event(Box::new(event))) {
+        let mut cmd = Command::Event(Box::new(event));
+        let sent = loop {
+            match self.inner.tx.try_send(cmd) {
+                Err(TrySendError::Full(back))
+                    if wait.is_some_and(|d| Instant::now() < d)
+                        && !self.inner.shared.stopping.load(Ordering::SeqCst) =>
+                {
+                    cmd = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                other => break other,
+            }
+        };
+        match sent {
             Ok(()) => {
                 h.enqueued.fetch_add(1, Ordering::Relaxed);
                 Submitted::Enqueued
@@ -576,6 +608,51 @@ impl Storage {
         // Nudge an idle writer so the gap is recorded promptly.
         let (ack, _rx) = mpsc::sync_channel(1);
         let _queue_full_is_fine = self.inner.tx.try_send(Command::Flush(ack));
+    }
+
+    /// Record agent-side loss reported through the spool (overflow,
+    /// rejected input, corrupt records). Written as a gap with the next
+    /// batch, plus a `system.events.dropped` marker.
+    pub fn record_agent_loss(
+        &self,
+        reason: LossReason,
+        count: u64,
+        first: DateTime<Utc>,
+        last: DateTime<Utc>,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.inner
+            .shared
+            .health
+            .dropped_agent
+            .fetch_add(count, Ordering::Relaxed);
+        self.inner.shared.add_loss(reason, count, first, last);
+    }
+
+    /// Count events a hook's capture policy excluded before spooling
+    /// (deliberate, not loss), so `events_excluded` covers them.
+    pub fn add_excluded(&self, n: u64) {
+        let h = &self.inner.shared.health;
+        h.received.fetch_add(n, Ordering::Relaxed);
+        h.excluded.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Agent sessions, most recent first. Blocking.
+    ///
+    /// # Errors
+    /// Invalid filters or a SQLite failure.
+    pub fn sessions(&self, q: &sessions::SessionQuery) -> Result<sessions::SessionPage> {
+        self.inner.readers.with(|c| sessions::list(c, q))
+    }
+
+    /// One agent session with summaries. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn session(&self, key: &str) -> Result<Option<sessions::SessionDetail>> {
+        self.inner.readers.with(|c| sessions::detail(c, key))
     }
 
     fn send_control(&self, cmd: Command, deadline: Instant) -> Result<()> {
@@ -976,6 +1053,27 @@ pub mod admin {
         db_stats(&open(path)?, path)
     }
 
+    /// Agent sessions, read directly from the file (no daemon needed).
+    ///
+    /// # Errors
+    /// Open failure, invalid filters, or SQLite failure.
+    pub fn sessions(
+        path: &Path,
+        q: &crate::sessions::SessionQuery,
+    ) -> Result<crate::sessions::SessionPage> {
+        let conn = schema::open_writer(path, SyncMode::Normal)?;
+        crate::sessions::list(&conn, q)
+    }
+
+    /// One agent session, read directly from the file.
+    ///
+    /// # Errors
+    /// Open failure or SQLite failure.
+    pub fn session(path: &Path, key: &str) -> Result<Option<crate::sessions::SessionDetail>> {
+        let conn = schema::open_writer(path, SyncMode::Normal)?;
+        crate::sessions::detail(&conn, key)
+    }
+
     /// Full `PRAGMA integrity_check`. Empty = healthy. Read-only.
     ///
     /// # Errors
@@ -1078,6 +1176,10 @@ pub mod admin {
             Ok(Some((c.last_insert_rowid(), hi)))
         })?;
         let Some((gap_id, hi)) = first else {
+            conn.execute(
+                "DELETE FROM agent_sessions WHERE session_key = ?1",
+                [session],
+            )?;
             return Ok(0);
         };
         let mut total = 0u64;
@@ -1110,6 +1212,10 @@ pub mod admin {
             }
             total += n;
         }
+        conn.execute(
+            "DELETE FROM agent_sessions WHERE session_key = ?1",
+            [session],
+        )?;
         Ok(total)
     }
 }

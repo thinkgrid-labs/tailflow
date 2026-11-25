@@ -296,7 +296,14 @@ impl Spool {
 
     fn read_overflow(f: &mut fs::File) -> Overflow {
         let mut s = String::new();
-        let _ = f.rewind();
+        if f.rewind().is_err() {
+            // Cannot read it: loss happened, the amount is unknown.
+            return Overflow {
+                count: 1,
+                first_at: None,
+                last_at: None,
+            };
+        }
         if f.take(4096).read_to_string(&mut s).is_err() || s.trim().is_empty() {
             return Overflow::default();
         }
@@ -401,6 +408,49 @@ impl Spool {
         Ok(names.into_iter().map(|n| self.dir.join(n)).collect())
     }
 
+    /// Records this owner claimed earlier and has not completed (after a
+    /// failed flush, for example), oldest first.
+    ///
+    /// # Errors
+    /// The claim directory cannot be read (missing = none).
+    pub fn own_claims(&self, owner: &str) -> io::Result<Vec<PathBuf>> {
+        let dir = self.claim_dir(owner);
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut v: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_record)
+            })
+            .collect();
+        v.sort();
+        Ok(v)
+    }
+
+    /// Return this owner's unfinished claims to the inbox (clean shutdown),
+    /// so the next daemon does not wait for them to go stale.
+    ///
+    /// # Errors
+    /// The claim directory cannot be read.
+    pub fn release_claims(&self, owner: &str) -> io::Result<usize> {
+        let mut n = 0usize;
+        for p in self.own_claims(owner)? {
+            if let Some(name) = p.file_name() {
+                if fs::rename(&p, self.dir.join(name)).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        let _empty_dir = fs::remove_dir(self.claim_dir(owner));
+        Ok(n)
+    }
+
     fn claim_dir(&self, owner: &str) -> PathBuf {
         self.dir.join(CLAIMED_DIR).join(owner)
     }
@@ -418,7 +468,15 @@ impl Spool {
         };
         let dest = dir.join(name);
         match fs::rename(path, &dest) {
-            Ok(()) => Ok(Some(dest)),
+            Ok(()) => {
+                // Stamp the claim time: staleness is judged from it, and a
+                // record written long ago (daemon was down) must not look
+                // abandoned the moment it is claimed.
+                if let Ok(f) = fs::OpenOptions::new().write(true).open(&dest) {
+                    let _best_effort = f.set_modified(SystemTime::now());
+                }
+                Ok(Some(dest))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
