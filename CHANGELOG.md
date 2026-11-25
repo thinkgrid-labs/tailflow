@@ -125,6 +125,9 @@ commands, the files their tools read or edit — and says what it cannot see.
   postponed (or interrupted past half full) and retried; after 60 s of
   deferral it runs regardless, so cleanup always progresses.
   `health.maintenance` reports yields, deferrals and forced runs.
+- `[privacy] excluded_agents` accepts `claude-code` (alias `claude`) and
+  `codex` and rejects other names at startup, instead of silently excluding
+  nothing.
 - `[privacy] allowed_project_dirs` and `excluded_file_globs` now resolve `.`
   and `..` before matching, so `/work/../etc/passwd` no longer passes an
   allowlist of `/work`.

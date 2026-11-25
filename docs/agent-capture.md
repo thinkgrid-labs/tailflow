@@ -58,6 +58,10 @@ agent ──hook──▶ tailflow agent hook <agent>     (one short process per
 - Run a daemon continuously with `tailflow-daemon --agents` (no log sources
   needed). A daemon started for your stack (`tailflow-daemon` with a
   `tailflow.toml`) ingests agent events too.
+- Agent events go into the **default per-user database** only. A daemon
+  configured with a custom `[storage] path` or `--db` leaves them for one that
+  uses the default (its startup banner says so), so one session is never split
+  across two databases.
 
 The data directory is `~/Library/Application Support/tailflow` (macOS),
 `$XDG_DATA_HOME/tailflow` or `~/.local/share/tailflow` (Linux), or
@@ -182,7 +186,7 @@ as `[privacy]` in `tailflow.toml`:
 capture = "metadata"                     # metadata | redacted | full
 allowed_project_dirs = ["/Users/me/work"] # record nothing outside these
 excluded_file_globs = ["**/.env", "**/.env.*", "**/secrets/**"]
-excluded_agents = []                     # e.g. ["codex"]
+excluded_agents = []                     # claude-code (or claude), codex
 ```
 
 An invalid config makes the hook record nothing (counted as loss and shown by
@@ -245,3 +249,5 @@ directory to remove them.
 | Codex: no events | Run `/hooks` in Codex and trust the TailFlow hooks. `[features] hooks = false` in `config.toml` disables all hooks. |
 | Events stay "waiting" in the spool | No daemon is running. Run `tailflow sessions`, `tailflow-daemon agent ingest`, or `tailflow-daemon --agents`. Check that `TAILFLOW_DATA_DIR` is the same for the agent and the daemon. |
 | Debugging the hook | `TAILFLOW_HOOK_DEBUG=1` makes the hook print a one-line report to stderr. |
+| Hooks stopped after upgrading TailFlow | `tailflow agent status` reports a missing hook binary; run `tailflow agent install …` again from the new install. |
+| Codex prints shell-profile text into the conversation | Codex runs hooks through your login shell (`$SHELL -lc`); anything your profile prints on startup reaches the hook's output. Make the profile quiet for non-interactive shells. |

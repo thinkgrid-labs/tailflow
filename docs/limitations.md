@@ -180,6 +180,12 @@ matrix. In short:
   attributed to the agent.
 - Codex support is built from Codex's published hook schemas and synthetic
   fixtures; it has not yet been exercised against a live Codex install.
+- Codex runs hooks through your login shell (`$SHELL -lc`). Anything your shell
+  profile prints at startup becomes hook output, which Codex adds to the
+  model's context on `SessionStart`. TailFlow cannot prevent that; keep the
+  profile quiet for non-interactive shells.
+- Agent events are ingested only into the default per-user database; a daemon
+  with a custom `[storage] path` / `--db` does not ingest them.
 
 ## Non-goals
 
