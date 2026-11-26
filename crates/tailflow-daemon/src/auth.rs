@@ -395,23 +395,53 @@ impl Auth {
 
     /// Write live sessions to the session store, if one is attached.
     ///
-    /// Not flushed to stable storage: losing this write in an OS crash
-    /// can only lose sessions (browsers sign in again), never restore one.
-    /// Writes that *remove* sessions use [`Auth::persist_removal`].
+    /// Not flushed to stable storage: used only for writes that cannot
+    /// make a revoked session valid again (startup, the idle-clock touch,
+    /// shutdown). On filesystems that write file data before the metadata
+    /// pointing to it (APFS, ext4 `data=ordered`, XFS, btrfs), losing it in
+    /// an OS crash only loses sessions. Writes that remove sessions or sign
+    /// one in use [`Auth::persist_durable`].
     pub fn persist(&self) {
-        self.persist_with(Durability::Unsynced);
+        if let Err(e) = self.persist_with(Durability::Unsynced) {
+            tracing::warn!(err = %e, "could not persist browser sessions");
+        }
     }
 
-    /// Like [`Auth::persist`], but flushed to stable storage before it
-    /// returns, so a revoked or signed-out session cannot be restored from
-    /// an older store after a power loss.
-    fn persist_removal(&self) {
-        self.persist_with(Durability::Synced);
-    }
-
-    fn persist_with(&self, durability: Durability) {
+    /// Like [`Auth::persist`], but flushed to stable storage (file, then
+    /// the directory entry) before it returns, so a revoked, signed-out or
+    /// evicted session cannot come back from an older store after a power
+    /// loss, and a store whose blocks were freed cannot be reused under a
+    /// later unflushed write. Used for sign-in, sign-out and revocation,
+    /// which are rare.
+    ///
+    /// Fails closed: if the new store cannot be written, the old one (which
+    /// may still hold the removed sessions) is deleted, so nothing is
+    /// restored after a restart.
+    fn persist_durable(&self) {
+        let Err(e) = self.persist_with(Durability::Synced) else {
+            return;
+        };
         let Some(path) = self.session_file.get() else {
             return;
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                tracing::warn!(err = %e, "could not write the session store; removed it (browsers sign in again after a restart)");
+                if let Some(dir) = path.parent() {
+                    sync_dir(dir);
+                }
+            }
+            Err(r) if r.kind() == std::io::ErrorKind::NotFound => {}
+            Err(r) => tracing::error!(
+                err = %e, remove_err = %r, path = %path.display(),
+                "could not write or remove the session store: revoked sessions may be restored after a restart within 15 minutes"
+            ),
+        }
+    }
+
+    fn persist_with(&self, durability: Durability) -> std::io::Result<()> {
+        let Some(path) = self.session_file.get() else {
+            return Ok(());
         };
         let _ordered = lock(&self.persist_lock);
         let now = now_secs();
@@ -429,10 +459,8 @@ impl Auth {
         let result = serde_json::to_vec(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             .and_then(|body| write_private(path, &body, durability));
-        if let Err(e) = result {
-            tracing::warn!(err = %e, "could not persist browser sessions");
-        }
         self.last_touch_persist.store(now, Ordering::Relaxed);
+        result
     }
 
     /// End every browser session (all browsers must sign in again).
@@ -443,7 +471,7 @@ impl Auth {
             s.clear();
             n
         };
-        self.persist_removal();
+        self.persist_durable();
         n
     }
 
@@ -533,7 +561,9 @@ impl Auth {
                 last_used: now,
             });
         }
-        self.persist();
+        // Durable: a sign-in may evict a session, and its write must not
+        // land in blocks freed by an earlier sign-out (see persist_durable).
+        self.persist_durable();
         Ok(secret)
     }
 
@@ -546,7 +576,7 @@ impl Auth {
             sessions.len() != before
         };
         if ended {
-            self.persist_removal();
+            self.persist_durable();
         }
         ended
     }
@@ -737,7 +767,8 @@ enum Durability {
 
 /// Atomically replace `path` with `body`, owner-only (`0600` in a `0700`
 /// directory on Unix). Readers see the old file or the new one, never a
-/// partial write; only `Synced` survives a power loss.
+/// partial write. On Unix, `Synced` also survives a power loss (file and
+/// directory are flushed); on Windows the rename itself is not flushed.
 fn write_private(path: &Path, body: &[u8], durability: Durability) -> std::io::Result<()> {
     use std::sync::atomic::AtomicU64 as Counter;
     static NEXT: Counter = Counter::new(0);
@@ -745,12 +776,17 @@ fn write_private(path: &Path, body: &[u8], durability: Durability) -> std::io::R
     tailflow_core::paths::create_private_dir(dir)?;
     // A unique name created exclusively: an existing file or symlink planted
     // at the temporary path makes the write fail instead of following it.
+    // The random part keeps a file left by a crash from colliding with a
+    // later run that reuses the pid and counter (after a reboot).
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
     let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
+        ".{}.{}.{}.{}.tmp",
         path.file_name()
             .map_or_else(|| "file".into(), |n| n.to_string_lossy()),
         std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        u64::from_le_bytes(nonce)
     ));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -798,13 +834,30 @@ fn write_private(path: &Path, body: &[u8], durability: Durability) -> std::io::R
     // A synced write must also make the rename durable, or a power loss
     // could bring back the previous file (for a revocation: the revoked
     // session).
-    #[cfg(unix)]
     if durability == Durability::Synced {
-        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        sync_dir(dir);
+    }
+    Ok(())
+}
+
+/// Flush a directory's entries (Unix). Opened with `O_DIRECTORY` and
+/// `O_NOFOLLOW`, so a symlink or a FIFO planted at the path fails at once
+/// instead of being followed or blocking. Windows: no-op (a directory
+/// cannot be flushed through std).
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(dir);
+        if let Err(e) = opened.and_then(|d| d.sync_all()) {
             tracing::warn!(err = %e, dir = %dir.display(), "could not flush the directory");
         }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Read a runtime file, bounded in size.
@@ -1106,6 +1159,34 @@ mod tests {
         let third = auth();
         third.attach_session_store(path);
         assert_eq!(ok(&third, &s), Err(Denied::SessionExpired));
+    }
+
+    /// M4-F: a revocation that cannot be written removes the old store
+    /// (which still holds the revoked session) instead of leaving it to be
+    /// restored after a restart.
+    #[cfg(unix)]
+    #[test]
+    fn a_revocation_that_cannot_be_written_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let path = run.join("sessions-7878.json");
+        let first = auth();
+        first.attach_session_store(path.clone());
+        let s = session(&first);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&s));
+        // The directory stops being private: write_private refuses it.
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(first.revoke_all_sessions(), 1);
+        assert!(!path.exists(), "the stale store must be gone");
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let second = auth();
+        second.attach_session_store(path);
+        let ok = second.authorize(&headers(&[
+            ("cookie", &format!("{}={s}", second.cookie_name())),
+            ("sec-fetch-site", "same-origin"),
+        ]));
+        assert_eq!(ok, Err(Denied::SessionExpired));
     }
 
     #[test]
