@@ -14,10 +14,11 @@ Nothing leaves your machine, and no account or external database is involved.
 | Collector lifecycle (process, file, Docker, stdin sources) | `system.collector.started`, `.stopped`, `.error` | `system_observed` |
 | Detected loss of events | `system.events.dropped` | `system_observed` |
 | Coding-agent activity, when [agent capture](agent-capture.md) is installed | `agent.*`, `command.*`, `file.*` | `agent_reported` |
+| File changes in directories listed in `[observe]` (path, kind, size; never contents) | `file.*` | `filesystem_observed` (source type `fs_watcher`) |
+| Git snapshots and HEAD movements of observed repositories | `git.snapshot`, `git.commit`, `git.checkout`, `git.head.moved` | `filesystem_observed` (source type `git`) |
 
-`git.*` types are defined but not produced (sessions record Git branch and HEAD
-as attributes instead). `GET /api/v1/schema` lists every type and whether it is
-collected in this version.
+`GET /api/v1/schema` lists every type and whether it is collected in this
+version. See [evidence](evidence.md) for what observation records.
 
 Agent sessions are summarized in their own table (`agent_sessions`, schema v2),
 maintained in the same transaction as each agent event, and served by
@@ -306,7 +307,8 @@ API token (`Authorization: Bearer …`) or a dashboard session; see
 | `severity` | Minimum: `trace`, `debug`, `info`, `warn`, `error` |
 | `status` | `started`, `succeeded`, `failed`, `cancelled` |
 | `path` / `path_prefix` | Glob (`**` crosses `/`, `*` does not) or prefix |
-| `command` | Substring of `attributes.command` |
+| `program` | Exact program of agent command events (`cargo`, `npm`) |
+| `command` | **Deprecated** (removal planned for 0.5): substring of `attributes.command`, which agent command events do not set. Responses carry `Deprecation: true` and `X-TailFlow-Warning`; use `program` |
 | `q` | Full-text terms, all required; `term*` matches a prefix |
 | `since`, `until` | RFC 3339 or relative (`30s`, `5m`, `2h`, `7d`) |
 | `after` / `before` | Cursor: pass `next_cursor` back (`after` for `order=asc`, `before` for `desc`) |

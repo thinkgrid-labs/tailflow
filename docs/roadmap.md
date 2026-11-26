@@ -70,10 +70,13 @@ against the running application.
 - [x] M3 (on `dev`): agent observability dashboard — overview from index
   aggregates, session explorer, activity search, multi-agent timeline with
   runtime markers, files and commands views, virtualized live logs.
-- M4 (next): live agent-event streaming to the dashboard, filesystem-verified
-  file changes and before/after diffs, change-impact analysis that goes beyond
-  time proximity, more agents.
-- Later: request and trace correlation, resource usage per session.
+- [x] M4 (on `dev`): authenticated local API (token for clients, one-time
+  sign-in for browsers), live agent stream, filesystem-verified file changes,
+  Git before/after evidence per session, reported command outcomes, and
+  evidence-graded correlation that never claims cause.
+- Next: more agents, live Codex and Windows-native hook validation, request
+  and trace correlation.
+- Later: resource usage per session.
 - A human-readable query language (`agent:claude type:file.modified since:24h`)
   compiling to the existing structured filters.
 

@@ -34,9 +34,13 @@ test('landmarks and headings exist on every page', async ({ page }) => {
   }
 })
 
-test('keyboard: skip link, search shortcut, focus ring, row activation', async ({ page }) => {
+test('keyboard: skip link, search shortcut, focus ring, row activation', async ({ page, browserName }) => {
   await page.goto('/#/sessions')
-  await page.keyboard.press('Tab')
+  // Tab only once the app has rendered (otherwise focus lands elsewhere).
+  await expect(page.locator('tbody tr').first()).toBeVisible()
+  // macOS WebKit (Safari's default) moves Tab focus to links only with
+  // Option held; Alt+Tab is the keyboard path its users have.
+  await page.keyboard.press(browserName === 'webkit' && process.platform === 'darwin' ? 'Alt+Tab' : 'Tab')
   await expect(page.getByText('Skip to content')).toBeFocused()
   await page.locator('main').click({ position: { x: 5, y: 5 } })
   await page.keyboard.press('/')

@@ -72,7 +72,7 @@ Opening it sets the session cookie and redirects to the dashboard. The link
 works once. Later, or in another browser, run:
 
 ```sh
-tailflow-daemon dashboard          # opens the browser with a fresh link (valid 5 minutes)
+tailflow-daemon dashboard          # opens the browser with a fresh link (valid 60 seconds)
 tailflow-daemon dashboard --no-open  # prints the link instead
 tailflow-daemon dashboard --port 7879
 ```
@@ -83,7 +83,8 @@ that hands out the token or a session to a caller without a credential.
 A browser session:
 
 - is shared by every tab of that browser;
-- survives daemon restarts on the same port, so open dashboards reconnect;
+- survives a daemon restart on the same port within 15 minutes, so open
+  dashboards reconnect (a session store older than that is not restored);
 - ends after 12 hours without use, after 7 days, on **Settings → Sign out**,
   or for every browser at once with
   `tailflow-daemon dashboard --revoke-sessions`.
@@ -124,6 +125,15 @@ cookies, so the daemon also checks where each browser request came from.
 Browsers that don't send Fetch Metadata can't use the dashboard. That means
 Chrome before 76, Firefox before 90 and Safari before 16.4.
 
+The daemon listens on `127.0.0.1` and, when available, `[::1]`, so
+`localhost` always reaches it. If another process already holds the port on
+`[::1]`, the daemon refuses to start rather than leave `localhost` to it.
+
+For dashboard development, `npm run dev` proxies `/api` and `/auth` to the
+daemon without any credential of its own: sign in through the daemon's link
+first. The proxy forwards your session cookie and strips the dev server's
+`Origin`; a page on another port still cannot use it.
+
 ## What is public
 
 Only these paths work without a credential:
@@ -146,7 +156,13 @@ run read-only, with a 10-second timeout:
 - `core.fsmonitor` off, so a hook configured in the repository is not
   executed;
 - no external diff and no textconv;
-- inherited `GIT_DIR`/`GIT_WORK_TREE` removed.
+- inherited `GIT_DIR`/`GIT_WORK_TREE` removed;
+- every filter driver (`filter.<name>.clean`, `smudge`, `process`) disabled,
+  so a repository cannot make TailFlow run a program. If the filters cannot
+  be listed, the snapshot is skipped.
+
+A snapshot lists only paths under the observed directories, and a rename
+whose source is excluded by your privacy settings is withheld.
 
 Commit ids are validated before they are passed to Git. See
 [evidence](evidence.md).
@@ -164,6 +180,19 @@ Commit ids are validated before they are passed to Git. See
 - **Network exposure.** The daemon serves plain HTTP. If you need remote
   access, put an authenticated, encrypted proxy in front of it, or use an SSH
   tunnel with `TAILFLOW_TOKEN`.
+
+## Residual risks
+
+- **Session restore window.** Browser sessions are written to
+  `run/sessions-<port>.json` (owner-only) and restored by a daemon started on
+  the same port within 15 minutes. Anyone who can read that file as your OS
+  user can use a session until it expires; this is the same trust boundary
+  as the runtime file.
+- **Command lines on Linux.** `tailflow-daemon dashboard` passes the
+  one-time sign-in URL to the system opener, whose command line other local
+  users can read while it runs. The link works once and expires after 60
+  seconds; use `--no-open` on shared Linux hosts.
+- **Cookie replay by a loopback server** (above, outside the threat model).
 
 ## Upgrading from 0.3.x
 

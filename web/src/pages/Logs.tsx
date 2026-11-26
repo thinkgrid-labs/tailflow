@@ -10,7 +10,8 @@ import { Callout, Empty } from '../components/ui'
 import { Icon } from '../components/icons'
 
 const LEVELS: LogLevel[] = ['error', 'warn', 'info', 'debug', 'trace']
-const PALETTE = ['#22d3ee', '#4ade80', '#facc15', '#e879f9', '#60a5fa', '#fb923c', '#a3e635', '#f472b6', '#2dd4bf', '#c084fc']
+// Theme-aware colors (--src-0 … --src-9 in index.css), readable on both themes.
+const PALETTE = Array.from({ length: 10 }, (_, i) => `var(--src-${i})`)
 
 const colorIndex = new Map<string, number>()
 function sourceColor(name: string): string {

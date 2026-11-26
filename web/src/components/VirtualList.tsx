@@ -31,6 +31,9 @@ interface Props<T> {
   footer?: ComponentChildren
 }
 
+/** After the user leaves the tail, "at the bottom" is not a return for this long. */
+const LEAVE_GRACE_MS = 400
+
 export function VirtualList<T>(p: Props<T>) {
   const scroller = useRef<HTMLDivElement>(null)
   const index = useRef(new HeightIndex(p.estimate)).current
@@ -44,6 +47,8 @@ export function VirtualList<T>(p: Props<T>) {
   const raf = useRef<number | null>(null)
   /** scrollTop we set while following; only moving above it is a user leaving the tail. */
   const pinned = useRef<number | null>(null)
+  /** When the user last left the tail by input (wheel up, PageUp, scrollbar). */
+  const leftAt = useRef(0)
 
   const keys = useMemo(() => p.items.map(p.keyOf), [p.items])
 
@@ -140,7 +145,11 @@ export function VirtualList<T>(p: Props<T>) {
         // bottom" then is not the user leaving. Only an upward move is.
         const movedUp = pinned.current !== null && el.scrollTop < pinned.current - 4
         if (movedUp) p.onFollowChange?.(false)
-      } else {
+      } else if (!atBottom || performance.now() - leftAt.current > LEAVE_GRACE_MS) {
+        // Right after the user left, a re-pin already queued (follow was
+        // still on when it rendered) can put the view back at the bottom
+        // before the user's own scroll applies (seen in WebKit under a fast
+        // stream). Being at the bottom then is not the user returning.
         p.onFollowChange?.(atBottom)
       }
       if (p.onEndReached && el.scrollTop + el.clientHeight >= el.scrollHeight - 200) p.onEndReached()
@@ -151,7 +160,10 @@ export function VirtualList<T>(p: Props<T>) {
   // Leaving the tail is decided from the user's input, not from positions:
   // under a fast stream the next update re-pins the view before a scroll
   // event could be compared with it.
-  const leave = () => { if (p.follow) p.onFollowChange?.(false) }
+  const leave = () => {
+    leftAt.current = performance.now()
+    if (p.follow) p.onFollowChange?.(false)
+  }
   const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) leave() }
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home') leave()
@@ -194,7 +206,8 @@ export function VirtualList<T>(p: Props<T>) {
           {rows}
         </div>
       </div>
-      {p.footer}
+      {/* Inside role=list, so the footer ("load more") is a list item too. */}
+      {p.footer && <div role="listitem">{p.footer}</div>}
     </div>
   )
 }

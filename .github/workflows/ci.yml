@@ -97,13 +97,41 @@ jobs:
       - run: cd web && npm ci && npm run build
       - run: cargo build -p tailflow-daemon -p tailflow-tui --bins
       - run: cd web && npx playwright install --with-deps chromium
-      - run: cd web && npx playwright test
+      - run: cd web && npx playwright test --project=chromium
         env:
           PLAYWRIGHT_CHANNEL: chromium
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: playwright-results
+          path: web/test-results
+
+  # The same suite (including axe and the Fetch Metadata checks) in Firefox
+  # and WebKit.
+  e2e-browsers:
+    name: e2e (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cd web && npm ci && npm run build
+      - run: cargo build -p tailflow-daemon -p tailflow-tui --bins
+      - run: cd web && npx playwright install --with-deps ${{ matrix.browser }}
+      - run: cd web && npx playwright test --project=${{ matrix.browser }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results-${{ matrix.browser }}
           path: web/test-results
 
   msrv:
@@ -191,7 +219,7 @@ jobs:
   # Set this as the required status check in branch protection for main and dev.
   quality:
     name: quality
-    needs: [fmt, clippy, build, test, web, e2e, msrv, resources, platforms]
+    needs: [fmt, clippy, build, test, web, e2e, e2e-browsers, msrv, resources, platforms]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All checks passed."

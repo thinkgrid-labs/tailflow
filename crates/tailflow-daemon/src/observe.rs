@@ -383,6 +383,7 @@ fn supervise(
                 coalesce: Duration::from_millis(cfg.coalesce_ms),
                 max_directories: cfg.max_directories,
                 id_prefix: format!("fs:{}:{i}", storage.run_key()),
+                queue_capacity: 0,
             };
             match observe::Observer::spawn(root.clone(), rules, opts, sink) {
                 Ok(observer) => {

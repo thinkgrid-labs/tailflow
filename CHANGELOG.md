@@ -21,8 +21,7 @@ Milestone M3: agent observability dashboard. The local web UI becomes an
 investigation tool for agent activity and the runtime around it, without
 claiming more than the hooks reported.
 
-Milestone M4 (in progress): verified changes, runtime correlation and local
-API security.
+Milestone M4: verified changes, runtime correlation and local API security.
 
 ### Added
 
@@ -185,7 +184,23 @@ API security.
   route-level code splitting (initial script 52.6 → 33.8 KB gzip).
 - Schema v4: `fs_coverage` and the partial indexes `events_path_ts` and
   `events_fs_ts`. A large database prints progress around the one-time
-  upgrade.
+  upgrade (about 1.5 s at 1 M events, 3.6 s at 2 M); a second process that
+  opens the database meanwhile waits for it (up to 5 minutes).
+- The daemon also listens on `[::1]`, so `localhost` always reaches it; if
+  another process holds the port there, it refuses to start.
+- Accessibility: every view passes an axe-core WCAG 2.2 AA audit in light
+  and dark themes (contrast of muted text, badges, log levels and source
+  names; links in text underlined; valid ARIA on selectable rows and the
+  search combobox). Timeline items can be stepped through with ↑/↓,
+  Home and End, and are announced. The browser test suite runs in Chromium,
+  Firefox and WebKit.
+
+### Deprecated
+
+- `GET /api/v1/events?command=` matches `attributes.command`, which agent
+  command events do not set. Responses using it carry `Deprecation: true`
+  and an `X-TailFlow-Warning` header; use `program=`. Removal is planned for
+  0.5.
 
 ### Changed
 
@@ -194,8 +209,8 @@ API security.
   clients and plain `curl` get `401` and must send
   `Authorization: Bearer $(tailflow-daemon token)`. `/health` without a
   credential returns only `ok`, `version` and `auth_required`.
-  `tailflow-logs` exits `4` when not authorized. `npm run dev` proxies with
-  the token server-side, for same-origin requests only.
+  `tailflow-logs` exits `4` when not authorized. `npm run dev` proxies
+  without a credential of its own: sign in through the daemon's link first.
 - **The live log view is virtualized.** Only on-screen rows are rendered
   (variable height, expanded JSON, wrapping or horizontal scrolling), the
   view stays put while paused or scrolled up, and a reconnect catches up
@@ -260,6 +275,22 @@ API security.
 
 ### Fixed
 
+- Observation: directories created or moved into an observed project are
+  scanned (bounded) and watched; a save through an excluded temporary file
+  counts as a change of the real file; coverage starts once watches are in
+  place, is closed for the whole run at shutdown, and is re-claimed if
+  another daemon closed it.
+- Git snapshots are a sorted, deterministic prefix of the changed paths, so
+  two snapshots cut at different points no longer make a path look new.
+- The agent stream sends `reset` and ends when history cannot be read, and
+  resets a cursor from another database; catch-up is bounded by pages read.
+- Correlation: tier 1 no longer misses links in busy sessions; an inferred
+  item is no longer also listed as nearby. Outcomes report when nearby
+  runtime errors were truncated.
+- Dashboard: a live or polling refresh no longer aborts a slow load in
+  flight (which could keep a view from ever loading under steady activity).
+- Command intent: quoted arguments, wrapper flags with values and unknown
+  programs can no longer leak an argument into the recorded program.
 - A hash change that happened between the dashboard's first render and its
   router effect was missed, leaving the previous page shown (more likely
   since the sign-in check delays the first render).
@@ -296,6 +327,13 @@ API security.
 
 ### Security
 
+- Sign-in links from `tailflow-daemon dashboard` expire after 60 seconds;
+  stored browser sessions are restored only by a daemon started within 15
+  minutes; session files are written atomically and only into an
+  owner-only directory.
+- Git snapshots disable every filter driver (a repository cannot make
+  TailFlow run a program), list only paths under the observed directories,
+  and withhold renames from paths excluded by privacy settings.
 - Local API access control: other OS users, containers on the host network
   and web pages on other localhost ports can no longer read agent sessions,
   paths, commands or logs. A session cookie counts only on requests the

@@ -115,8 +115,15 @@ Git is only read:
 - runs time out after 10 seconds and output is size-capped;
 - TailFlow never stages, checks out, resets or cleans.
 
-Clean filters you configured yourself (Git LFS, for example) run as they
-would for your own `git status`.
+Filter drivers (Git LFS, for example) are disabled for snapshots: TailFlow
+never runs a program a repository configures. Files they manage may then
+show as modified; the snapshot records `git.filters_disabled`.
+
+A snapshot lists only paths under the observed directories (the total for
+the whole worktree is still recorded), sorted by path. When the list is cut
+(150 paths, or the 11 KiB budget), it stops at `git.changes_listed_through`,
+and comparisons stop there too, so a path beyond the cut is never reported
+as new.
 
 When HEAD differs between two snapshots, TailFlow records one of:
 - `git.checkout`: the branch changed;

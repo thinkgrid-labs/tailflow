@@ -199,8 +199,8 @@ matrix. In short:
 - A file watcher records that a path changed, not which process changed it. A **reported + observed** match is an association within a time window (± 5 s by default), not authorship.
 - The OS may coalesce or drop notifications. Drops the OS reports (`fs_watcher_rescan`) and TailFlow's own queue overflows (`fs_observer_overflow`) are recorded as loss; drops the OS does not report cannot be detected.
 - On Linux at most `max_directories` directories per root are watched (inotify uses one watch per directory); beyond that coverage is reported as partial and reports there are **unverified**.
-- Git snapshots list at most 150 changed paths in the event (the total is always recorded); a session comparison beyond that is marked incomplete. Snapshots happen at startup, at session boundaries (seen within about a second) and after changes settle (at most every 30 s by default): changes between snapshots are seen only as their net effect.
-- TailFlow runs `git status` and `git diff --numstat` read-only. Clean filters configured by the user (for example Git LFS) still run, as they would for the user's own `git status`.
+- Git snapshots list at most 150 changed paths under the observed directories (the total is always recorded); a session comparison stops at the last listed path and is marked incomplete. Snapshots happen at startup, at session boundaries (seen within about a second) and after changes settle (at most every 30 s by default): changes between snapshots are seen only as their net effect.
+- TailFlow runs `git status` and `git diff --numstat` read-only, with every filter driver disabled. Files managed by a filter (for example Git LFS) can therefore appear modified in snapshots when your own `git status` shows them clean.
 - `.gitignore` support is a subset (no `[[:class:]]`), and ignore files created after the observer started apply from the next start.
 
 ## Outcomes and correlation boundaries

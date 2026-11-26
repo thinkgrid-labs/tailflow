@@ -6,8 +6,10 @@ import path from 'node:path'
 // Binaries come from TAILFLOW_BIN_DIR (default: the workspace debug build),
 // so CI and local runs test exactly what was just built.
 //
-// Browser: system Chrome locally (no download); in CI set
-// PLAYWRIGHT_CHANNEL=chromium after `npx playwright install chromium`.
+// Browsers: the `chromium` project uses system Chrome locally (no
+// download); in CI set PLAYWRIGHT_CHANNEL=chromium after
+// `npx playwright install chromium`. `firefox` and `webkit` need
+// `npx playwright install firefox webkit`. Run one with --project.
 
 export default defineConfig({
   testDir: './e2e',
@@ -24,9 +26,13 @@ export default defineConfig({
     baseURL: process.env.TAILFLOW_E2E_BASE,
     // Session cookie for the fixture daemon, written by global-setup.
     storageState: path.join(os.tmpdir(), 'tailflow-e2e-auth.json'),
-    channel: process.env.PLAYWRIGHT_CHANNEL ?? 'chrome',
     headless: true,
     viewport: { width: 1440, height: 900 },
     trace: 'retain-on-failure',
   },
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium', channel: process.env.PLAYWRIGHT_CHANNEL ?? 'chrome' } },
+    { name: 'firefox', use: { browserName: 'firefox' } },
+    { name: 'webkit', use: { browserName: 'webkit' } },
+  ],
 })

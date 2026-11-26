@@ -422,6 +422,10 @@ pub struct Options {
     pub max_directories: usize,
     /// Prefix for event ids (unique per daemon run).
     pub id_prefix: String,
+    /// Notifications buffered between the OS watcher and the observer
+    /// thread; beyond this they are dropped and counted as loss. `0` means
+    /// the default (8,192). Small values are for fault-injection tests.
+    pub queue_capacity: usize,
 }
 
 /// A running observer. Dropping it without [`Observer::stop`] leaves the
@@ -446,7 +450,12 @@ impl Observer {
     /// The OS watcher could not be created or the root could not be
     /// watched.
     pub fn spawn(root: Root, rules: Rules, opts: Options, sink: impl Sink) -> notify::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
+        let capacity = if opts.queue_capacity == 0 {
+            QUEUE
+        } else {
+            opts.queue_capacity
+        };
+        let (tx, rx) = mpsc::sync_channel::<Msg>(capacity);
         let stats = Arc::new(Stats::default());
         let cb_tx = tx.clone();
         let cb_stats = stats.clone();
@@ -1037,6 +1046,7 @@ mod tests {
                 coalesce: Duration::from_millis(100),
                 max_directories: cfg.max_directories,
                 id_prefix: "t".into(),
+                queue_capacity: 0,
             },
             sink.clone(),
         )
@@ -1373,6 +1383,70 @@ mod tests {
         );
     }
 
+    /// A sink that blocks the observer thread on every observation, like
+    /// a storage writer that has stalled.
+    #[derive(Clone, Default)]
+    struct Slow(Collect);
+
+    impl Sink for Slow {
+        fn observed(&self, e: ObservabilityEvent) {
+            std::thread::sleep(Duration::from_millis(30));
+            self.0.observed(e);
+        }
+        fn lost(&self, rescan: bool, count: u64, a: DateTime<Utc>, b: DateTime<Utc>) {
+            self.0.lost(rescan, count, a, b);
+        }
+        fn coverage(&self, _: u64, _: u64) {}
+    }
+
+    #[test]
+    fn fault_a_full_queue_is_reported_as_counted_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ObserveConfig::default();
+        let root = Root::resolve(dir.path(), Path::new("/"), None).unwrap();
+        let sink = Slow::default();
+        let obs = Observer::spawn(
+            root.clone(),
+            Rules::new(&root.display, &cfg, Vec::new()),
+            Options {
+                coalesce: Duration::from_millis(20),
+                max_directories: 100,
+                id_prefix: "t".into(),
+                queue_capacity: 2,
+            },
+            sink.clone(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        // A burst while the sink is stalled: far more notifications than
+        // the 2-slot queue holds.
+        for round in 0..20 {
+            for i in 0..100 {
+                std::fs::write(dir.path().join(format!("f{i}.txt")), format!("{round}")).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sink.0.lost.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Stopping flushes the last loss report; count after it.
+        let stats = obs.stats.clone();
+        obs.stop();
+        let dropped = stats.overflowed.load(Ordering::Relaxed);
+        assert!(dropped > 0, "the queue overflowed");
+        let lost = sink.0.lost.lock().unwrap().clone();
+        // Reported as observer overflow (not a rescan), with the exact count:
+        // loss is never silent and never double counted.
+        assert!(
+            lost.iter()
+                .all(|(rescan, _)| !rescan || cfg!(target_os = "macos")),
+            "{lost:?}"
+        );
+        let reported: u64 = lost.iter().filter(|(r, _)| !r).map(|(_, n)| n).sum();
+        assert_eq!(reported, dropped, "{lost:?}");
+    }
+
     #[test]
     fn stopping_flushes_pending_observations() {
         let dir = tempfile::tempdir().unwrap();
@@ -1389,6 +1463,7 @@ mod tests {
                 coalesce: Duration::from_millis(5_000),
                 max_directories: 100,
                 id_prefix: "t".into(),
+                queue_capacity: 0,
             },
             sink.clone(),
         )

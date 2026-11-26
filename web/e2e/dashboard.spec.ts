@@ -123,9 +123,20 @@ test('commands never claim an outcome that was not reported', async ({ page }) =
 
 test('errors view lists reported failures and runtime errors', async ({ page }) => {
   await page.goto('/#/errors')
-  await expect(page.locator('.act-row', { hasText: 'exited 101' })).toBeVisible()
   await expect(page.locator('.act-row', { hasText: 'connection refused' }).first()).toBeVisible()
-  await expect(page.locator('.act-row', { hasText: 'make exited 2' })).toBeVisible()
+  // The fixture's api source logs an error every 10 s, so on a slow run the
+  // older agent failures sit below the virtualized window: scroll to them.
+  const list = page.getByRole('list', { name: 'Errors' })
+  for (const text of ['exited 101', 'make exited 2']) {
+    const row = page.locator('.act-row', { hasText: text })
+    await list.evaluate(el => { el.scrollTop = 0 })
+    for (let i = 0; i < 40 && !(await row.count()); i++) {
+      await list.evaluate(el => { el.scrollTop += el.clientHeight / 2 })
+      await page.waitForTimeout(50)
+    }
+    await row.first().scrollIntoViewIfNeeded()
+    await expect(row.first()).toBeVisible()
+  }
 })
 
 test('timeline draws agent lanes, intervals and runtime markers; zoom updates the URL', async ({ page }) => {

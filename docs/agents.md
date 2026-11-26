@@ -408,7 +408,7 @@ daemons sharing the per-user database.
 | `agent` | One stored event (`id:` is its seq) |
 | `gap` | Detected loss or expired history in the delivered range: `reason`, `count` (null = unknown), `from_seq`, `to_seq` |
 | `ready` | Catch-up finished, now live (`id:` is the cursor) |
-| `reset` | More than 5,000 events to catch up: continue from `cursor` and reload your views |
+| `reset` | Reload your views and continue from `cursor`. `reason`: `catchup_limit` (more than 5,000 events, or 40 pages, to catch up), `cursor_ahead` (the cursor came from another database), `storage_unavailable` (history could not be read; the stream then ends and your client reconnects) |
 | `lag` | This client fell behind the live feed; the missed events were re-read from history (nothing lost) |
 
 Guarantees:

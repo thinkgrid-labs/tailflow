@@ -218,7 +218,7 @@ function SearchBox({ value, onSubmit }: { value: string; onSubmit: (filters: Rec
       <div class="grow" style={{ position: 'relative' }}>
         <input ref={input} class="input" style={{ width: '100%' }} type="search" value={text} spellcheck={false}
           placeholder="Full-text search, or filters like  agent:codex  type:failures  path:src/**"
-          aria-label="Search history" aria-autocomplete="list" aria-expanded={open && suggestions.length > 0}
+          role="combobox" aria-controls="search-suggest" aria-label="Search history" aria-autocomplete="list" aria-expanded={open && suggestions.length > 0}
           onFocus={() => setOpen(true)} onBlur={() => setTimeout(() => setOpen(false), 150)}
           onInput={e => { setText((e.target as HTMLInputElement).value); setOpen(true) }}
           onKeyDown={e => {
@@ -229,7 +229,7 @@ function SearchBox({ value, onSubmit }: { value: string; onSubmit: (filters: Rec
             if (e.key === 'Escape') setOpen(false)
           }} />
         {open && suggestions.length > 0 && (
-          <div class="suggest" role="listbox" aria-label="Filter suggestions">
+          <div class="suggest" id="search-suggest" role="listbox" aria-label="Filter suggestions">
             {suggestions.map((s, i) => (
               <button type="button" role="option" aria-selected={i === active} key={s.key} onMouseDown={e => { e.preventDefault(); accept(s.key) }}>
                 <span class="mono">{s.key}:</span><span class="hint">{s.hint}</span>
