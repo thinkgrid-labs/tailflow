@@ -43,6 +43,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/files", get(files))
         .route("/api/v1/stream/agent", get(stream_agent))
         .merge(crate::evidence_api::router())
+        .merge(crate::correlation_api::router())
 }
 
 // ── GET /api/v1/stream/agent ─────────────────────────────────────────────────
@@ -1983,5 +1984,219 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── command outcomes and correlation (M4-E, M4-F) ─────────────────────────
+
+    fn bash(id: &str, cmd: &str, phase: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({"cwd": "/work/app", "tool_name": "Bash", "tool_use_id": id,
+            "tool_input": {"command": cmd}});
+        match phase {
+            "pre" => v["hook_event_name"] = "PreToolUse".into(),
+            "ok" => {
+                v["hook_event_name"] = "PostToolUse".into();
+                v["tool_response"] =
+                    serde_json::json!({"stdout": "", "stderr": "", "interrupted": false});
+            }
+            "interrupted" => {
+                v["hook_event_name"] = "PostToolUse".into();
+                v["tool_response"] =
+                    serde_json::json!({"stdout": "", "stderr": "", "interrupted": true});
+            }
+            _ => {
+                v["hook_event_name"] = "PostToolUseFailure".into();
+                v["error"] = "Exit code 1\nerror: test failed".into();
+            }
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn outcomes_report_only_what_the_agent_reported() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(
+            &h,
+            "s-out",
+            &[
+                bash("t1", "cd web && npm test", "pre"),
+                bash("t1", "cd web && npm test", "fail"),
+                bash("b1", "cargo build --release", "pre"),
+                bash("b1", "cargo build --release", "ok"),
+                bash("l1", "cargo clippy", "pre"),
+                bash("l1", "cargo clippy", "interrupted"),
+                bash("r1", "cargo test", "pre"),
+            ],
+        );
+        h.ingest(vec![line("api", LogLevel::Error, "boom after the test")])
+            .await;
+        let (status, v) = h.get("/api/v1/outcomes?since=1h").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let items = v["items"].as_array().unwrap();
+        let by = |sub: &str, prog: &str| {
+            items
+                .iter()
+                .find(|i| i["subcommand"] == sub && i["program"] == prog)
+                .unwrap_or_else(|| panic!("{sub} {prog}: {v}"))
+                .clone()
+        };
+        let t = by("test", "npm");
+        assert_eq!(t["category"], "test");
+        assert_eq!(t["outcome"], "reported_failure");
+        assert_eq!(t["exit_code"], 1);
+        assert!(t["nearby_errors_total"].as_u64().unwrap() >= 1, "{t}");
+        assert!(t["evidence"].as_str().unwrap().contains("reported"));
+        let b = by("build", "cargo");
+        assert_eq!(
+            (b["category"].as_str(), b["outcome"].as_str()),
+            (Some("build"), Some("reported_success"))
+        );
+        let l = by("clippy", "cargo");
+        assert_eq!(
+            (l["category"].as_str(), l["outcome"].as_str()),
+            (Some("lint"), Some("interrupted"))
+        );
+        let r = by("test", "cargo");
+        assert_eq!(
+            r["outcome"], "outcome_unknown",
+            "no end hook: no synthetic success"
+        );
+        // Never claimed for agent commands.
+        assert!(items.iter().all(|i| i["outcome"] != "verified_exit_status"));
+        assert!(v["counts"]["test"]["reported_failure"].as_u64() >= Some(1));
+
+        let (_, f) = h
+            .get("/api/v1/outcomes?since=1h&category=test&outcome=reported_failure")
+            .await;
+        assert_eq!(f["items"].as_array().unwrap().len(), 1, "{f}");
+        for bad in [
+            "/api/v1/outcomes?category=nope",
+            "/api/v1/outcomes?outcome=succeeded",
+            "/api/v1/outcomes?since=1h&until=2h",
+            "/api/v1/outcomes?bogus=1",
+        ] {
+            let (status, _) = h.get(bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn related_events_are_graded_by_evidence_never_causation() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(
+            &h,
+            "s-rel",
+            &[
+                bash("t1", "cargo test", "pre"),
+                bash("t1", "cargo test", "fail"),
+                serde_json::json!({"hook_event_name":"PostToolUse","cwd":"/work/app","tool_name":"Edit",
+                    "tool_use_id":"e1","tool_input":{"file_path":"/work/app/src/handler.rs"},"tool_response":{}}),
+            ],
+        );
+        // An observation of the edited path and a runtime error naming it.
+        let storage = h.state.storage.storage().unwrap().clone();
+        let path = tailflow_core::agent::normalize_path("/work/app/src/handler.rs", None)
+            .unwrap()
+            .display()
+            .to_string();
+        let mut obs = tailflow_core::event::ObservabilityEvent::new(
+            "fs-1",
+            "file.modified",
+            tailflow_core::event::Provenance::FilesystemObserved,
+            tailflow_core::observe::SOURCE_TYPE,
+            "fs:/work/app",
+            Utc::now(),
+        );
+        obs.path = Some(path.clone());
+        let _ = storage.submit(obs);
+        h.ingest(vec![line(
+            "api",
+            LogLevel::Error,
+            "panic in handler.rs line 42",
+        )])
+        .await;
+        let (_, page) = h
+            .get("/api/v1/events?type=command.failed,file.modified&limit=10")
+            .await;
+        let events = page["events"].as_array().unwrap();
+        let cmd = events
+            .iter()
+            .find(|e| e["event_type"] == "command.failed")
+            .unwrap();
+        let edit = events
+            .iter()
+            .find(|e| e["event_type"] == "file.modified" && e["provenance"] == "agent_reported")
+            .unwrap();
+
+        let (status, r) = h
+            .get(&format!("/api/v1/events/{}/related", cmd["seq"]))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        let tier = |r: &serde_json::Value, n: u64| {
+            r["tiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["tier"] == n)
+                .unwrap()
+                .clone()
+        };
+        let t1 = tier(&r, 1);
+        assert!(
+            t1["total"].as_u64().unwrap() >= 2,
+            "tool and command events share ids: {t1}"
+        );
+        assert!(tier(&r, 2)["note"]
+            .as_str()
+            .unwrap()
+            .contains("does not observe processes"));
+        let t4 = tier(&r, 4);
+        assert!(
+            t4["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["summary"].as_str().is_some_and(|s| s.contains("panic"))),
+            "{t4}"
+        );
+        let text = r.to_string().to_lowercase();
+        for banned in ["caused", "because of", "due to", "led to"] {
+            assert!(
+                !text.contains(banned),
+                "no causal wording ({banned}): {text}"
+            );
+        }
+
+        let (_, r) = h
+            .get(&format!("/api/v1/events/{}/related", edit["seq"]))
+            .await;
+        let t2 = tier(&r, 2);
+        assert_eq!(
+            t2["items"].as_array().unwrap().len(),
+            1,
+            "the observation: {t2}"
+        );
+        assert!(t2["items"][0]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("not authorship"));
+        let t5 = tier(&r, 5);
+        assert!(
+            t5["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["explanation"].as_str().unwrap().contains("not confirmed")),
+            "heuristic names the file: {t5}"
+        );
+
+        let (status, _) = h.get("/api/v1/events/999999/related").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = h
+            .get(&format!(
+                "/api/v1/events/{}/related?window_ms=10",
+                cmd["seq"]
+            ))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

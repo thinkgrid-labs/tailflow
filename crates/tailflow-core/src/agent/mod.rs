@@ -29,6 +29,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod command;
 pub mod correlation;
 pub mod hook;
 pub mod install;
@@ -332,6 +333,23 @@ pub fn summarize_command(cmd: &str) -> CommandSummary {
         compound,
         chars: cmd.chars().count(),
     }
+}
+
+/// Record a command's recordable intent (see [`command::intent`]): the
+/// effective program when it differs from `command.program` (`cd x &&
+/// cargo test`), a vocabulary subcommand, a pattern-matching script name.
+/// Never arguments.
+pub(crate) fn put_intent(
+    attrs: &mut serde_json::Map<String, Value>,
+    cmd: &str,
+    program: Option<&str>,
+) {
+    let it = command::intent(cmd);
+    if it.program.as_deref() != program {
+        put(attrs, "command.effective_program", it.program);
+    }
+    put(attrs, "command.subcommand", it.subcommand);
+    put(attrs, "command.script", it.script);
 }
 
 fn is_env_assignment(word: &str) -> bool {

@@ -478,6 +478,50 @@ fn files_inner(c: &Connection, q: &FileEvidenceQuery) -> Result<FileEvidencePage
     })
 }
 
+/// File-change events at exactly `path` between `since` and `until`, from
+/// `source_type` (`fs_watcher` or `agent_hook`), oldest first, at most
+/// `limit` (≤ 50). Uses the `events_path_ts` index.
+///
+/// # Errors
+/// SQLite failure.
+pub fn events_at_path(
+    c: &Connection,
+    path: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    source_type: &str,
+    limit: usize,
+) -> Result<Vec<EvidenceRef>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT seq, ts, event_type, path, session_id, agent_name FROM events INDEXED BY events_path_ts
+         WHERE path = ?1 AND ts BETWEEN ?2 AND ?3
+           AND path IS NOT NULL AND source_type IN ('fs_watcher', 'agent_hook')
+           AND source_type = ?4 AND event_type IN ({CHANGE_TYPES})
+         ORDER BY ts LIMIT ?5"
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            path,
+            micros(since),
+            micros(until),
+            source_type,
+            i64::try_from(limit.min(50)).unwrap_or(50)
+        ],
+        |r| {
+            Ok(Row {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                ty: r.get(2)?,
+                path: r.get(3)?,
+                session: r.get(4)?,
+                agent: r.get(5)?,
+            })
+        },
+    )?;
+    let rows: Vec<Row> = rows.collect::<rusqlite::Result<_>>()?;
+    Ok(rows.iter().map(Row::as_ref).collect())
+}
+
 /// The most recent `git.snapshot` event seq for a worktree root (its
 /// `path`) at or before `at`. Walks `git.snapshot` rows newest first
 /// through the type index.

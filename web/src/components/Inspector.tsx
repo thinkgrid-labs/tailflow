@@ -1,10 +1,9 @@
-// Event inspector: every field of one event, its provenance, explicit
-// relationships (shared operation ids), and runtime events near it in time.
+// Event inspector: every field of one event, its provenance, and related
+// events graded by evidence tier (GET /api/v1/events/{seq}/related).
 // Relationships are labelled by how they are known; time proximity is
 // never presented as cause.
 
 import type { ComponentChildren } from 'preact'
-import { useMemo } from 'preact/hooks'
 import type { StoredEvent } from '../lib/types.ts'
 import { api } from '../lib/api.ts'
 import { useAsync, useSettings } from '../lib/hooks.ts'
@@ -13,8 +12,6 @@ import { agentLabel, PROVENANCE_TEXT, statusOf, summary, category } from '../lib
 import { href } from '../lib/router.ts'
 import { Agent, Badge, Callout, CopyButton, StatusBadge } from './ui'
 import { Icon } from './icons'
-
-const WINDOW_MS = 60_000
 
 function Field({ k, children }: { k: string; children: ComponentChildren }) {
   return (<><dt>{k}</dt><dd>{children}</dd></>)
@@ -98,7 +95,7 @@ function EventBody({ e, tz, onSelect }: { e: StoredEvent; tz: 'local' | 'utc'; o
           {e.path && <Field k={category(e.event_type) === 'file' ? 'Path' : 'Directory'}><span class="mono">{e.path}</span></Field>}
         </dl>
       </section>
-      <Relationships e={e} onSelect={onSelect} />
+      <Relationships e={e} />
       <Nearby e={e} onSelect={onSelect} />
       <section>
         <h4>Attributes</h4>
@@ -131,17 +128,10 @@ function EventBody({ e, tz, onSelect }: { e: StoredEvent; tz: 'local' | 'utc'; o
   )
 }
 
-/** Events sharing this event's operation or its parent: explicit ids only. */
-function Relationships({ e, onSelect }: { e: StoredEvent; onSelect?: (seq: number) => void }) {
+/** The operation ids the source reported (links are graded below). */
+function Relationships({ e }: { e: StoredEvent }) {
   const op = e.operation_id
   const parent = e.parent_operation_id
-  const rel = useAsync(async s => {
-    if (!e.session_id || (!op && !parent)) return []
-    const page = await api.events({ session: e.session_id, after: Math.max(0, e.seq - 400), before: e.seq + 400, limit: 800 }, s)
-    return page.events.filter(x => x.seq !== e.seq && (
-      (op && (x.operation_id === op || x.parent_operation_id === op)) ||
-      (parent && (x.operation_id === parent || x.parent_operation_id === parent))))
-  }, [e.seq])
   if (!op && !parent) return null
   return (
     <section>
@@ -150,60 +140,50 @@ function Relationships({ e, onSelect }: { e: StoredEvent; onSelect?: (seq: numbe
         {op && <Field k="Operation">{<span class="mono">{op}</span>}</Field>}
         {parent && <Field k="Parent">{<span class="mono">{parent}</span>}</Field>}
       </dl>
-      <p class="note" style={{ margin: '8px 0 4px' }}>Linked by ids the agent reported.</p>
-      {rel.data && rel.data.length > 0 && (
-        <ul style={{ listStyle: 'none', display: 'grid', gap: '4px' }}>
-          {rel.data.slice(0, 12).map(x => (
-            <li key={x.seq}><button class="btn sm ghost" onClick={() => onSelect?.(x.seq)}>{summary(x)} <span class="dim">· {statusOf(x).label}</span></button></li>
-          ))}
-        </ul>
-      )}
     </section>
   )
 }
 
-/** Runtime warnings/errors within ±60 s. Chronology, not causation. */
+const TIER_TONE: Record<string, 'ok' | 'info' | 'muted' | 'warn'> = {
+  'recorded link': 'ok', observed: 'ok', context: 'info', nearby: 'muted', inferred: 'warn',
+}
+
+/** Related events graded by evidence (direct ids, independent observation,
+ *  shared context, time proximity, stated heuristics). Never causation. */
 function Nearby({ e, onSelect }: { e: StoredEvent; onSelect?: (seq: number) => void }) {
-  const isRuntime = category(e.event_type) === 'runtime'
-  const t = Date.parse(e.timestamp)
-  const range = useMemo(() => ({
-    since: new Date(t - WINDOW_MS).toISOString(),
-    until: new Date(t + WINDOW_MS).toISOString(),
-  }), [t])
-  const near = useAsync(s => api.events({
-    type: isRuntime ? 'agent.*,command.*,file.*' : 'runtime.error,runtime.warning',
-    since: range.since, until: range.until, limit: 25,
-  }, s), [e.seq])
-  if (Number.isNaN(t)) return null
-  const items = (near.data?.events ?? []).filter(x => x.seq !== e.seq)
+  const r = useAsync(s => api.related(e.seq, s), [e.seq])
   return (
     <section>
-      <h4>{isRuntime ? 'Agent activity within ±60 s' : 'Runtime warnings and errors within ±60 s'}</h4>
-      {near.error ? <p class="note">Unavailable: {(near.error as Error).message}</p>
-        : !near.data ? <div class="skeleton" />
-        : items.length === 0 ? <p class="note">None in this window.</p>
+      <h4>Related evidence</h4>
+      {r.error ? <p class="note">Unavailable: {(r.error as Error).message}</p>
+        : !r.data ? <div class="skeleton" />
         : (
-          <ul style={{ listStyle: 'none', display: 'grid', gap: '2px' }}>
-            {items.map(x => {
-              const dt = Date.parse(x.timestamp) - t
-              const sameProject = !!x.project_id && x.project_id === e.project_id
-              return (
-                <li key={x.seq}>
-                  <button class="btn sm ghost" style={{ maxWidth: '100%' }} onClick={() => onSelect?.(x.seq)} title={x.message ?? summary(x)}>
-                    <span class="mono dim">{dt >= 0 ? '+' : '−'}{duration(Math.abs(dt))}</span>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{x.message ?? summary(x)}</span>
-                    {sameProject && <Badge tone="outline">same project</Badge>}
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
+          <>
+            {r.data.tiers.map(t => (
+              <div key={t.tier} class="tier">
+                <div class="tier-head">
+                  <Badge tone={TIER_TONE[t.strength] ?? 'muted'} title={t.description}>{`${t.tier}. ${t.name}`}</Badge>
+                  <span class="note">{t.total === 0 ? 'none' : `${t.total}${t.total > t.items.length ? ` · showing ${t.items.length}` : ''}`}</span>
+                </div>
+                {t.items.length > 0 && (
+                  <ul style={{ listStyle: 'none', display: 'grid', gap: '2px' }}>
+                    {t.items.map(x => (
+                      <li key={x.seq}>
+                        <button class="btn sm ghost" style={{ maxWidth: '100%' }} onClick={() => onSelect?.(x.seq)} title={x.explanation}>
+                          <span class="mono dim">{x.delta_ms >= 0 ? '+' : '−'}{duration(Math.abs(x.delta_ms))}</span>
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{x.summary ?? x.event_type}</span>
+                        </button>
+                        <div class="note tier-why">{x.explanation}</div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {t.note && <p class="note tier-why">{t.note}</p>}
+              </div>
+            ))}
+            <p class="note" style={{ marginTop: '6px' }}>{r.data.notice} Window ±{Math.round(r.data.window_ms / 1000)} s.</p>
+          </>
         )}
-      <p class="note" style={{ marginTop: '6px' }}>
-        {dt0(isRuntime)} Shown because they are close in time — that alone does not mean they are related.
-      </p>
     </section>
   )
 }
-
-const dt0 = (rt: boolean) => (rt ? 'Agent operations near this log line.' : 'Occurred before (−) or after (+) this event.')

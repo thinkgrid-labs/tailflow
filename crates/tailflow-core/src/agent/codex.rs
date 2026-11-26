@@ -472,6 +472,7 @@ fn tool_events(
                 (_, Some(code)) => format!("command `{program}` failed (exit {code})"),
                 _ => format!("command `{program}` failed"),
             });
+            super::put_intent(&mut c.attributes, &cmd, summary.program.as_deref());
             put(&mut c.attributes, "command.program", summary.program);
             c.attributes
                 .insert("command.compound".into(), Value::Bool(summary.compound));

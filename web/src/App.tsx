@@ -7,16 +7,21 @@ import { useLiveStatus } from './hooks/useLogStream'
 import { Icon, type IconName } from './components/icons'
 import { Overview } from './pages/Overview'
 import { Sessions } from './pages/Sessions'
-import { SessionDetailPage } from './pages/SessionDetail'
 import { Activity } from './pages/Activity'
-import { Timeline } from './pages/Timeline'
 import { Logs } from './pages/Logs'
-import { Files } from './pages/Files'
-import { Commands } from './pages/Commands'
-import { Integrations } from './pages/Integrations'
-import { SettingsPage } from './pages/Settings'
+import { lazy } from './lib/lazy.ts'
+import { Card, Loading } from './components/ui'
 import { SignIn } from './components/SignIn'
 import { authState, checkSession, subscribeAuth, type AuthState } from './lib/auth.ts'
+
+// Less-used pages load on first visit (route-level code splitting).
+const pageFallback = () => <div class="page"><Card><Loading rows={6} /></Card></div>
+const SessionDetailPage = lazy(() => import('./pages/SessionDetail').then(m => m.SessionDetailPage), pageFallback)
+const Timeline = lazy(() => import('./pages/Timeline').then(m => m.Timeline), pageFallback)
+const Files = lazy(() => import('./pages/Files').then(m => m.Files), pageFallback)
+const Commands = lazy(() => import('./pages/Commands').then(m => m.Commands), pageFallback)
+const Integrations = lazy(() => import('./pages/Integrations').then(m => m.Integrations), pageFallback)
+const SettingsPage = lazy(() => import('./pages/Settings').then(m => m.SettingsPage), pageFallback)
 
 const NAV: { page: Page; label: string; icon: IconName; section?: string }[] = [
   { page: 'overview', label: 'Overview', icon: 'overview' },

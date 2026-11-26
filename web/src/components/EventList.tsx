@@ -1,10 +1,10 @@
 // Virtualized activity rows: `time | agent | icon | activity | status | duration`.
 
 import type { StoredEvent } from '../lib/types.ts'
-import { category, statusOf, summary, type Category } from '../lib/events.ts'
+import { category, PROVENANCE_TEXT, statusOf, summary, type Category } from '../lib/events.ts'
 import { clock, duration } from '../lib/format.ts'
 import { useSettings } from '../lib/hooks.ts'
-import { Agent, StatusBadge } from './ui'
+import { Agent, Badge, StatusBadge } from './ui'
 import { Icon, type IconName } from './icons'
 import { VirtualList } from './VirtualList'
 import type { ComponentChildren } from 'preact'
@@ -32,7 +32,11 @@ export function EventRow({ e, selected, onSelect }: { e: StoredEvent; selected: 
       onClick={() => onSelect(e.seq)}
       onKeyDown={ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onSelect(e.seq) } }}>
       <span class="t" title={e.timestamp}>{clock(e.timestamp, settings.tz)}</span>
-      <span class="who"><Agent name={e.agent_name ?? (category(e.event_type) === 'runtime' ? null : e.source_id)} /></span>
+      <span class="who">
+        {e.provenance === 'filesystem_observed'
+          ? <Badge tone="outline" icon="files" title={PROVENANCE_TEXT.filesystem_observed.detail}>{e.source_type === 'git' ? 'git' : 'on disk'}</Badge>
+          : <Agent name={e.agent_name ?? (category(e.event_type) === 'runtime' ? null : e.source_id)} />}
+      </span>
       <CategoryIcon e={e} />
       <span class="what" title={e.message ?? text}>
         {text}

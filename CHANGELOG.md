@@ -164,6 +164,25 @@ API security.
     evidence, never credits pre-existing changes, and lists concurrent
     sessions and limitations.
   - **Session → Git changes**.
+- **Command outcomes (M4-E).** Hooks also record a command's intent:
+  - the effective program, for example after `cd …&&`;
+  - a subcommand from a fixed per-tool vocabulary;
+  - a script name matching a fixed pattern.
+
+  Arguments are never recorded. `GET /api/v1/outcomes` and **Commands →
+  Tests, builds & checks** classify commands (build, test, lint, typecheck,
+  format, deps), with the rule that decided each one. Outcomes are only
+  what was reported (`reported_success`, `reported_failure` with the exit
+  code, `interrupted`, `outcome_unknown`). Runtime errors during or up to
+  30 s after a command are listed as nearby. Session summaries list tests,
+  builds and checks.
+- **Evidence-graded correlation (M4-F).** `GET /api/v1/events/{seq}/related`
+  and the inspector's **Related evidence** list related events in five
+  tiers (direct identifiers, independent observation, shared context,
+  temporal proximity, inference), each with its reason, and no causal
+  claims.
+- Dashboard: provenance markers (**on disk**, **git**) in event lists, and
+  route-level code splitting (initial script 52.6 → 33.8 KB gzip).
 - Schema v4: `fs_coverage` and the partial indexes `events_path_ts` and
   `events_fs_ts`. A large database prints progress around the one-time
   upgrade.

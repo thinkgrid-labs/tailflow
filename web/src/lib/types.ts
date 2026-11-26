@@ -470,3 +470,64 @@ export interface ObserveStatus {
   coalesce_ms: number
   git_min_interval_secs: number
 }
+
+export interface RelatedItem {
+  seq: number
+  at: string
+  event_type: string
+  summary: string | null
+  explanation: string
+  delta_ms: number
+  session_id?: string
+}
+
+export interface RelatedTier {
+  tier: number
+  name: string
+  strength: string
+  description: string
+  items: RelatedItem[]
+  total: number
+  note?: string
+}
+
+export interface RelatedPage {
+  seq: number
+  event_type: string
+  window_ms: number
+  tiers: RelatedTier[]
+  notice: string
+}
+
+export interface CommandOutcome {
+  operation_id: string | null
+  session_id: string | null
+  agent_name: string | null
+  project_id: string | null
+  program: string | null
+  subcommand: string | null
+  script: string | null
+  category: 'build' | 'test' | 'lint' | 'typecheck' | 'format' | 'deps' | 'other' | 'unknown'
+  category_rule: string
+  outcome: 'reported_success' | 'reported_failure' | 'interrupted' | 'outcome_unknown' | 'verified_exit_status'
+  evidence: string
+  exit_code: number | null
+  exit_code_source: string | null
+  started_at: string | null
+  ended_at: string | null
+  duration_ms: number | null
+  start_seq: number | null
+  end_seq: number | null
+  compound: boolean
+  nearby_errors: { seq: number; at: string; source_id: string; message: string | null; same_project: boolean }[]
+  nearby_errors_total: number
+}
+
+export interface OutcomesPage {
+  items: CommandOutcome[]
+  counts: Record<string, Record<string, number>>
+  total: number
+  truncated: boolean
+  nearby_after_ms: number
+  outcomes: Record<string, string>
+}

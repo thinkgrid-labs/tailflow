@@ -385,6 +385,9 @@ verdict, is served under `/api/v1/events`. See
 | `GET /api/v1/evidence/files?since=&until=&session=&agent=&path_prefix=&window_ms=&status=&limit=` | Each reported or observed file change with `status` (`matched_observation`, `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`), an explanation, and the event seqs behind it; coverage and observer loss over the range |
 | `GET /api/v1/sessions/{id}/changes` | The session's worktree before/after comparison: changed paths with evidence, pre-existing changes, concurrent sessions, limitations |
 
+| `GET /api/v1/outcomes?since=&until=&session=&agent=&project=&category=&outcome=&limit=` | Command operations with `category` (+ `category_rule`), `outcome` (`reported_success`, `reported_failure`, `interrupted`, `outcome_unknown`), exit code when reported, duration, and nearby runtime errors; counts per category and outcome |
+| `GET /api/v1/events/{seq}/related?window_ms=` | Related events in five evidence tiers with an explanation per item; never causal |
+
 `git.snapshot`, `git.commit`, `git.checkout` and `git.head.moved` events are
 also available through `/api/v1/events`. See [evidence](evidence.md).
 
