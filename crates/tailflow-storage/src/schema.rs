@@ -18,7 +18,7 @@ use tailflow_core::config::SyncMode;
 pub const APPLICATION_ID: i32 = 0x5446_4c57;
 
 /// Highest schema version this build understands.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// How long a connection waits on a lock held by another connection or
 /// process before reporting `SQLITE_BUSY`.
@@ -171,6 +171,28 @@ CREATE INDEX agent_sessions_recent   ON agent_sessions(last_event_at);
 CREATE INDEX agent_sessions_last_seq ON agent_sessions(last_seq);
 ";
 
+/// Schema v3 (M3): a partial covering index over agent events, for the
+/// dashboard aggregates (`/api/v1/stats`, `/api/v1/files`).
+///
+/// Counting agent activity by event time over days of history otherwise
+/// costs one random table lookup per agent event (`ts`, `agent_name`,
+/// `project_id` are not in `events_type`): ~140k lookups for a 7-day range on
+/// a 2M-event store, which blew the 3 s query budget on a cold cache. With
+/// `(event_type, ts, agent_name, project_id, session_id, path)` the overview
+/// counts and the per-path file aggregation are index-only.
+///
+/// Partial (`agent_name IS NOT NULL`): runtime logs — the bulk of the table —
+/// are not in it, so ingestion of runtime lines is unaffected; each agent
+/// event adds one index entry. Building it scans the table once, at upgrade.
+///
+/// Rollback: a v2 build refuses a v3 file (`NewerSchema`) and runs
+/// memory-only without modifying it.
+const V3: &str = r"
+CREATE INDEX IF NOT EXISTS events_agent_activity
+    ON events(event_type, ts, agent_name, project_id, session_id, path)
+    WHERE agent_name IS NOT NULL;
+";
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -181,6 +203,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "agent sessions; drop unused events_ts index",
         sql: V2,
+    },
+    Migration {
+        version: 3,
+        name: "agent activity index for dashboard aggregates",
+        sql: V3,
     },
 ];
 
@@ -533,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_upgrades_to_v2_in_place() {
+    fn v1_database_upgrades_to_current_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
         {
@@ -550,11 +577,19 @@ mod tests {
         let v: i32 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, SCHEMA_VERSION);
         let n: i64 = c
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "existing history is kept");
+        let activity: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'events_agent_activity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(activity, 1, "v3 agent activity index created");
         let idx: i64 = c
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name = 'events_ts'",
@@ -579,7 +614,7 @@ mod tests {
             matches!(
                 err,
                 StorageError::NewerSchema {
-                    found: 2,
+                    found: SCHEMA_VERSION,
                     supported: 1
                 }
             ),

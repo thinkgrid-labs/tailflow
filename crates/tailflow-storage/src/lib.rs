@@ -20,6 +20,7 @@ pub mod query;
 pub mod retention;
 pub mod schema;
 pub mod sessions;
+pub mod stats;
 mod writer;
 
 pub use error::{Result, StorageError};
@@ -645,6 +646,22 @@ impl Storage {
     /// Invalid filters or a SQLite failure.
     pub fn sessions(&self, q: &sessions::SessionQuery) -> Result<sessions::SessionPage> {
         self.inner.readers.with(|c| sessions::list(c, q))
+    }
+
+    /// Overview aggregates for the dashboard. Blocking.
+    ///
+    /// # Errors
+    /// Invalid filters, the query time budget, or a SQLite failure.
+    pub fn stats(&self, q: &stats::StatsQuery) -> Result<stats::Stats> {
+        self.inner.readers.with(|c| stats::overview(c, q))
+    }
+
+    /// Agent-reported file activity grouped by path. Blocking.
+    ///
+    /// # Errors
+    /// Invalid filters, the query time budget, or a SQLite failure.
+    pub fn files(&self, q: &stats::FilesQuery) -> Result<stats::FilesPage> {
+        self.inner.readers.with(|c| stats::files(c, q))
     }
 
     /// One agent session with summaries. Blocking.

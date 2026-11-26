@@ -186,6 +186,7 @@ pub fn list(args: SessionsArgs, cfg: &StorageConfig, privacy: &PrivacyConfig) ->
             statuses: args.status,
             since,
             limit: args.limit,
+            ..SessionQuery::default()
         },
     )?;
     if args.json {

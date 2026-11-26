@@ -75,6 +75,9 @@ pub struct EventQuery {
     pub path_prefix: Option<String>,
     /// Substring of `attributes.command`.
     pub command: Option<String>,
+    /// Exact `attributes."command.program"` (the program agents' command
+    /// events report, e.g. `cargo`).
+    pub program: Option<String>,
     /// Full-text terms, ANDed. A trailing `*` makes a term a prefix.
     pub text: Option<String>,
     /// On event `timestamp`.
@@ -100,6 +103,7 @@ impl Default for EventQuery {
             path_glob: None,
             path_prefix: None,
             command: None,
+            program: None,
             text: None,
             since: None,
             until: None,
@@ -169,6 +173,7 @@ impl EventQuery {
         for (name, v) in [
             ("path_prefix", &self.path_prefix),
             ("command", &self.command),
+            ("program", &self.program),
         ] {
             if v.as_ref().is_some_and(|s| s.is_empty() || s.len() > 1024) {
                 return Err(invalid(format!("`{name}` must be 1..=1024 bytes")));
@@ -482,6 +487,13 @@ fn build_filters(q: &EventQuery) -> Result<Filters> {
             &mut f,
             "instr(json_extract(attributes, '$.command'), ?N) > 0",
             SqlValue::Text(cmd.clone()),
+        );
+    }
+    if let Some(program) = &q.program {
+        push_cond(
+            &mut f,
+            "json_extract(attributes, '$.\"command.program\"') = ?N",
+            SqlValue::Text(program.clone()),
         );
     }
     if let Some(since) = q.since {
@@ -864,10 +876,10 @@ fn finish_completeness(
 /// Holds the connection exclusively while a deadline progress handler is
 /// installed (rusqlite ≥ 0.41 requires `&mut` to change the handler); derefs
 /// to the connection for the query itself and removes the handler on drop.
-struct ProgressGuard<'a>(&'a mut Connection);
+pub(crate) struct ProgressGuard<'a>(&'a mut Connection);
 
 impl<'a> ProgressGuard<'a> {
-    fn install(conn: &'a mut Connection, deadline: Instant) -> Result<Self> {
+    pub(crate) fn install(conn: &'a mut Connection, deadline: Instant) -> Result<Self> {
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
         Ok(Self(conn))
     }

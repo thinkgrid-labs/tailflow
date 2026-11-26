@@ -39,6 +39,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/{id}", get(get_session))
         .route("/api/v1/agents/status", get(agents_status))
+        .route("/api/v1/stats", get(stats))
+        .route("/api/v1/files", get(files))
 }
 
 pub struct V1Error {
@@ -136,6 +138,8 @@ struct EventParams {
     path: Option<String>,
     path_prefix: Option<String>,
     command: Option<String>,
+    /// Exact program of agent command events (`cargo`, `npm`).
+    program: Option<String>,
     /// Full-text terms (ANDed; trailing `*` = prefix).
     q: Option<String>,
     since: Option<String>,
@@ -238,6 +242,7 @@ impl EventParams {
             path_glob: self.path,
             path_prefix: self.path_prefix,
             command: self.command,
+            program: self.program,
             text: self.q,
             since,
             until,
@@ -328,7 +333,27 @@ struct SessionParams {
     /// active | ended | unterminated (comma-separated).
     status: Option<String>,
     since: Option<String>,
+    /// Sessions that began before this time.
+    until: Option<String>,
+    /// Case-insensitive substring of id, project, directory or branch.
+    q: Option<String>,
+    /// `next_cursor` from the previous page.
+    cursor: Option<String>,
     limit: Option<usize>,
+}
+
+fn parse_time(
+    name: &str,
+    v: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, V1Error> {
+    v.map(|s| {
+        parse_since(s).ok_or_else(|| {
+            V1Error::bad_request(format!(
+                "invalid `{name}`: {s:?} (expected RFC 3339 or 30s|5m|2h|1d)"
+            ))
+        })
+    })
+    .transpose()
 }
 
 async fn list_sessions(
@@ -338,22 +363,14 @@ async fn list_sessions(
     let AxumQuery(p) = params.map_err(|r| {
         V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
     })?;
-    let since = p
-        .since
-        .as_deref()
-        .map(|s| {
-            parse_since(s).ok_or_else(|| {
-                V1Error::bad_request(format!(
-                    "invalid `since`: {s:?} (expected RFC 3339 or 30s|5m|2h|1d)"
-                ))
-            })
-        })
-        .transpose()?;
     let q = tailflow_storage::sessions::SessionQuery {
         agents: list(p.agent.as_ref()),
         projects: list(p.project.as_ref()),
         statuses: list(p.status.as_ref()),
-        since,
+        since: parse_time("since", p.since.as_deref())?,
+        until: parse_time("until", p.until.as_deref())?,
+        text: p.q,
+        cursor: p.cursor,
         limit: p.limit.unwrap_or(50),
     };
     let storage = storage_of(&state)?.clone();
@@ -404,6 +421,9 @@ async fn agents_status(
         .await
         .ok()
         .flatten();
+    let installation = tokio::task::spawn_blocking(installation_report)
+        .await
+        .unwrap_or_default();
     let agents: Vec<serde_json::Value> = tailflow_core::agent::AgentKind::ALL
         .iter()
         .map(|k| {
@@ -411,6 +431,7 @@ async fn agents_status(
                 "agent": k.as_str(),
                 "name": k.display_name(),
                 "capabilities": tailflow_core::agent::capabilities(*k),
+                "installation": installation.get(k.as_str()),
             })
         })
         .collect();
@@ -419,6 +440,195 @@ async fn agents_status(
         "spool": stats,
         "agents": agents,
     })))
+}
+
+/// What `tailflow agent install` recorded, checked against the agent's
+/// config file as it is now. Read-only: reads `integrations.json`, the
+/// recorded config files and the managed-policy files (all size-bounded),
+/// never runs the agent and never writes anything.
+///
+/// `state`:
+/// - `configured` — every recorded hook is present and its binary exists;
+/// - `incomplete` — recorded, but hooks are missing, disabled, duplicated,
+///   blocked by policy, or point at a binary that no longer exists;
+/// - `not_installed` — no install record (hooks added by hand are not
+///   detected; `tailflow agent status` checks the default config paths);
+/// - `unknown` — the record could not be read.
+///
+/// None of these says a session is running: activity comes from sessions.
+fn installation_report() -> serde_json::Map<String, serde_json::Value> {
+    use tailflow_core::agent::{install, AgentKind};
+    let mut out = serde_json::Map::new();
+    let state =
+        tailflow_core::paths::default_agents_dir().map(|d| install::IntegrationState::load(&d));
+    for kind in AgentKind::ALL {
+        let policy_block = match kind {
+            AgentKind::ClaudeCode => install::claude_policy_blocks_hooks()
+                .map(|(p, setting)| format!("{} sets {setting}", p.display())),
+            AgentKind::Codex => None,
+        };
+        let warnings: Vec<String> = match kind {
+            AgentKind::Codex => install::codex_config_warnings(),
+            AgentKind::ClaudeCode => Vec::new(),
+        };
+        let (status, records) = match &state {
+            None => ("unknown", Vec::new()),
+            Some(Err(_)) => ("unknown", Vec::new()),
+            Some(Ok(st)) => {
+                let recs = st.integrations.get(&kind).cloned().unwrap_or_default();
+                let mut healthy = !recs.is_empty() && policy_block.is_none() && warnings.is_empty();
+                let views: Vec<serde_json::Value> = recs
+                    .iter()
+                    .map(|r| {
+                        let events: Vec<&str> = r.events.iter().map(String::as_str).collect();
+                        let i = install::inspect(kind, &r.config_path, &r.binary, &events);
+                        let binary_exists = r.binary.exists();
+                        if !i.missing.is_empty()
+                            || i.hooks_disabled
+                            || !i.missing_binaries.is_empty()
+                            || !i.duplicated.is_empty()
+                            || i.error.is_some()
+                            || !binary_exists
+                        {
+                            healthy = false;
+                        }
+                        serde_json::json!({
+                            "config_path": r.config_path,
+                            "installed_at": r.installed_at,
+                            "tailflow_version": r.tailflow_version,
+                            "binary": r.binary,
+                            "binary_exists": binary_exists,
+                            "hooks_installed": i.installed,
+                            "hooks_missing": i.missing,
+                            "hooks_duplicated": i.duplicated,
+                            "hooks_disabled": i.hooks_disabled,
+                            "missing_binaries": i.missing_binaries,
+                            "error": i.error,
+                        })
+                    })
+                    .collect();
+                let status = if recs.is_empty() {
+                    "not_installed"
+                } else if healthy {
+                    "configured"
+                } else {
+                    "incomplete"
+                };
+                (status, views)
+            }
+        };
+        out.insert(
+            kind.as_str().to_string(),
+            serde_json::json!({
+                "state": status,
+                "records": records,
+                "policy_block": policy_block,
+                "warnings": warnings,
+            }),
+        );
+    }
+    out
+}
+
+// ── GET /api/v1/stats, /api/v1/files ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StatsParams {
+    /// Default 24h.
+    since: Option<String>,
+    until: Option<String>,
+    project: Option<String>,
+    agent: Option<String>,
+    buckets: Option<usize>,
+}
+
+fn stats_range(
+    since: Option<&str>,
+    until: Option<&str>,
+    project: Option<&String>,
+    agent: Option<&String>,
+    buckets: usize,
+) -> Result<tailflow_storage::stats::StatsQuery, V1Error> {
+    let since = parse_time("since", since)?
+        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
+    Ok(tailflow_storage::stats::StatsQuery {
+        since,
+        until: parse_time("until", until)?,
+        projects: list(project),
+        agents: list(agent),
+        buckets,
+    })
+}
+
+/// Overview aggregates: sessions by status, agent activity totals and a
+/// time histogram, computed from indexes (never from a page of events).
+async fn stats(
+    State(state): State<Arc<AppState>>,
+    params: Result<AxumQuery<StatsParams>, QueryRejection>,
+) -> Result<Json<tailflow_storage::stats::Stats>, V1Error> {
+    let AxumQuery(p) = params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    if p.buckets == Some(0) {
+        return Err(V1Error::bad_request("`buckets` must be at least 1"));
+    }
+    let q = stats_range(
+        p.since.as_deref(),
+        p.until.as_deref(),
+        p.project.as_ref(),
+        p.agent.as_ref(),
+        p.buckets.unwrap_or(0),
+    )?;
+    let storage = storage_of(&state)?.clone();
+    let out = blocking(move || storage.stats(&q).map_err(V1Error::from)).await?;
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FilesParams {
+    /// Default 7d.
+    since: Option<String>,
+    until: Option<String>,
+    project: Option<String>,
+    agent: Option<String>,
+    session: Option<String>,
+    path_prefix: Option<String>,
+    /// Only paths reported by more than one agent.
+    multi_agent: Option<bool>,
+    limit: Option<usize>,
+}
+
+/// Agent-reported file operations grouped by path. Every row is
+/// `agent_reported`: nothing here was verified on disk.
+async fn files(
+    State(state): State<Arc<AppState>>,
+    params: Result<AxumQuery<FilesParams>, QueryRejection>,
+) -> Result<Json<tailflow_storage::stats::FilesPage>, V1Error> {
+    let AxumQuery(p) = params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    if p.limit == Some(0) {
+        return Err(V1Error::bad_request("`limit` must be at least 1"));
+    }
+    let since = p.since.as_deref().or(Some("7d"));
+    let q = tailflow_storage::stats::FilesQuery {
+        range: stats_range(
+            since,
+            p.until.as_deref(),
+            p.project.as_ref(),
+            p.agent.as_ref(),
+            0,
+        )?,
+        sessions: list(p.session.as_ref()),
+        path_prefix: p.path_prefix,
+        multi_agent: p.multi_agent.unwrap_or(false),
+        limit: p.limit.unwrap_or(0),
+    };
+    let storage = storage_of(&state)?.clone();
+    let out = blocking(move || storage.files(&q).map_err(V1Error::from)).await?;
+    Ok(Json(out))
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
@@ -1086,5 +1296,203 @@ mod tests {
         );
         assert!(text.contains("\"seq\":1"));
         assert!(!text.contains("abcdef123456"), "SSE is redacted: {text}");
+    }
+
+    fn agent_events(h: &Harness, session: &str, payloads: &[serde_json::Value]) {
+        let storage = h.state.storage.storage().unwrap().clone();
+        let ctx = tailflow_core::agent::HookContext::now();
+        for v in payloads {
+            let mut v = v.clone();
+            v["session_id"] = serde_json::json!(session);
+            let n = tailflow_core::agent::normalize(
+                tailflow_core::agent::AgentKind::ClaudeCode,
+                &v,
+                &ctx,
+            )
+            .unwrap();
+            for e in n.events {
+                assert_eq!(storage.submit(e), tailflow_storage::Submitted::Enqueued);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_and_files_aggregate_from_storage() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(
+            &h,
+            "s-1",
+            &[
+                serde_json::json!({"hook_event_name":"SessionStart","cwd":"/work/app","source":"startup"}),
+                serde_json::json!({"hook_event_name":"PostToolUse","cwd":"/work/app","tool_name":"Read",
+                    "tool_use_id":"r1","tool_input":{"file_path":"/work/app/src/main.rs"},"tool_response":{}}),
+                serde_json::json!({"hook_event_name":"PostToolUseFailure","cwd":"/work/app","tool_name":"Bash",
+                    "tool_use_id":"b1","tool_input":{"command":"cargo test"},"error":"Exit code 101"}),
+            ],
+        );
+        h.ingest(vec![line("api", LogLevel::Error, "boom")]).await;
+
+        let (status, st) = h.get("/api/v1/stats?since=1h&buckets=6").await;
+        assert_eq!(status, StatusCode::OK, "{st}");
+        assert_eq!(st["activity"]["tool_calls"], 2);
+        assert_eq!(st["activity"]["command_failures"], 1);
+        assert_eq!(st["activity"]["file_reads"], 1);
+        assert_eq!(st["sessions"]["active"], 1);
+        assert_eq!(st["runtime_errors"], 1);
+        assert_eq!(st["buckets"].as_array().unwrap().len(), 6);
+        assert_eq!(
+            st["agents"].as_array().unwrap().len(),
+            2,
+            "both known agents listed"
+        );
+
+        let (status, cmds) = h.get("/api/v1/events?type=command.*&program=cargo").await;
+        assert_eq!(status, StatusCode::OK, "{cmds}");
+        let cmds = cmds["events"].as_array().unwrap();
+        assert!(!cmds.is_empty());
+        assert!(cmds
+            .iter()
+            .all(|e| e["attributes"]["command.program"] == "cargo"));
+        let (_, none) = h.get("/api/v1/events?type=command.*&program=npm").await;
+        assert!(none["events"].as_array().unwrap().is_empty());
+
+        let (status, f) = h.get("/api/v1/files?agent=claude").await;
+        assert_eq!(status, StatusCode::OK, "{f}");
+        assert_eq!(f["files"][0]["path"], "/work/app/src/main.rs");
+        assert_eq!(f["files"][0]["provenance"], "agent_reported");
+
+        for bad in [
+            "/api/v1/stats?bogus=1",
+            "/api/v1/stats?buckets=0",
+            "/api/v1/stats?buckets=100000",
+            "/api/v1/stats?since=yesterday",
+            "/api/v1/stats?since=1h&until=2h",
+            "/api/v1/files?limit=0",
+            "/api/v1/files?multi_agent=maybe",
+            "/api/v1/files?nope=1",
+        ] {
+            let (status, body) = h.get(bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            assert!(body["error"].is_string(), "{bad}");
+        }
+        for uri in ["/api/v1/stats", "/api/v1/files"] {
+            let (status, _) =
+                send(h.state.clone(), Request::builder().method("POST").uri(uri)).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri} is read-only");
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregates_are_explicit_without_storage() {
+        let h = harness(PrivacyConfig::default(), false);
+        for uri in ["/api/v1/stats", "/api/v1/files"] {
+            let (status, body) = h.get(uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(body["kind"], "storage_disabled");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_list_pages_with_a_cursor_over_http() {
+        let h = harness(PrivacyConfig::default(), true);
+        for i in 0..3 {
+            agent_events(
+                &h,
+                &format!("p-{i}"),
+                &[
+                    serde_json::json!({"hook_event_name":"SessionStart","cwd":"/work/app","source":"startup"}),
+                ],
+            );
+            // Distinct last-activity times.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        h.flush().await;
+        let (status, p1) = h.get("/api/v1/sessions?limit=2").await;
+        assert_eq!(status, StatusCode::OK, "{p1}");
+        assert_eq!(p1["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(p1["has_more"], true);
+        let cursor = p1["next_cursor"].as_str().unwrap().to_string();
+        let encoded: String = cursor
+            .bytes()
+            .map(|b| match b {
+                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let (status, p2) = h
+            .get(&format!("/api/v1/sessions?limit=2&cursor={encoded}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{p2}");
+        assert_eq!(p2["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(p2["has_more"], false);
+        let (status, q) = h.get("/api/v1/sessions?q=P-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(q["sessions"][0]["session_id"], "claude-code:p-1");
+        let (status, _) = h.get("/api/v1/sessions?cursor=garbage").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = h.get("/api/v1/sessions?until=soon").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agent_status_reports_installation_without_claiming_activity() {
+        let h = harness(PrivacyConfig::default(), true);
+        let (status, a) = h.get("/api/v1/agents/status").await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        for agent in a["agents"].as_array().unwrap() {
+            let state = agent["installation"]["state"].as_str().unwrap();
+            assert!(
+                ["configured", "incomplete", "not_installed", "unknown"].contains(&state),
+                "{agent}"
+            );
+            assert!(agent["installation"]["records"].is_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_is_served_with_a_strict_content_security_policy() {
+        let h = harness(PrivacyConfig::default(), false);
+        for uri in ["/", "/some/client/route"] {
+            let response = router(h.state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = response.headers();
+            let csp = headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(csp.contains("script-src 'self'"), "{uri}: {csp}");
+            assert!(csp.contains("frame-ancestors 'none'"), "{uri}");
+            assert!(!csp.contains("unsafe-inline"), "{uri}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+        }
+    }
+
+    #[tokio::test]
+    async fn ring_catch_up_resumes_after_a_seq_and_names_the_process() {
+        let h = harness(PrivacyConfig::default(), false);
+        h.ingest(vec![
+            line("api", LogLevel::Info, "one"),
+            line("api", LogLevel::Info, "two"),
+            line("api", LogLevel::Info, "three"),
+        ])
+        .await;
+        let (_, all) = h.get("/api/records").await;
+        let all = all.as_array().unwrap().clone();
+        assert_eq!(all.len(), 3);
+        let first = all[0]["seq"].as_u64().unwrap();
+        let (status, rest) = h.get(&format!("/api/records?after={first}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let rest = rest.as_array().unwrap();
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|r| r["seq"].as_u64().unwrap() > first));
+        let (_, health) = h.get("/health").await;
+        assert!(health["instance_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
     }
 }
