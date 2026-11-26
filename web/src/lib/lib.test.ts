@@ -12,6 +12,7 @@ import { sanitize, DEFAULT_SETTINGS } from './settings.ts'
 import { statusOf, summary, agentLabel, isFailure } from './events.ts'
 import type { LogRecord, StoredEvent, SessionView } from './types.ts'
 import { isRefusal, signInCommand, markSignedOut, authState, subscribeAuth } from './auth.ts'
+import { isFailureEvent, isSessionChange, matchesQuery } from './liveFilters.ts'
 
 const rec = (seq: number, payload = `line ${seq}`): LogRecord =>
   ({ seq, timestamp: '2026-11-25T10:00:00Z', source: 'api', level: 'info', payload })
@@ -268,4 +269,33 @@ test('a refusal notifies subscribers once', () => {
   off()
   assert.equal(calls, 1)
   assert.deepEqual(authState(), { status: 'signed_out', reason: 'session_expired' })
+})
+
+// ── live agent stream filters (M4-B) ────────────────────────────────────────
+
+const sev = (p: Partial<{ event_type: string; agent_name: string; session_id: string; project_id: string; status: string }>) =>
+  ({ seq: 1, event_type: 'agent.tool.started', ...p })
+
+test('live filters reload a view only for events that can change it', () => {
+  assert.equal(matchesQuery(sev({}), {}), true)
+  assert.equal(matchesQuery(sev({ event_type: 'command.failed' }), { type: 'command.*' }), true)
+  assert.equal(matchesQuery(sev({ event_type: 'file.modified' }), { type: 'command.*' }), false)
+  assert.equal(matchesQuery(sev({ event_type: 'agent.tool.failed' }), { type: 'agent.tool.failed,command.failed' }), true)
+  assert.equal(matchesQuery(sev({ session_id: 'claude-code:a' }), { session: 'claude-code:b' }), false)
+  assert.equal(matchesQuery(sev({ session_id: 'claude-code:a' }), { session: 'claude-code:a' }), true)
+  assert.equal(matchesQuery(sev({ agent_name: 'codex' }), { agent: 'claude-code,codex' }), true)
+  assert.equal(matchesQuery(sev({}), { project: '/p' }), false, 'no project on the event: not a match')
+  // Unknown filters (text, globs) are "may match": reload rather than go stale.
+  assert.equal(matchesQuery(sev({}), { q: 'anything', path: '**/*.rs' }), true)
+  // Loss affects every view's completeness.
+  assert.equal(matchesQuery(sev({ event_type: 'system.events.dropped' }), { session: 'x', type: 'file.*' }), true)
+})
+
+test('failure and session predicates', () => {
+  assert.equal(isFailureEvent(sev({ event_type: 'command.failed' })), true)
+  assert.equal(isFailureEvent(sev({ status: 'failed' })), true)
+  assert.equal(isFailureEvent(sev({})), false)
+  assert.equal(isSessionChange(sev({ session_id: 's' })), true)
+  assert.equal(isSessionChange(sev({})), false)
+  assert.equal(isSessionChange(sev({ event_type: 'system.events.dropped' })), true)
 })

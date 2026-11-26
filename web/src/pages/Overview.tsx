@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks'
+import { isFailureEvent as isFailure, isSessionChange } from '../lib/liveFilters.ts'
 import { api, ApiError } from '../lib/api.ts'
 import { useAsync, useNow } from '../lib/hooks.ts'
 import { href } from '../lib/router.ts'
@@ -22,13 +23,16 @@ export const INSTALL_TEXT = {
 
 export function Overview() {
   const [range, setRange] = useState<string>('24h')
-  const stats = useAsync(s => api.stats({ since: range, buckets: 48 }, s), [range], POLL_MS)
+  // Live: any committed agent activity can change these aggregates.
+  const any = () => true
+  const stats = useAsync(s => api.stats({ since: range, buckets: 48 }, s), [range], POLL_MS, any)
+  // Installation state is not agent activity: keep polling it.
   const agents = useAsync(s => api.agents(s), [], POLL_MS * 2)
-  const sessions = useAsync(s => api.sessions({ limit: 8 }, s), [], POLL_MS)
+  const sessions = useAsync(s => api.sessions({ limit: 8 }, s), [], POLL_MS, isSessionChange)
   const failures = useAsync(s => api.events({
     type: 'agent.tool.failed,command.failed,agent.turn.failed,runtime.error,system.events.dropped',
     since: range, order: 'desc', limit: 8,
-  }, s), [range], POLL_MS)
+  }, s), [range], POLL_MS, isFailure)
   useNow(30_000)
 
   const storageDown = stats.error instanceof ApiError && (stats.error.kind === 'storage_disabled' || stats.error.kind === 'storage_unavailable')

@@ -97,8 +97,10 @@ clients, or a browser session created by a one-time sign-in link
 A Preact single-page app with hash routing and no other runtime dependency.
 Pages read the public read-only API; nothing in the browser filters a full
 dataset. The live log view keeps the newest 5,000 ring records and renders
-only the visible rows (a variable-height virtual list). Agent views poll
-durable history while visible. Pure logic (`web/src/lib/`) has Node unit tests
+only the visible rows (a variable-height virtual list). Agent views follow
+`/api/v1/stream/agent`, a resumable SSE stream of *committed* agent events.
+Each event reloads only the views it concerns (coalesced), and the views
+fall back to polling when the stream is unavailable. Pure logic (`web/src/lib/`) has Node unit tests
 (`npm test`); `web/e2e/` runs Playwright against a real daemon fed through the
 real agent hook adapters.
 

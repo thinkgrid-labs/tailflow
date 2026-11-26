@@ -127,6 +127,19 @@ API security.
   token-only) and `POST /api/v1/auth/logout`. The dashboard has a sign-in
   screen and **Settings → Access → Sign out**.
 
+- **Live agent activity (M4-B).** New `GET /api/v1/stream/agent` (SSE).
+  - It carries agent, command, file and git events once they are committed
+    to durable history, in seq order, each with its seq as the SSE `id`.
+  - Clients resume from `after=` or `Last-Event-ID`, with catch-up from
+    SQLite (bounded at 5,000 events, then a `reset`).
+  - Detected loss and expired history arrive as `gap` events. A lagging
+    client is re-read from history rather than dropped (`lag`).
+  - One shared feed per daemon. It wakes on this daemon's commits and polls
+    the newest seq every 250 ms for other daemons' commits, only while
+    someone is subscribed.
+  - The dashboard replaces 10–30 s polling with targeted, coalesced reloads,
+    and adds an **Agents** stream pill in the top bar.
+
 ### Changed
 
 - **Breaking: the HTTP API requires a credential.** `tailflow-mcp` and
@@ -199,6 +212,10 @@ API security.
 - The `tailflow` binary no longer starts its async runtime for subcommands.
 
 ### Fixed
+
+- A hash change that happened between the dashboard's first render and its
+  router effect was missed, leaving the previous page shown (more likely
+  since the sign-in check delays the first render).
 
 - Ctrl-C or `SIGTERM` did not stop the daemon while any client was connected
   to the live stream (`/events` — an open dashboard tab, `curl`, an agent): the

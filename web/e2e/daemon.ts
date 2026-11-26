@@ -1,7 +1,7 @@
 // Spawn a throwaway daemon for tests that need their own (high-volume logs,
 // restarts). Memory-only unless `storage` is set; always a private data dir.
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -33,17 +33,22 @@ export interface Daemon {
   signIn: (page: Page) => Promise<void>
   /** Authenticated GET (API token), parsed as JSON. */
   api: (p: string) => Promise<any>
+  /** Run `tailflow agent hook claude-code` with `payload` into this
+   *  daemon's spool, exactly as Claude Code does. */
+  hook: (payload: Record<string, unknown>) => void
 }
 
 /** `script` is a /bin/sh program whose stdout becomes the `app` source. */
-export async function startDaemon(script: string, opts: { port?: number; dir?: string; storage?: boolean } = {}): Promise<Daemon> {
+/** `agents`: record coding-agent hooks from this daemon's private spool
+ *  (implies storage). */
+export async function startDaemon(script: string, opts: { port?: number; dir?: string; storage?: boolean; agents?: boolean } = {}): Promise<Daemon> {
   const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'tf-e2e-d-'))
   const port = opts.port ?? await freePort()
   const sh = path.join(dir, 'app.sh')
   fs.writeFileSync(sh, script)
   const cfg = path.join(dir, 'tailflow.toml')
-  fs.writeFileSync(cfg, `[[sources.process]]\nlabel = "app"\ncmd = "sh ${sh}"\n\n[storage]\nenabled = ${opts.storage ? 'true' : 'false'}\n`)
-  const proc = spawn(path.join(binDir(), 'tailflow-daemon'), ['--config', cfg, '--port', String(port), '--no-agents'], {
+  fs.writeFileSync(cfg, `[[sources.process]]\nlabel = "app"\ncmd = "sh ${sh}"\n\n[storage]\nenabled = ${opts.storage || opts.agents ? 'true' : 'false'}\n`)
+  const proc = spawn(path.join(binDir(), 'tailflow-daemon'), ['--config', cfg, '--port', String(port), opts.agents ? '--agents' : '--no-agents'], {
     env: { ...process.env, TAILFLOW_DATA_DIR: path.join(dir, 'data'), TAILFLOW_TOKEN: E2E_TOKEN, RUST_LOG: 'warn' },
     stdio: 'ignore',
   })
@@ -62,13 +67,19 @@ export async function startDaemon(script: string, opts: { port?: number; dir?: s
     }),
     restart: async () => {
       await d.stop()
-      return startDaemon(script, { port, dir, storage: opts.storage })
+      return startDaemon(script, { port, dir, storage: opts.storage, agents: opts.agents })
     },
     signIn: async (page: Page) => {
       const res = await page.goto(await signInUrl(base))
       if (!res?.ok()) throw new Error(`sign-in failed: ${res?.status()}`)
     },
     api: async (p: string) => (await fetch(`${base}${p}`, { headers: authHeaders })).json(),
+    hook: (payload: Record<string, unknown>) => {
+      const r = spawnSync(path.join(binDir(), 'tailflow'), ['agent', 'hook', 'claude-code'], {
+        input: JSON.stringify(payload), env: { ...process.env, TAILFLOW_DATA_DIR: path.join(dir, 'data') }, encoding: 'utf8',
+      })
+      if (r.status !== 0) throw new Error(`hook exited ${r.status}: ${r.stderr}`)
+    },
   }
   return d
 }

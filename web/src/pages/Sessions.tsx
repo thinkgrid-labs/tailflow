@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks'
+import { isSessionChange } from '../lib/liveFilters.ts'
 import { api } from '../lib/api.ts'
 import { useAsync, navigate, useNow } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
@@ -26,7 +27,9 @@ export function Sessions({ params }: { params: URLSearchParams }) {
   const [extra, setExtra] = useState<{ key: string; sessions: SessionView[]; cursor: string | null; hasMore: boolean }>(
     { key, sessions: [], cursor: null, hasMore: false })
   const olderLoaded = extra.key === key && extra.sessions.length > 0
-  const first = useAsync(s => api.sessions({ ...filters, limit: PAGE }, s), [key], olderLoaded ? undefined : 15_000)
+  // Live updates (like polling) only while the list is one page.
+  const first = useAsync(s => api.sessions({ ...filters, limit: PAGE }, s), [key],
+    olderLoaded ? undefined : 15_000, olderLoaded ? undefined : isSessionChange)
   const [loadingMore, setLoadingMore] = useState(false)
   const [moreError, setMoreError] = useState<unknown>(null)
   useNow(30_000)

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks'
+import { matchesQuery } from '../lib/liveFilters.ts'
 import { api } from '../lib/api.ts'
 import { useAsync, navigate } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
@@ -21,7 +22,8 @@ export function Files({ params }: { params: URLSearchParams }) {
   const data = useAsync(s => api.files({
     since, agent: p.agent, project: p.project, session: p.session, path_prefix: p.path_prefix,
     multi_agent: multi || undefined, limit: 500,
-  }, s), [since, p.agent, p.project, p.session, p.path_prefix, multi], 30_000)
+  }, s), [since, p.agent, p.project, p.session, p.path_prefix, multi], 30_000,
+  e => e.event_type.startsWith('file.') && matchesQuery(e, { agent: p.agent, project: p.project, session: p.session }))
   const files = data.data?.files ?? []
 
   return (
