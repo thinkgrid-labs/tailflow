@@ -2,6 +2,7 @@ mod agent_ingest;
 mod agent_stream;
 mod api_v1;
 mod auth;
+mod correlation_api;
 mod dashboard_cli;
 mod evidence_api;
 mod observe;
