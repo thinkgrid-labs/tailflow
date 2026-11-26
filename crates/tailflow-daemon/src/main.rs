@@ -1,4 +1,5 @@
 mod agent_ingest;
+mod agent_stream;
 mod api_v1;
 mod auth;
 mod dashboard_cli;

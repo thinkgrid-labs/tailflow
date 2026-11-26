@@ -377,6 +377,33 @@ History that survives restarts, with persistent cursors and a `completeness`
 verdict, is served under `/api/v1/events`. See
 [durable history](storage.md#http-api-v1) for parameters and guarantees.
 
+### Live agent activity: `/api/v1/stream/agent`
+
+Server-Sent Events carrying agent, command, file and git events as they are
+**committed** to durable history. That includes events committed by other
+daemons sharing the per-user database.
+
+| Parameter / header | Meaning |
+|---|---|
+| `after=<seq>` | Resume after this seq: catch-up from history, then live |
+| `Last-Event-ID` | Sent by `EventSource` on reconnect; the later of the two wins |
+| `agent`, `session`, `project` | Comma-separated filters |
+
+| Event | Data |
+|---|---|
+| `agent` | One stored event (`id:` is its seq) |
+| `gap` | Detected loss or expired history in the delivered range: `reason`, `count` (null = unknown), `from_seq`, `to_seq` |
+| `ready` | Catch-up finished, now live (`id:` is the cursor) |
+| `reset` | More than 5,000 events to catch up: continue from `cursor` and reload your views |
+| `lag` | This client fell behind the live feed; the missed events were re-read from history (nothing lost) |
+
+Guarantees:
+- Events arrive in strictly increasing `seq`, each once.
+- Nothing that is not yet committed is ever sent.
+- Loss is reported as a `gap`, never skipped silently.
+- At most 32 streams per daemon (`429` beyond).
+- Without a cursor, the stream starts live at the newest committed seq.
+
 ---
 
 ## Design notes

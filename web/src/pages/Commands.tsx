@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'preact/hooks'
+import { matchesQuery } from '../lib/liveFilters.ts'
 import { api, describeError } from '../lib/api.ts'
 import { useAsync, navigate } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
@@ -60,7 +61,8 @@ export function Commands({ params }: { params: URLSearchParams }) {
   const [extra, setExtra] = useState<{ key: string; events: StoredEvent[]; page: EventPage | null }>({ key, events: [], page: null })
   // Poll only while the list is a single page: see Activity.
   const olderLoaded = extra.key === key && extra.events.length > 0
-  const first = useAsync(s => api.events({ ...q, order: 'desc', limit: PAGE }, s), [key], olderLoaded ? undefined : 20_000)
+  const first = useAsync(s => api.events({ ...q, order: 'desc', limit: PAGE }, s), [key],
+    olderLoaded ? undefined : 20_000, olderLoaded ? undefined : e => e.event_type.startsWith('command.') && matchesQuery(e, q))
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<unknown>(null)
   const ext = extra.key === key ? extra : { key, events: [], page: null }

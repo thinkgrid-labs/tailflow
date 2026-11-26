@@ -41,6 +41,8 @@ mime_guess = "2"
 # Per-run API tokens, session and sign-in secrets (OS CSPRNG; already in the
 # tree through tailflow-storage).
 getrandom = "0.4"
+# `stream::unfold` for the agent SSE stream (already in the tree via axum).
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

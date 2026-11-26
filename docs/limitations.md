@@ -196,9 +196,13 @@ matrix. In short:
 
 See the [dashboard guide](dashboard.md) for how each view reads its data.
 
-- Agent activity is not streamed live: agent pages refresh from durable
-  history every 10–30 seconds while visible, and history trails ingestion by
-  up to the storage batch delay (500 ms by default).
+- Agent activity streams to the dashboard only after it is committed to
+  durable history. Expect about 1 second from a hook call to an updated page
+  (spool pickup, the storage batch delay, a 250 ms coalescing window, then
+  the page's own query). Commits made by *another* daemon sharing the
+  database are seen within 250 ms of committing (polling interval). A
+  reconnecting tab catches up at most 5,000 events, then reloads its views
+  instead.
 - The live log view keeps the newest 5,000 lines and renders only the rows on
   screen. Browser find-in-page and drag-selection cover only rendered rows;
   use the filter box, **Copy lines**, or Activity search instead.

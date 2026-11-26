@@ -559,6 +559,7 @@ async fn health_handler(
             "ingest_dropped": ingest.records_dropped,
             "storage": storage,
             "auth": state.auth.view(),
+            "agent_stream": state.agent_feed.as_ref().map(|f| f.stats()),
         })),
     )
         .into_response()

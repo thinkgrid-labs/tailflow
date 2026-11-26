@@ -1,6 +1,6 @@
 import { Fragment } from 'preact'
 import { useEffect, useRef, useState } from 'preact/hooks'
-import { useRoute, SettingsContext, navigate } from './lib/hooks.ts'
+import { useRoute, SettingsContext, navigate, useAgentStreamStatus } from './lib/hooks.ts'
 import { href, type Page } from './lib/router.ts'
 import { applySettings, loadSettings, saveSettings, type Settings } from './lib/settings.ts'
 import { useLiveStatus } from './hooks/useLogStream'
@@ -37,6 +37,11 @@ const TITLES: Record<Page, string> = {
   integrations: 'Integrations & storage', settings: 'Settings',
 }
 
+/** Agent stream state → the connection pill's tone and label. Pages fall
+ *  back to polling whenever the stream is not live. */
+const AGENT_CONN = { live: 'connected', connecting: 'connecting', reconnecting: 'connecting', off: 'disconnected' } as const
+const AGENT_LABEL = { live: 'Live', connecting: 'Connecting', reconnecting: 'Reconnecting', off: 'Polling' } as const
+
 /** Checks the browser session first: nothing that reads data (pages, the
  *  live stream) mounts until the daemon accepts it. */
 export function App() {
@@ -66,6 +71,7 @@ function Dashboard() {
 
   const route = useRoute()
   const status = useLiveStatus()
+  const agentStatus = useAgentStreamStatus()
   const [navOpen, setNavOpen] = useState(false)
   const [version, setVersion] = useState<string | null>(null)
   const search = useRef<HTMLInputElement>(null)
@@ -144,6 +150,10 @@ function Dashboard() {
             <Icon name="search" size="sm" />
             <input ref={search} class="input" type="search" placeholder="Search all history  ( / )" aria-label="Search all history" />
           </form>
+          <span class={`conn conn--${AGENT_CONN[agentStatus]}`} role="status" title={`Agent event stream: ${AGENT_LABEL[agentStatus].toLowerCase()}`}>
+            <span class="conn-dot" aria-hidden="true" />
+            <span class="conn-label">Agents {AGENT_LABEL[agentStatus].toLowerCase()}</span>
+          </span>
           <span class={`conn conn--${status}`} role="status" title={`Live log stream: ${statusLabel.toLowerCase()}`}>
             <span class="conn-dot" aria-hidden="true" />
             <span class="conn-label">{statusLabel}</span>

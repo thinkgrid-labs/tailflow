@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import { matchesQuery } from '../lib/liveFilters.ts'
 import { api, describeError } from '../lib/api.ts'
 import { useAsync, navigate } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
@@ -80,7 +81,8 @@ export function Activity({ params, mode }: { params: URLSearchParams; mode: 'act
   // followed by pages from the old cursor would silently skip events).
   const olderLoaded = extra.key === key && extra.events.length > 0
   const first = useAsync(s => api.events({ ...query, order: 'desc', limit: PAGE }, s), [key],
-    mode === 'errors' && !olderLoaded ? 20_000 : undefined)
+    mode === 'errors' && !olderLoaded ? 20_000 : undefined,
+    olderLoaded ? undefined : e => matchesQuery(e, query))
   const [moreErr, setMoreErr] = useState<unknown>(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const ext = extra.key === key ? extra : { key, events: [], page: null }

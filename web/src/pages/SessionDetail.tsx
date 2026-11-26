@@ -23,7 +23,7 @@ export function SessionDetailPage({ id, params }: { id: string; params: URLSearc
   const tab = (p.tab as Tab) || 'events'
   const selected = p.event ? Number(p.event) : null
   const set = (c: Record<string, string | number | null>) => navigate(href('session', withParams(params, c), id), true)
-  const detail = useAsync(s => api.session(id, s), [id], 15_000)
+  const detail = useAsync(s => api.session(id, s), [id], 15_000, e => e.session_id === id)
   const d = detail.data
 
   if (detail.error) {

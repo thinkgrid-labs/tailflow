@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import { matchesQuery } from '../lib/liveFilters.ts'
 import { api } from '../lib/api.ts'
 import { navigate, useAsync, useSettings, useDebounced } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
@@ -92,7 +93,10 @@ export function Timeline({ params }: { params: URLSearchParams }) {
       sessionsTruncated: sessions.has_more,
       events: events.length,
     }
-  }, [fetchWin[0], fetchWin[1], p.agent, p.project, showRuntime], live ? 15_000 : undefined)
+  }, [fetchWin[0], fetchWin[1], p.agent, p.project, showRuntime], live ? 15_000 : undefined,
+  // Following "now": committed agent events extend the view (a window
+  // reload is up to 3,000 events, so at most every 3 s).
+  live ? e => matchesQuery(e, { agent: p.agent, project: p.project }) : undefined, 3_000)
 
   return (
     <div class="page" style={{ maxWidth: 'none' }}>

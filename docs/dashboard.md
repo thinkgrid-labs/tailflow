@@ -110,8 +110,16 @@ operating system's reduced-motion setting.
 
 The dashboard is meant to be left open all day.
 
-- Agent views refresh every 10–30 seconds, and only while the tab is visible.
-  A hidden tab makes no requests and does no rendering work.
+- Agent views update live. The daemon streams committed agent events to the
+  dashboard (one connection per tab, `/api/v1/stream/agent`), and a page
+  reloads its own bounded query only when an event concerns it, at most
+  once a second (every 3 seconds for the timeline). The **Agents** pill in
+  the top bar shows the stream's state. When it reads **Polling** (the
+  stream is not available), views fall back to refreshing every 10–30
+  seconds.
+- A tab hidden for a minute closes the stream and makes no requests. When
+  it is shown again it reconnects from the last event it received, and the
+  daemon catches it up from durable history.
 - Every count comes from SQLite indexes on the daemon. Each query runs under a
   3-second budget and returns a bounded response. The browser never downloads
   the database to filter it.

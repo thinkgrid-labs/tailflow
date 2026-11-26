@@ -5,12 +5,16 @@ import { createContext } from 'preact'
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks'
 import { parseHash, type Route } from './router.ts'
 import { DEFAULT_SETTINGS, type Settings } from './settings.ts'
+import { agentStream, type AgentStreamStatus, type StreamEvent } from './agentStream.ts'
 
 export function useRoute(): Route {
   const [route, setRoute] = useState(() => parseHash(location.hash))
   useEffect(() => {
     const on = () => setRoute(parseHash(location.hash))
     window.addEventListener('hashchange', on)
+    // The hash may have changed between the first render and this effect
+    // (effects run after paint): a hashchange in that window was missed.
+    on()
     return () => window.removeEventListener('hashchange', on)
   }, [])
   return route
@@ -49,15 +53,29 @@ export interface AsyncState<T> {
   reload: () => void
 }
 
+/** Coalescing for live reloads: wait this long for a burst to settle… */
+const LIVE_SETTLE_MS = 250
+/** …and never reload one query more often than this. */
+const LIVE_MIN_INTERVAL_MS = 1_000
+
 /**
  * Run `load` when `deps` change, aborting the previous request. With
  * `pollMs`, re-run on that interval while the page is visible, and once
  * immediately when it becomes visible again.
+ *
+ * With `live`, the committed agent stream drives updates instead: while
+ * the stream is live, polling stops and a matching event reloads this
+ * query (coalesced: at most once per second, after a burst settles); a
+ * resync (reconnect, gap, reset) reloads it too. Without a live stream
+ * (connecting, refused, older daemon) `pollMs` polling continues as the
+ * fallback.
  */
 export function useAsync<T>(
   load: (signal: AbortSignal) => Promise<T>,
   deps: readonly unknown[],
   pollMs?: number,
+  live?: (e: StreamEvent) => boolean,
+  liveMinMs: number = LIVE_MIN_INTERVAL_MS,
 ): AsyncState<T> {
   // Results are keyed by their deps, so data loaded for a previous filter is
   // never shown under the new one, even for a frame.
@@ -82,11 +100,39 @@ export function useAsync<T>(
     return () => ctrl.abort()
   }, [key, tick, visible])
 
+  const streamStatus = useAgentStreamStatus(live !== undefined)
+  const streaming = live !== undefined && streamStatus === 'live'
+  const liveRef = useRef(live)
+  liveRef.current = live
+
   useEffect(() => {
-    if (!pollMs || !visible) return
+    if (!pollMs || !visible || streaming) return
     const t = setInterval(() => setTick(n => n + 1), pollMs)
     return () => clearInterval(t)
-  }, [pollMs, visible])
+  }, [pollMs, visible, streaming])
+
+  useEffect(() => {
+    if (!liveRef.current) return
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let last = 0
+    const fire = () => {
+      timer = null
+      last = performance.now()
+      if (document.visibilityState !== 'hidden') setTick(n => n + 1)
+    }
+    const schedule = () => {
+      if (timer !== null) return
+      const wait = Math.max(LIVE_SETTLE_MS, last + liveMinMs - performance.now())
+      timer = setTimeout(fire, wait)
+    }
+    const off = agentStream.subscribe(sig => {
+      if (sig.kind === 'resync' || liveRef.current?.(sig.event)) schedule()
+    })
+    return () => {
+      off()
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [key, liveMinMs])
 
   const reload = useCallback(() => setTick(n => n + 1), [])
   const current = state.key === key
@@ -96,6 +142,17 @@ export function useAsync<T>(
     loading: current ? state.loading : true,
     reload,
   }
+}
+
+/** The agent stream's connection state (subscribing keeps it open). */
+export function useAgentStreamStatus(enabled = true): AgentStreamStatus {
+  const [status, setStatus] = useState<AgentStreamStatus>(agentStream.status)
+  useEffect(() => {
+    if (!enabled) return
+    setStatus(agentStream.status)
+    return agentStream.onStatus(() => setStatus(agentStream.status))
+  }, [enabled])
+  return status
 }
 
 export function useDebounced<T>(value: T, ms: number): T {

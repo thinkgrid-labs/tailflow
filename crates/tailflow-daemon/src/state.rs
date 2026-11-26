@@ -122,6 +122,9 @@ pub struct AppState {
     /// Access control: every route except the static UI shell, `/health`
     /// and the sign-in link requires a credential (see `auth.rs`).
     pub auth: Arc<crate::auth::Auth>,
+    /// Live feed of committed agent events (`/api/v1/stream/agent`);
+    /// `None` without durable storage.
+    pub agent_feed: Option<Arc<crate::agent_stream::AgentFeed>>,
     /// Identifies this daemon process. The live ring's `seq` restarts with
     /// every process, so a client compares this before resuming a cursor.
     pub instance_id: String,
@@ -233,7 +236,11 @@ impl AppState {
             agent_ingest,
             auth,
         } = pipeline;
+        let agent_feed = storage
+            .storage()
+            .map(|s| crate::agent_stream::AgentFeed::spawn(s.clone(), shutdown.clone()));
         let state = Arc::new(AppState {
+            agent_feed,
             tx: tx.clone(),
             store: Arc::new(LogStore::with_limits(limits.records, limits.bytes)),
             storage,
