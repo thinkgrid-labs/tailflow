@@ -9,7 +9,7 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 
 | Area | Current boundary | Practical implication |
 |---|---|---|
-| Network | Loopback-only HTTP, no auth or TLS | Do not expose the daemon directly to a network |
+| Network | Loopback-only HTTP; token or session required, no TLS | Do not expose the daemon directly to a network |
 | Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
 | Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
 | Redaction | Heuristic credential patterns | Not every secret is detected |
@@ -23,9 +23,11 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 
 ## Security model
 
-The daemon binds to `127.0.0.1`, rejects nonloopback Host headers, and does not
-enable permissive cross-origin access. It has no users, permissions, API keys,
-or transport encryption.
+The daemon binds to `127.0.0.1`, rejects nonloopback Host headers, does not
+enable cross-origin access, and requires a credential on every data
+endpoint: a per-run API token (CLI, MCP, scripts) or a same-origin browser
+session (see [security](security.md)). It has one credential level (full
+read access), no per-user permissions, and no transport encryption.
 
 That is appropriate for one developer machine. It is not sufficient for:
 
@@ -40,12 +42,15 @@ passwords, private keys, `password=` assignments) before display and before
 storage, unless `capture = "full"`. That is a heuristic: personal data,
 customer content, and secrets in unrecognized formats pass through.
 
-Any local process running as any user able to connect to `127.0.0.1` can read
-the live buffer and durable history over HTTP; there is no per-client
-authentication. Browser pages from other origins are refused (`Origin` and
-`Sec-Fetch-Site` checks plus the Host allowlist), and no HTTP endpoint can
-delete or change data. The database file is protected only by filesystem
-permissions (a user-only directory on Unix) and is not encrypted at rest.
+Other OS users, containers sharing the host network and web pages on other
+localhost ports cannot read the API without a credential. Processes running
+as your own user can: they can read the token file and the database
+directly. Browsers send loopback cookies to every port, so a malicious
+server on another loopback port that your browser visits receives the
+session cookie (see [security](security.md#outside-the-threat-model)). No
+HTTP endpoint can delete or change data. The database file is protected only
+by filesystem permissions (a user-only directory on Unix) and is not
+encrypted at rest.
 
 If remote access is required, place an authenticated, encrypted proxy in front
 of TailFlow and evaluate the exposure deliberately. Remote operation is not a

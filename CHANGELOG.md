@@ -21,6 +21,9 @@ Milestone M3: agent observability dashboard. The local web UI becomes an
 investigation tool for agent activity and the runtime around it, without
 claiming more than the hooks reported.
 
+Milestone M4 (in progress): verified changes, runtime correlation and local
+API security.
+
 ### Added
 
 - **Durable local history.** `tailflow-daemon` records runtime logs and
@@ -112,8 +115,27 @@ claiming more than the hooks reported.
 - `GET /api/records?after=<seq>` and `instance_id` in `/health`, so live
   clients catch up incrementally and detect a daemon restart.
 
+- **Local API authentication (M4-A).** Every data endpoint requires a
+  credential (see `docs/security.md`). The CLI, MCP and scripts use a per-run
+  256-bit API token that the daemon writes to an owner-only runtime file,
+  `<data dir>/run/daemon-<port>.json`, or `$TAILFLOW_TOKEN`. Browsers use an
+  `HttpOnly; SameSite=Strict` session cookie created by a one-time sign-in
+  link. New commands: `tailflow-daemon dashboard` (open the browser with a
+  fresh link; `--no-open`, `--revoke-sessions`) and `tailflow-daemon token`.
+  New endpoints: `GET /auth/login/<code>`, `GET /api/v1/auth/session`,
+  `POST /api/v1/auth/login-links`, `POST /api/v1/auth/sessions/revoke` (both
+  token-only) and `POST /api/v1/auth/logout`. The dashboard has a sign-in
+  screen and **Settings → Access → Sign out**.
+
 ### Changed
 
+- **Breaking: the HTTP API requires a credential.** `tailflow-mcp` and
+  `tailflow-logs` from this release find the token by themselves. Older
+  clients and plain `curl` get `401` and must send
+  `Authorization: Bearer $(tailflow-daemon token)`. `/health` without a
+  credential returns only `ok`, `version` and `auth_required`.
+  `tailflow-logs` exits `4` when not authorized. `npm run dev` proxies with
+  the token server-side, for same-origin requests only.
 - **The live log view is virtualized.** Only on-screen rows are rendered
   (variable height, expanded JSON, wrapping or horizontal scrolling), the
   view stays put while paused or scrolled up, and a reconnect catches up
@@ -210,6 +232,16 @@ claiming more than the hooks reported.
 
 ### Security
 
+- Local API access control: other OS users, containers on the host network
+  and web pages on other localhost ports can no longer read agent sessions,
+  paths, commands or logs. A session cookie counts only on requests the
+  browser marks `Sec-Fetch-Site: same-origin` (or `none` for a URL the user
+  opened), because browsers send loopback cookies to every port. The cookie
+  name carries the port, and tossed duplicate cookies are tolerated. Every
+  protected path refuses with the same answer whether or not the resource
+  exists, so there is no existence oracle. Tokens and sessions are compared
+  in constant time, and refused requests are counted in the authenticated
+  `/health`.
 - Browser requests with a non-loopback `Origin`, and cross-site requests other
   than top-level navigation (`Sec-Fetch-Site`), are refused with `403`. Request
   targets over 8 KiB are refused with `414`. No HTTP endpoint mutates or deletes

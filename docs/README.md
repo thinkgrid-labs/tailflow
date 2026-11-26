@@ -14,6 +14,7 @@ Use this page to find the shortest path to the information you need.
 | Call the HTTP API | [TailFlow for agents: HTTP API](agents.md#http-api) |
 | Use the web dashboard and read what it shows | [Dashboard](dashboard.md) |
 | Keep history, set retention, or control what is recorded | [Durable history](storage.md) |
+| Sign in to the dashboard, use the API token, understand who can read the API | [Security](security.md) |
 | Understand the internals | [Architecture](architecture.md) |
 | Evaluate production or automation use | [Limitations](limitations.md) |
 | See planned work | [Roadmap](roadmap.md) |

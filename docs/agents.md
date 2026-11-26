@@ -48,6 +48,16 @@ claude mcp add tailflow -- tailflow-mcp
 The daemon address is resolved in this order: `--url` flag, `$TAILFLOW_URL`,
 then `http://127.0.0.1:7878`.
 
+The daemon requires an API token. `tailflow-mcp` and `tailflow-logs` read it
+from the daemon's owner-only runtime file
+(`<data dir>/run/daemon-<port>.json`) when the host is loopback, and re-read
+it after a refusal, so a long-running MCP server keeps working across daemon
+restarts. If the MCP client runs as another user, in a container, or through
+a port forward, add `"TAILFLOW_TOKEN"` to its `env` (`tailflow-daemon token`
+prints the current one; start the daemon with the same `TAILFLOW_TOKEN` to
+keep it stable). A refused token is an MCP tool error naming the fix, and
+exit code `4` for `tailflow-logs`. See [security](security.md).
+
 ### When the daemon isn't running
 
 Tool calls return `isError: true` with:
@@ -242,6 +252,10 @@ fi
 ## HTTP API
 
 All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
+Each request needs `Authorization: Bearer <token>`; `tailflow-daemon token`
+prints the current one, and `401`/`403` answers carry
+`{"error", "kind"}` with `kind` one of `unauthorized`, `invalid_token`,
+`session_expired`, `cross_origin` ([security](security.md)).
 
 ### Shared parameters
 

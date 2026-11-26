@@ -231,8 +231,9 @@ policy. Exclusions are counted (`events_excluded`) and are not reported as loss.
 tailflow-daemon storage status         # size, events, oldest/newest, gaps
 tailflow-daemon storage status --json
 tailflow-daemon storage check          # full integrity check, read-only
-curl -s localhost:7878/api/v1/storage/status
-curl -s localhost:7878/api/v1/collectors/status
+export TF_AUTH="Authorization: Bearer $(tailflow-daemon token)"
+curl -s -H "$TF_AUTH" localhost:7878/api/v1/storage/status
+curl -s -H "$TF_AUTH" localhost:7878/api/v1/collectors/status
 ```
 
 The dashboard's **Integrations** page shows the same information.
@@ -272,7 +273,9 @@ contain SQLite messages and file paths.
 
 ## HTTP API (v1)
 
-All endpoints are read-only `GET`s on the loopback listener.
+All endpoints are read-only `GET`s on the loopback listener and require the
+API token (`Authorization: Bearer …`) or a dashboard session; see
+[security](security.md).
 
 | Endpoint | Returns |
 |---|---|
@@ -312,8 +315,8 @@ request scans a bounded range of history; if it stops early it sets
 always advances — keep paging.
 
 ```bash
-curl -s 'localhost:7878/api/v1/events?type=runtime.error&since=24h&order=desc&limit=20'
-curl -s 'localhost:7878/api/v1/events?q=connection%20refused&source=api'
+curl -s -H "$TF_AUTH" 'localhost:7878/api/v1/events?type=runtime.error&since=24h&order=desc&limit=20'
+curl -s -H "$TF_AUTH" 'localhost:7878/api/v1/events?q=connection%20refused&source=api'
 ```
 
 ## Moving from memory-only versions
