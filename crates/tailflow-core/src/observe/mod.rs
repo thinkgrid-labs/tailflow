@@ -186,6 +186,7 @@ impl Root {
         let display = crate::agent::normalize_path(&joined.to_string_lossy(), None)
             .ok_or_else(|| RootError::NotADirectory(joined.clone()))?;
         let canonical = std::fs::canonicalize(&display)
+            .map(simplify_verbatim)
             .map_err(|_| RootError::NotADirectory(display.clone()))?;
         if !canonical.is_dir() {
             return Err(RootError::NotADirectory(display));
@@ -224,6 +225,24 @@ impl Root {
         }
         None
     }
+}
+
+/// On Windows `canonicalize` returns verbatim paths (`\\?\C:\…`,
+/// `\\?\UNC\server\share\…`). Watch and compare in the ordinary form,
+/// which is what the OS reports for a watch registered on it. Other
+/// platforms are unaffected.
+fn simplify_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Only drive paths (`C:\…`); other verbatim forms stay as they are.
+        if rest.as_bytes().get(1) == Some(&b':') {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// What the observer ignores under one root.
@@ -900,10 +919,36 @@ mod tests {
         }
     }
 
+    /// Events whose path ends with `suffix` (`/`-separated; Windows paths
+    /// are compared with `\\` turned into `/`).
     fn by_path<'a>(ev: &'a [ObservabilityEvent], suffix: &str) -> Vec<&'a ObservabilityEvent> {
         ev.iter()
-            .filter(|e| e.path.as_deref().is_some_and(|p| p.ends_with(suffix)))
+            .filter(|e| {
+                e.path
+                    .as_deref()
+                    .is_some_and(|p| p.replace('\\', "/").ends_with(suffix))
+            })
             .collect()
+    }
+
+    #[test]
+    fn verbatim_windows_paths_are_simplified() {
+        assert_eq!(
+            simplify_verbatim(PathBuf::from(r"\\?\C:\Users\a")),
+            PathBuf::from(r"C:\Users\a")
+        );
+        assert_eq!(
+            simplify_verbatim(PathBuf::from(r"\\?\UNC\srv\share\x")),
+            PathBuf::from(r"\\srv\share\x")
+        );
+        assert_eq!(
+            simplify_verbatim(PathBuf::from(r"\\?\Volume{abc}\x")),
+            PathBuf::from(r"\\?\Volume{abc}\x")
+        );
+        assert_eq!(
+            simplify_verbatim(PathBuf::from("/tmp/x")),
+            PathBuf::from("/tmp/x")
+        );
     }
 
     #[test]
@@ -959,7 +1004,11 @@ mod tests {
             Err(RootError::DataDirectory(_))
         ));
         let ok = Root::resolve(Path::new("proj"), &data, None).unwrap();
-        assert!(ok.display.ends_with("data/proj"));
+        assert!(ok.display.ends_with(Path::new("data").join("proj")));
+        assert!(
+            !ok.canonical.to_string_lossy().starts_with(r"\\?\"),
+            "no verbatim prefix"
+        );
     }
 
     #[test]
@@ -1020,7 +1069,10 @@ mod tests {
         } else {
             sink.events.lock().unwrap().clone()
         };
-        let paths: Vec<_> = ev.iter().filter_map(|e| e.path.clone()).collect();
+        let paths: Vec<_> = ev
+            .iter()
+            .filter_map(|e| e.path.as_deref().map(|p| p.replace('\\', "/")))
+            .collect();
         assert!(paths.iter().any(|p| p.ends_with("/kept.rs")), "{paths:?}");
         assert!(
             !paths

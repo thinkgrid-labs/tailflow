@@ -454,7 +454,7 @@ fn files_inner(c: &Connection, q: &FileEvidenceQuery) -> Result<FileEvidencePage
             observed: vec![o.as_ref()],
         });
     }
-    items.sort_by(|a, b| b.at.cmp(&a.at));
+    items.sort_by_key(|i| std::cmp::Reverse(i.at));
     let mut counts = BTreeMap::new();
     for s in [
         "matched_observation",
