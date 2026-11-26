@@ -32,7 +32,7 @@ async fn observe_status(State(state): State<Arc<AppState>>) -> Json<Value> {
         .observe
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+        .current();
     Json(serde_json::to_value(s).unwrap_or(Value::Null))
 }
 

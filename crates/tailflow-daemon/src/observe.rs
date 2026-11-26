@@ -10,13 +10,17 @@
 //!   and after file changes settle (at most every `git_min_interval_secs`).
 //!   A HEAD that moved between two snapshots is recorded as `git.commit`,
 //!   `git.checkout` or `git.head.moved`.
+//! - Idle costs no periodic wakeups beyond a few bounded maintenance
+//!   timers: observers and the Git thread block until there is work, and
+//!   the supervisor sleeps until its next deadline (claim retry or check,
+//!   the foreign-commit poll) or a wake (own session boundary, stop).
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +40,10 @@ const CLAIM_RETRY: Duration = Duration::from_secs(60);
 /// How often a running observer checks that its coverage claim is still
 /// open (another daemon closes it when it declares this run dead).
 const CLAIM_CHECK: Duration = Duration::from_secs(30);
+/// Session boundaries committed by this daemon wake the supervisor at once
+/// (commit hook). Another daemon sharing the database does not call our
+/// hook, so its commits are found by polling this often.
+const FOREIGN_SESSION_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RootStatus {
@@ -86,6 +94,35 @@ pub struct ObserveStatus {
     pub errors: Vec<String>,
     pub coalesce_ms: u64,
     pub git_min_interval_secs: u64,
+    /// Live counters of each root's running observer (read when the status
+    /// is requested, so nothing has to copy them on a timer).
+    #[serde(skip)]
+    live: Vec<Option<Arc<observe::Stats>>>,
+}
+
+impl ObserveStatus {
+    /// A copy with the counters of running observers read now.
+    pub fn current(&self) -> Self {
+        let mut s = self.clone();
+        for (r, live) in s.roots.iter_mut().zip(&self.live) {
+            if let Some(st) = live {
+                fill_counts(r, st);
+            }
+        }
+        s.live = Vec::new();
+        s
+    }
+}
+
+fn fill_counts(r: &mut RootStatus, st: &observe::Stats) {
+    let ld = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    r.observations = ld(&st.observations);
+    r.excluded = ld(&st.excluded);
+    r.overflowed = ld(&st.overflowed);
+    r.rescans = ld(&st.rescans);
+    r.watched_dirs = ld(&st.watched_dirs);
+    r.unwatched_dirs = ld(&st.unwatched_dirs);
+    r.pending_paths = ld(&st.pending_paths);
 }
 
 pub type Shared = Arc<Mutex<ObserveStatus>>;
@@ -119,12 +156,44 @@ enum GitMsg {
 /// so a burst of file changes cannot grow the queue.
 const GIT_QUEUE: usize = 1024;
 
-/// The Git nudge of one repository: the repository and its "a `Changed`
-/// is queued" flag.
+/// Change tracking of one repository, shared by its observers and the Git
+/// thread.
+#[derive(Clone)]
+struct RepoFlag {
+    /// Set by the first change after a snapshot (and a `Changed` is sent);
+    /// cleared by the Git thread just before it takes a snapshot. Later
+    /// changes only update `last_change_ms`, so a burst of file changes
+    /// neither grows the queue nor wakes the Git thread per change.
+    dirty: Arc<AtomicBool>,
+    /// Time of the latest change, in ms since `epoch`.
+    last_change_ms: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl RepoFlag {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            dirty: Arc::new(AtomicBool::new(false)),
+            last_change_ms: Arc::new(AtomicU64::new(0)),
+            epoch,
+        }
+    }
+
+    fn touch(&self) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_change_ms.fetch_max(ms, Ordering::AcqRel);
+    }
+
+    fn last_change(&self) -> Instant {
+        self.epoch + Duration::from_millis(self.last_change_ms.load(Ordering::Acquire))
+    }
+}
+
+/// The Git nudge of one repository.
 #[derive(Clone)]
 struct GitNudge {
     repo: PathBuf,
-    queued: Arc<AtomicBool>,
+    flag: RepoFlag,
     tx: mpsc::SyncSender<GitMsg>,
 }
 
@@ -139,11 +208,15 @@ impl observe::Sink for StorageSink {
     fn observed(&self, event: ObservabilityEvent) {
         let _counted_in_storage_health = self.storage.submit(event);
         if let Some(g) = &self.git {
-            if !g.queued.swap(true, Ordering::AcqRel)
+            // Time first, then the flag: the Git thread clears the flag
+            // before it snapshots, so a change is either in that snapshot
+            // or sets the flag again.
+            g.flag.touch();
+            if !g.flag.dirty.swap(true, Ordering::AcqRel)
                 && g.tx.try_send(GitMsg::Changed(g.repo.clone())).is_err()
             {
                 // Queue full or the Git thread is gone: allow a later try.
-                g.queued.store(false, Ordering::Release);
+                g.flag.dirty.store(false, Ordering::Release);
             }
         }
     }
@@ -169,6 +242,7 @@ impl observe::Sink for StorageSink {
 
 pub struct Handle {
     stop: CancellationToken,
+    wake: mpsc::SyncSender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -177,6 +251,9 @@ impl Handle {
     /// thread; close coverage. Blocking.
     pub fn stop(mut self) {
         self.stop.cancel();
+        // Full: a wake is already queued, and the supervisor checks the
+        // token after every wake.
+        let _queued = self.wake.try_send(());
         if let Some(t) = self.thread.take() {
             if t.join().is_err() {
                 tracing::warn!("observe supervisor panicked");
@@ -228,13 +305,32 @@ pub fn spawn(
         return (status, None);
     }
     let stop = shutdown.child_token();
+    // Wakes the supervisor: a session boundary committed by this daemon,
+    // or stop. Capacity 1: wakes coalesce, a sender never blocks.
+    let (wake, wake_rx) = mpsc::sync_channel::<()>(1);
+    let hook_wake = wake.clone();
+    storage.on_commit(move |info| {
+        if info.inserted_session_boundaries > 0 {
+            let _coalesced = hook_wake.try_send(());
+        }
+    });
+    // The daemon's shutdown token is cancelled before `Handle::stop`; wake
+    // the supervisor for it too, so stopping never waits for a timer.
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let token = stop.clone();
+        let w = wake.clone();
+        rt.spawn(async move {
+            token.cancelled().await;
+            let _coalesced = w.try_send(());
+        });
+    }
     let st = status.clone();
     let stop_thread = stop.clone();
     let thread = std::thread::Builder::new()
         .name("tailflow-observe-supervisor".into())
-        .spawn(move || supervise(cfg, roots, own_dirs, storage, &st, &stop_thread))
+        .spawn(move || supervise(cfg, roots, own_dirs, storage, &st, &stop_thread, &wake_rx))
         .ok();
-    (status, Some(Handle { stop, thread }))
+    (status, Some(Handle { stop, wake, thread }))
 }
 
 struct Running {
@@ -252,6 +348,7 @@ fn supervise(
     storage: Storage,
     status: &Shared,
     stop: &CancellationToken,
+    wake: &mpsc::Receiver<()>,
 ) {
     // Repositories containing the roots.
     let git_bin = if cfg.git { git::find_git() } else { None };
@@ -277,8 +374,10 @@ fn supervise(
                 ..RootStatus::default()
             })
             .collect();
+        s.live = roots.iter().map(|_| None).collect();
     }
-    let mut flags: HashMap<PathBuf, Arc<AtomicBool>> = HashMap::new();
+    let epoch = Instant::now();
+    let mut flags: HashMap<PathBuf, RepoFlag> = HashMap::new();
     let (git_tx, git_thread) = match &git_bin {
         Some(bin) => {
             let mut repos: Vec<PathBuf> = repo_of.iter().flatten().cloned().collect();
@@ -300,7 +399,7 @@ fn supervise(
                 })
                 .collect();
             for repo in &repos {
-                flags.insert(repo.clone(), Arc::new(AtomicBool::new(false)));
+                flags.insert(repo.clone(), RepoFlag::new(epoch));
             }
             let (tx, rx) = mpsc::sync_channel::<GitMsg>(GIT_QUEUE);
             let t = spawn_git(
@@ -327,9 +426,8 @@ fn supervise(
     let mut running: Vec<Option<Running>> = roots.iter().map(|_| None).collect();
     let mut next_try = vec![Instant::now(); roots.len()];
     let mut session_cursor = storage.newest_seq().unwrap_or(0);
-    let mut last_status = Instant::now()
-        .checked_sub(Duration::from_secs(5))
-        .unwrap_or_else(Instant::now);
+    let mut next_session_poll = Instant::now() + FOREIGN_SESSION_POLL;
+    let mut session_wake = false;
     while !stop.is_cancelled() {
         // Start (or retry) observers.
         for (i, root) in roots.iter().enumerate() {
@@ -371,8 +469,8 @@ fn supervise(
                 storage: storage.clone(),
                 coverage: coverage.clone(),
                 git: match (&git_tx, repo_of.get(i).cloned().flatten()) {
-                    (Some(tx), Some(repo)) => flags.get(&repo).map(|q| GitNudge {
-                        queued: q.clone(),
+                    (Some(tx), Some(repo)) => flags.get(&repo).map(|f| GitNudge {
+                        flag: f.clone(),
                         repo,
                         tx: tx.clone(),
                     }),
@@ -407,11 +505,17 @@ fn supervise(
                             cfg.max_directories
                         );
                     }
-                    set_root(status, i, |r| {
-                        r.state = "observing";
-                        r.backend = Some(observer.backend);
-                        r.detail = None;
-                    });
+                    {
+                        let mut s = lock(status);
+                        if let Some(r) = s.roots.get_mut(i) {
+                            r.state = "observing";
+                            r.backend = Some(observer.backend);
+                            r.detail = None;
+                        }
+                        if let Some(l) = s.live.get_mut(i) {
+                            *l = Some(observer.stats.clone());
+                        }
+                    }
                     if let Some(slot) = running.get_mut(i) {
                         *slot = Some(Running {
                             observer,
@@ -443,6 +547,7 @@ fn supervise(
             }
             if let Some(run) = slot.take() {
                 run.observer.stop();
+                freeze_counts(status, i);
                 lock(&run.coverage).take();
             }
             eprintln!(
@@ -458,40 +563,49 @@ fn supervise(
                 *t = Instant::now();
             }
         }
-        // Session boundaries in observed repositories trigger snapshots.
+        // Session boundaries in observed repositories trigger snapshots:
+        // at once for this daemon's own commits (the commit hook wakes us),
+        // and by a bounded poll for commits of another daemon.
         if let Some(tx) = &git_tx {
-            session_cursor = session_boundaries(&storage, session_cursor, &repo_of, tx);
-        }
-        if last_status.elapsed() >= Duration::from_secs(1) {
-            last_status = Instant::now();
-            let mut s = lock(status);
-            for (r, run) in s.roots.iter_mut().zip(&running) {
-                if let Some(run) = run {
-                    let st = &run.observer.stats;
-                    let ld = |a: &std::sync::atomic::AtomicU64| {
-                        a.load(std::sync::atomic::Ordering::Relaxed)
-                    };
-                    r.observations = ld(&st.observations);
-                    r.excluded = ld(&st.excluded);
-                    r.overflowed = ld(&st.overflowed);
-                    r.rescans = ld(&st.rescans);
-                    r.watched_dirs = ld(&st.watched_dirs);
-                    r.unwatched_dirs = ld(&st.unwatched_dirs);
-                    r.pending_paths = ld(&st.pending_paths);
-                }
+            if session_wake || Instant::now() >= next_session_poll {
+                session_cursor = session_boundaries(&storage, session_cursor, &repo_of, tx);
+                next_session_poll = Instant::now() + FOREIGN_SESSION_POLL;
             }
         }
-        // Responsive to shutdown, cheap when idle.
-        for _ in 0..10 {
-            if stop.is_cancelled() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        // Sleep until the next deadline or a wake (session boundary, stop).
+        let mut deadline: Option<Instant> = git_tx.as_ref().map(|_| next_session_poll);
+        for (i, slot) in running.iter().enumerate() {
+            let at = match slot {
+                Some(run) => Some(run.checked + CLAIM_CHECK),
+                None => next_try.get(i).copied(),
+            };
+            deadline = [deadline, at].into_iter().flatten().min();
         }
+        if stop.is_cancelled() {
+            break;
+        }
+        let wait = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        session_wake = match wait {
+            None => match wake.recv() {
+                Ok(()) => true,
+                Err(_) => break,
+            },
+            Some(w) => match wake.recv_timeout(w) {
+                Ok(()) => true,
+                Err(RecvTimeoutError::Timeout) => false,
+                // Every sender is gone (cannot happen while the handle
+                // lives): stop rather than spin.
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+        };
     }
-    for run in running.into_iter().flatten() {
+    for (i, run) in running.into_iter().enumerate() {
+        let Some(run) = run else { continue };
+        // Stop first: stopping flushes pending observations.
         run.observer.stop();
-        if let Some(id) = lock(&run.coverage).take() {
+        freeze_counts(status, i);
+        let id = lock(&run.coverage).take();
+        if let Some(id) = id {
             if let Err(e) = storage.coverage_stopped(id) {
                 tracing::warn!(err = %e, "could not close observation coverage");
             }
@@ -502,6 +616,16 @@ fn supervise(
     }
     if let Some(t) = git_thread {
         let _joined = t.join();
+    }
+}
+
+/// Copy a root's final counters into its status and stop reading them
+/// live (its observer has stopped).
+fn freeze_counts(status: &Shared, i: usize) {
+    let mut s = lock(status);
+    let live = s.live.get_mut(i).and_then(Option::take);
+    if let (Some(st), Some(r)) = (live, s.roots.get_mut(i)) {
+        fill_counts(r, &st);
     }
 }
 
@@ -563,8 +687,8 @@ fn session_boundaries(
 
 struct RepoState {
     last_snapshot: Option<Instant>,
-    dirty_since: Option<Instant>,
-    last_change: Option<Instant>,
+    /// A `Changed` arrived and no snapshot has been taken since.
+    dirty: bool,
     previous: Option<git::Snapshot>,
     seq: u64,
 }
@@ -572,7 +696,7 @@ struct RepoState {
 fn spawn_git(
     bin: PathBuf,
     scope: HashMap<PathBuf, Vec<Root>>,
-    flags: HashMap<PathBuf, Arc<AtomicBool>>,
+    flags: HashMap<PathBuf, RepoFlag>,
     cfg: &ObserveConfig,
     storage: Storage,
     status: Shared,
@@ -601,24 +725,43 @@ fn spawn_git(
                         r.clone(),
                         RepoState {
                             last_snapshot: None,
-                            dirty_since: None,
-                            last_change: None,
+                            dirty: false,
                             previous: None,
                             seq: 0,
                         },
                     )
                 })
                 .collect();
+            // A change-triggered snapshot is due once changes have been
+            // quiet for GIT_QUIET and the last snapshot is min_interval
+            // old. With no repository dirty, the thread blocks.
+            let due_at = |repo: &Path, st: &RepoState| -> Option<Instant> {
+                if !st.dirty {
+                    return None;
+                }
+                let quiet = flags.get(repo).map(|f| f.last_change() + GIT_QUIET);
+                let spaced = st.last_snapshot.map(|l| l + min_interval);
+                [quiet, spaced].into_iter().flatten().max()
+            };
+            // Clear the shared flag before snapshotting: a change after
+            // this point sets it again and is snapshotted later.
+            let clear = |repo: &Path, st: &mut RepoState| {
+                st.dirty = false;
+                if let Some(f) = flags.get(repo) {
+                    f.dirty.store(false, Ordering::Release);
+                }
+            };
             loop {
-                match rx.recv_timeout(Duration::from_millis(500)) {
+                let deadline = state.iter().filter_map(|(r, st)| due_at(r, st)).min();
+                let got = match deadline {
+                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                    Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+                };
+                match got {
                     Ok(GitMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Ok(GitMsg::Changed(repo)) => {
-                        if let Some(q) = flags.get(&repo) {
-                            q.store(false, Ordering::Release);
-                        }
                         if let Some(st) = state.get_mut(&repo) {
-                            st.dirty_since.get_or_insert_with(Instant::now);
-                            st.last_change = Some(Instant::now());
+                            st.dirty = true;
                         }
                     }
                     Ok(GitMsg::Now {
@@ -627,6 +770,7 @@ fn spawn_git(
                         session,
                     }) => {
                         if let Some(st) = state.get_mut(&repo) {
+                            clear(&repo, st);
                             let roots = scope.get(&repo).map_or(&[][..], Vec::as_slice);
                             take(
                                 &bin,
@@ -642,23 +786,15 @@ fn spawn_git(
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                 }
-                // Change-triggered snapshots: quiet, and not too often.
                 let now = Instant::now();
                 let due: Vec<PathBuf> = state
                     .iter()
-                    .filter(|(_, st)| {
-                        st.dirty_since.is_some()
-                            && st
-                                .last_change
-                                .is_some_and(|c| now.duration_since(c) >= GIT_QUIET)
-                            && st
-                                .last_snapshot
-                                .is_none_or(|l| now.duration_since(l) >= min_interval)
-                    })
+                    .filter(|(r, st)| due_at(r, st).is_some_and(|d| now >= d))
                     .map(|(r, _)| r.clone())
                     .collect();
                 for repo in due {
                     if let Some(st) = state.get_mut(&repo) {
+                        clear(&repo, st);
                         let roots = scope.get(&repo).map_or(&[][..], Vec::as_slice);
                         take(&bin, &repo, roots, st, "fs_change", None, &storage, &status);
                     }
@@ -680,7 +816,6 @@ fn take(
     status: &Shared,
 ) {
     st.last_snapshot = Some(Instant::now());
-    st.dirty_since = None;
     let result = git::snapshot(bin, repo, git::DEFAULT_TIMEOUT);
     let repo_s = repo.display().to_string();
     let snap = match result {
@@ -1064,6 +1199,148 @@ mod tests {
         assert_eq!(a["git.filters_disabled"], serde_json::json!(["lfs"]));
         assert!(a.get("git.changes_listed_through").is_none());
         assert_eq!(a["git.list_format"], 2);
+    }
+
+    fn snapshots(st: &Storage) -> Vec<ObservabilityEvent> {
+        let q = EventQuery {
+            event_types: vec!["git.snapshot".into()],
+            order: Order::Asc,
+            limit: 100,
+            ..EventQuery::default()
+        };
+        st.query(&q)
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|e| e.event)
+            .collect()
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ok() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// M4-F: the event-driven supervisor and Git thread still take the
+    /// startup, change-triggered and session-boundary snapshots, the
+    /// status reports live counters, and stopping does not wait on a timer.
+    #[test]
+    fn event_driven_supervisor_keeps_every_snapshot_trigger() {
+        let Some(git_bin) = git::find_git() else {
+            eprintln!("git not installed; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run_git = |args: &[&str]| {
+            let ok = std::process::Command::new(&git_bin)
+                .args(args)
+                .current_dir(&repo)
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("a.rs"), "v1\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let st = storage(&dir.path().join("data"), &PrivacyConfig::default());
+        let cfg = ObserveConfig {
+            paths: vec![repo.clone()],
+            git_min_interval_secs: 5,
+            coalesce_ms: 50,
+            ..ObserveConfig::default()
+        };
+        let (status, handle) = spawn(cfg, dir.path(), st.clone(), &CancellationToken::new());
+        let handle = handle.expect("observation starts");
+        wait_until("observing and the startup snapshot", || {
+            let s = lock(&status).current();
+            s.roots.first().is_some_and(|r| r.state == "observing")
+                && s.repos.first().is_some_and(|r| r.snapshots >= 1)
+        });
+        let triggers = |st: &Storage| -> Vec<String> {
+            snapshots(st)
+                .iter()
+                .filter_map(|e| e.attributes.get("git.trigger")?.as_str().map(String::from))
+                .collect()
+        };
+        // Submitted to storage asynchronously; committed shortly after.
+        wait_until("the startup snapshot in storage", || {
+            !triggers(&st).is_empty()
+        });
+        assert_eq!(triggers(&st), ["startup"]);
+
+        // A file change: observed (live counter), then a snapshot once the
+        // changes are quiet and the minimum interval has passed.
+        std::fs::write(repo.join("a.rs"), "v2\n").unwrap();
+        wait_until("a live observation count", || {
+            lock(&status)
+                .current()
+                .roots
+                .first()
+                .is_some_and(|r| r.observations >= 1)
+        });
+        wait_until("a change-triggered snapshot", || {
+            triggers(&st).iter().any(|t| t == "fs_change")
+        });
+
+        // A session boundary committed by this daemon wakes the supervisor.
+        let mut start = ObservabilityEvent::new(
+            "s1",
+            "agent.session.started",
+            Provenance::AgentReported,
+            "agent",
+            "agent:test",
+            Utc::now(),
+        );
+        start.session_id = Some("claude-code:s1".into());
+        start.attributes.insert(
+            "git.root".into(),
+            Value::from(
+                tailflow_core::agent::correlation::discover(&repo)
+                    .unwrap()
+                    .worktree_root
+                    .display()
+                    .to_string(),
+            ),
+        );
+        let _accepted = st.submit(start);
+        wait_until("a session-start snapshot", || {
+            triggers(&st).iter().any(|t| t == "session_start")
+        });
+
+        let t = Instant::now();
+        handle.stop();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "stop took {:?}",
+            t.elapsed()
+        );
+        // Counters stay readable after the observer stopped.
+        let s = lock(&status).current();
+        assert!(
+            s.roots.first().is_some_and(|r| r.observations >= 1),
+            "{s:?}"
+        );
     }
 
     #[test]
