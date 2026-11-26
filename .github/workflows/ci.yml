@@ -176,17 +176,26 @@ jobs:
       # event loss, missing metrics and an oversized binary — proven here by
       # injecting each fault against the real daemon.
       - run: python3 scripts/bench/gate_selftest.py
+      # Agent hooks run as Claude Code and Codex run them (Linux).
+      - run: python3 scripts/smoke/agent_hook_smoke.py --out agent-smoke-ubuntu.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: resource-checks
-          path: resource-checks.jsonl
+          path: |
+            resource-checks.jsonl
+            agent-smoke-ubuntu.json
           if-no-files-found: error
 
   # ── Native platforms ───────────────────────────────────────────────────────
   # The full test suite and a release smoke test (start, API, database, file
   # and process collection, graceful stop, restart persistence, hard-kill
-  # recovery) on Windows x86_64 (MSVC) and macOS arm64, natively.
+  # recovery) on Windows x86_64 (MSVC) and macOS arm64, natively. Then the
+  # agent hook smoke test: install, run the hooks as Claude Code (exec form)
+  # and Codex (`cmd /C` on Windows) do from a path with spaces and
+  # parentheses, ingestion, evidence, privacy, restart, uninstall. It needs no
+  # agent, account or secret, and does not prove real agents call hooks
+  # this way (see the script's docstring).
   platforms:
     name: platform (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -209,11 +218,14 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast
       - run: cargo build --release --locked --bins
       - run: python3 scripts/smoke/platform_smoke.py --out smoke-${{ matrix.os }}.json
+      - run: python3 scripts/smoke/agent_hook_smoke.py --out agent-smoke-${{ matrix.os }}.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: smoke-${{ matrix.os }}
-          path: smoke-${{ matrix.os }}.json
+          path: |
+            smoke-${{ matrix.os }}.json
+            agent-smoke-${{ matrix.os }}.json
 
   # ── Quality gate ───────────────────────────────────────────────────────────
   # Set this as the required status check in branch protection for main and dev.
