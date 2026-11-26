@@ -41,6 +41,80 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/agents/status", get(agents_status))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/files", get(files))
+        .route("/api/v1/stream/agent", get(stream_agent))
+}
+
+// ── GET /api/v1/stream/agent ─────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StreamParams {
+    /// Resume after this seq (exclusive). Absent: start live, or from the
+    /// `Last-Event-ID` header an `EventSource` sends when it reconnects.
+    after: Option<u64>,
+    agent: Option<String>,
+    session: Option<String>,
+    project: Option<String>,
+}
+
+/// Live, resumable stream of committed agent activity (see
+/// `agent_stream.rs`).
+async fn stream_agent(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    params: Result<AxumQuery<StreamParams>, QueryRejection>,
+) -> Result<Response, V1Error> {
+    let AxumQuery(p) = params.map_err(|r| {
+        V1Error::bad_request(format!("invalid query parameters: {}", r.body_text()))
+    })?;
+    let storage = storage_of(&state)?.clone();
+    let last_event_id = match headers.get("last-event-id") {
+        None => None,
+        Some(v) => Some(
+            v.to_str()
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .ok_or_else(|| V1Error::bad_request("invalid Last-Event-ID (expected a seq)"))?,
+        ),
+    };
+    // An EventSource reconnects with its original URL (and so a possibly
+    // older `after`) plus the newest id it received: resume from whichever
+    // is further along. Everything at or below it was already delivered.
+    let after = match (p.after, last_event_id) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    if after.is_some_and(|a| i64::try_from(a).is_err()) {
+        return Err(V1Error::bad_request("`after` is out of range"));
+    }
+    let filter = crate::agent_stream::Filter {
+        agents: list(p.agent.as_ref()),
+        sessions: list(p.session.as_ref()),
+        projects: list(p.project.as_ref()),
+    };
+    for (name, l) in [
+        ("agent", &filter.agents),
+        ("session", &filter.sessions),
+        ("project", &filter.projects),
+    ] {
+        if l.len() > tailflow_storage::query::MAX_LIST_VALUES || l.iter().any(|v| v.len() > 4096) {
+            return Err(V1Error::bad_request(format!(
+                "`{name}` accepts at most {} values of up to 4096 bytes",
+                tailflow_storage::query::MAX_LIST_VALUES
+            )));
+        }
+    }
+    match crate::agent_stream::subscribe(&state, storage, filter, after) {
+        Some(sse) => Ok(sse.into_response()),
+        None => Err(V1Error {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            kind: "too_many_streams",
+            message: format!(
+                "at most {} live agent streams per daemon; close another dashboard tab",
+                crate::agent_stream::MAX_SUBSCRIBERS
+            ),
+        }),
+    }
 }
 
 pub struct V1Error {
@@ -1525,5 +1599,386 @@ mod tests {
         assert!(health["instance_id"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    // ── live agent stream (M4-B) ──────────────────────────────────────────────
+
+    /// One parsed SSE frame.
+    #[derive(Debug, Clone)]
+    struct Frame {
+        event: String,
+        id: Option<String>,
+        data: String,
+    }
+
+    /// An open `/api/v1/stream/agent` response, read frame by frame.
+    struct StreamReader {
+        body: axum::body::Body,
+        buf: String,
+    }
+
+    impl StreamReader {
+        async fn open(
+            h: &Harness,
+            uri: &str,
+            extra: &[(&str, &str)],
+        ) -> (StatusCode, Option<Self>) {
+            let mut b = Request::builder().uri(uri).header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", h.state.auth.token().expose()),
+            );
+            for (k, v) in extra {
+                b = b.header(*k, *v);
+            }
+            let response = router(h.state.clone())
+                .oneshot(b.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            if status != StatusCode::OK {
+                return (status, None);
+            }
+            (
+                status,
+                Some(Self {
+                    body: response.into_body(),
+                    buf: String::new(),
+                }),
+            )
+        }
+
+        /// Next non-comment frame, or `None` at end of stream / timeout.
+        async fn next(&mut self, timeout: Duration) -> Option<Frame> {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if let Some(end) = self.buf.find("\n\n") {
+                    let raw: String = self.buf.drain(..end + 2).collect();
+                    let mut f = Frame {
+                        event: "message".into(),
+                        id: None,
+                        data: String::new(),
+                    };
+                    let mut any = false;
+                    for line in raw.lines() {
+                        if let Some(v) = line.strip_prefix("event:") {
+                            f.event = v.trim().into();
+                            any = true;
+                        } else if let Some(v) = line.strip_prefix("id:") {
+                            f.id = Some(v.trim().into());
+                        } else if let Some(v) = line.strip_prefix("data:") {
+                            f.data.push_str(v.strip_prefix(' ').unwrap_or(v));
+                            any = true;
+                        }
+                    }
+                    if any {
+                        return Some(f);
+                    }
+                    continue; // keep-alive comment
+                }
+                let frame = tokio::time::timeout_at(deadline, self.body.frame())
+                    .await
+                    .ok()??;
+                let bytes = frame.ok()?.into_data().ok()?;
+                self.buf.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+
+        /// Frames until (and including) the first `event`, bounded.
+        async fn until(&mut self, event: &str, timeout: Duration) -> Vec<Frame> {
+            let mut out = Vec::new();
+            while let Some(f) = self.next(timeout).await {
+                let done = f.event == event;
+                out.push(f);
+                if done {
+                    break;
+                }
+            }
+            out
+        }
+
+        /// `agent` frames, collected until `n` arrived or `timeout`.
+        async fn agents(&mut self, n: usize, timeout: Duration) -> Vec<Frame> {
+            let mut out = Vec::new();
+            let deadline = tokio::time::Instant::now() + timeout;
+            while out.len() < n {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match self.next(left).await {
+                    Some(f) if f.event == "agent" => out.push(f),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            out
+        }
+    }
+
+    fn seqs(frames: &[Frame]) -> Vec<u64> {
+        frames
+            .iter()
+            .filter(|f| f.event == "agent")
+            .map(|f| f.id.as_deref().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    fn tool_calls(n: usize, prefix: &str) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                serde_json::json!({"hook_event_name":"PreToolUse","cwd":"/work/app","tool_name":"Read",
+                    "tool_use_id": format!("{prefix}-{i}"),"tool_input":{"file_path":"/work/app/a.rs"}})
+            })
+            .collect()
+    }
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn agent_stream_delivers_committed_events_live_in_seq_order() {
+        let h = harness(PrivacyConfig::default(), true);
+        let (status, s) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut s = s.unwrap();
+        let ready = s.until("ready", WAIT).await;
+        assert_eq!(ready.last().unwrap().event, "ready", "{ready:?}");
+        // Runtime logs are not agent activity.
+        h.ingest(vec![line("api", LogLevel::Error, "boom")]).await;
+        agent_events(&h, "s-live", &tool_calls(5, "t"));
+        h.flush().await;
+        let got = s.agents(5, WAIT).await;
+        let seq = seqs(&got);
+        assert_eq!(seq.len(), 5, "{got:?}");
+        assert!(seq.windows(2).all(|w| w[0] < w[1]), "{seq:?}");
+        for f in &got {
+            let v: serde_json::Value = serde_json::from_str(&f.data).unwrap();
+            assert_eq!(v["seq"].to_string(), *f.id.as_ref().unwrap());
+            assert_eq!(v["provenance"], "agent_reported");
+            assert!(v["event_type"].as_str().unwrap().starts_with("agent."));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_stream_resumes_from_a_cursor_without_duplicates() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(&h, "s-hist", &tool_calls(6, "h"));
+        h.ingest(vec![line("api", LogLevel::Info, "noise")]).await;
+        // Everything so far, from the start.
+        let (_, s) = StreamReader::open(&h, "/api/v1/stream/agent?after=0", &[]).await;
+        let mut s = s.unwrap();
+        let all = s.until("ready", WAIT).await;
+        let all_seqs = seqs(&all);
+        assert_eq!(all_seqs.len(), 6, "{all:?}");
+        let ready: serde_json::Value = serde_json::from_str(&all.last().unwrap().data).unwrap();
+        assert_eq!(ready["caught_up_events"], 6);
+        // Resume after the third one: only the rest, once.
+        let cut = all_seqs[2];
+        let (_, s2) =
+            StreamReader::open(&h, &format!("/api/v1/stream/agent?after={cut}"), &[]).await;
+        let resumed = seqs(&s2.unwrap().until("ready", WAIT).await);
+        assert_eq!(resumed, all_seqs[3..].to_vec());
+        // The header an EventSource sends on reconnect works the same.
+        let (_, s3) = StreamReader::open(
+            &h,
+            "/api/v1/stream/agent",
+            &[("last-event-id", &cut.to_string())],
+        )
+        .await;
+        assert_eq!(
+            seqs(&s3.unwrap().until("ready", WAIT).await),
+            all_seqs[3..].to_vec()
+        );
+        // A native EventSource reconnect: stale `after` in the URL, newer
+        // Last-Event-ID. Resume from the newer one.
+        let (_, s5) = StreamReader::open(
+            &h,
+            &format!("/api/v1/stream/agent?after={}", all_seqs[0]),
+            &[("last-event-id", &cut.to_string())],
+        )
+        .await;
+        assert_eq!(
+            seqs(&s5.unwrap().until("ready", WAIT).await),
+            all_seqs[3..].to_vec()
+        );
+        // New events after a reconnect continue from the cursor.
+        let mut s4 = StreamReader::open(
+            &h,
+            &format!("/api/v1/stream/agent?after={}", all_seqs[5]),
+            &[],
+        )
+        .await
+        .1
+        .unwrap();
+        s4.until("ready", WAIT).await;
+        agent_events(&h, "s-hist", &tool_calls(2, "later"));
+        h.flush().await;
+        let more = seqs(&s4.agents(2, WAIT).await);
+        assert_eq!(more.len(), 2);
+        assert!(more[0] > all_seqs[5]);
+    }
+
+    #[tokio::test]
+    async fn agent_stream_filters_by_session_and_rejects_bad_parameters() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(&h, "s-a", &tool_calls(3, "a"));
+        agent_events(&h, "s-b", &tool_calls(4, "b"));
+        h.flush().await;
+        // Stored session ids carry the agent (`<agent>:<id>`).
+        let (_, page) = h.get("/api/v1/events?type=agent.*&limit=100").await;
+        let sid = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["session_id"].as_str().unwrap().to_string())
+            .find(|s| s.ends_with("s-b"))
+            .unwrap();
+        let (_, s) = StreamReader::open(
+            &h,
+            &format!("/api/v1/stream/agent?after=0&session={sid}"),
+            &[],
+        )
+        .await;
+        let frames = s.unwrap().until("ready", WAIT).await;
+        let got: Vec<serde_json::Value> = frames
+            .iter()
+            .filter(|f| f.event == "agent")
+            .map(|f| serde_json::from_str(&f.data).unwrap())
+            .collect();
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|v| v["session_id"] == sid.as_str()));
+        for bad in [
+            "/api/v1/stream/agent?bogus=1",
+            "/api/v1/stream/agent?after=x",
+            "/api/v1/stream/agent?after=99999999999999999999",
+        ] {
+            let (status, _) = StreamReader::open(&h, bad, &[]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (status, _) =
+            StreamReader::open(&h, "/api/v1/stream/agent", &[("last-event-id", "abc")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agent_stream_reports_loss_and_expired_history_as_gaps() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(&h, "s-g", &tool_calls(3, "g"));
+        let storage = h.state.storage.storage().unwrap().clone();
+        let (_, s) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        let mut s = s.unwrap();
+        s.until("ready", WAIT).await;
+        // Loss detected by this run: the next commit records a gap and a
+        // system.events.dropped marker.
+        let now = Utc::now();
+        storage.record_upstream_loss(7, now, now);
+        agent_events(&h, "s-g", &tool_calls(1, "after-loss"));
+        h.flush().await;
+        let mut saw_gap = false;
+        let mut saw_marker = false;
+        while let Some(f) = s.next(Duration::from_secs(3)).await {
+            if f.event == "gap" {
+                let g: serde_json::Value = serde_json::from_str(&f.data).unwrap();
+                assert_eq!(g["count"], 7, "{g}");
+                saw_gap = true;
+            }
+            if f.event == "agent" && f.data.contains("system.events.dropped") {
+                saw_marker = true;
+            }
+            if saw_gap && saw_marker {
+                break;
+            }
+        }
+        assert!(saw_gap && saw_marker, "loss is reported, not skipped");
+
+        // History removed while a client was away: a retention gap first.
+        let path = storage.path().to_path_buf();
+        let report = tokio::task::spawn_blocking(move || {
+            tailflow_storage::admin::purge(&path, tailflow_storage::admin::PurgeTarget::All)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(report.deleted > 0);
+        let (_, s2) = StreamReader::open(&h, "/api/v1/stream/agent?after=1", &[]).await;
+        let frames = s2.unwrap().until("ready", WAIT).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.event == "gap" && f.data.contains("retention")),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_stream_recovers_from_lag_through_storage() {
+        let h = harness(PrivacyConfig::default(), true);
+        let (_, s) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        let mut s = s.unwrap();
+        s.until("ready", WAIT).await;
+        // Do not read while far more batches than the channel holds are
+        // published (one commit and one feed read per event).
+        let total = 90;
+        for i in 0..total {
+            agent_events(&h, "s-lag", &tool_calls(1, &format!("lag{i}")));
+            h.flush().await;
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
+        let mut seqs_seen = Vec::new();
+        let mut lagged = false;
+        while seqs_seen.len() < total {
+            let Some(f) = s.next(WAIT).await else { break };
+            match f.event.as_str() {
+                "agent" => seqs_seen.push(f.id.unwrap().parse::<u64>().unwrap()),
+                "lag" => lagged = true,
+                _ => {}
+            }
+        }
+        assert!(lagged, "the subscriber lagged and said so");
+        assert_eq!(seqs_seen.len(), total, "nothing lost");
+        assert!(
+            seqs_seen.windows(2).all(|w| w[0] < w[1]),
+            "no duplicates, in order"
+        );
+        let stats = h.state.agent_feed.as_ref().unwrap().stats();
+        assert!(stats.subscriber_lag_recoveries >= 1, "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn agent_stream_is_bounded_and_ends_on_shutdown() {
+        let h = harness(PrivacyConfig::default(), true);
+        let mut open = Vec::new();
+        for _ in 0..crate::agent_stream::MAX_SUBSCRIBERS {
+            let (status, s) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+            assert_eq!(status, StatusCode::OK);
+            open.push(s.unwrap());
+        }
+        let (status, _) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        // A closed client frees its slot.
+        drop(open.pop());
+        let (status, s) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut s = s.unwrap();
+        s.until("ready", WAIT).await;
+        h.state.shutdown.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while s.next(Duration::from_secs(5)).await.is_some() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the stream ends on shutdown");
+    }
+
+    #[tokio::test]
+    async fn agent_stream_needs_storage_and_a_credential() {
+        let h = harness(PrivacyConfig::default(), false);
+        let (status, _) = StreamReader::open(&h, "/api/v1/stream/agent", &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let h = harness(PrivacyConfig::default(), true);
+        let (status, _) = send_raw(
+            h.state.clone(),
+            Request::builder().uri("/api/v1/stream/agent"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
