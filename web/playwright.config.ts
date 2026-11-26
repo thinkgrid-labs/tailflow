@@ -1,4 +1,6 @@
 import { defineConfig } from '@playwright/test'
+import os from 'node:os'
+import path from 'node:path'
 
 // Browser end-to-end tests against a real daemon (see e2e/global-setup.ts).
 // Binaries come from TAILFLOW_BIN_DIR (default: the workspace debug build),
@@ -20,6 +22,8 @@ export default defineConfig({
   reporter: process.env.CI ? [['list'], ['github']] : 'list',
   use: {
     baseURL: process.env.TAILFLOW_E2E_BASE,
+    // Session cookie for the fixture daemon, written by global-setup.
+    storageState: path.join(os.tmpdir(), 'tailflow-e2e-auth.json'),
     channel: process.env.PLAYWRIGHT_CHANNEL ?? 'chrome',
     headless: true,
     viewport: { width: 1440, height: 900 },

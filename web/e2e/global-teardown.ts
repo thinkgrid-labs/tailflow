@@ -10,4 +10,5 @@ export default async function globalTeardown() {
   await new Promise(r => setTimeout(r, 500))
   fs.rmSync(root, { recursive: true, force: true })
   fs.rmSync(state, { force: true })
+  fs.rmSync(path.join(os.tmpdir(), 'tailflow-e2e-auth.json'), { force: true })
 }

@@ -7,6 +7,9 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { Page } from '@playwright/test'
+// @ts-expect-error plain ESM helper shared with the manual screenshot script
+import { E2E_TOKEN, authHeaders, signInUrl } from './fixture.mjs'
 
 export const binDir = () => path.resolve(process.env.TAILFLOW_BIN_DIR ?? fileURLToPath(new URL('../../target/debug', import.meta.url)))
 
@@ -26,6 +29,10 @@ export interface Daemon {
   dir: string
   stop: (signal?: NodeJS.Signals) => Promise<{ code: number | null; ms: number }>
   restart: () => Promise<Daemon>
+  /** Sign `page`'s browser context in to this daemon (one-time link). */
+  signIn: (page: Page) => Promise<void>
+  /** Authenticated GET (API token), parsed as JSON. */
+  api: (p: string) => Promise<any>
 }
 
 /** `script` is a /bin/sh program whose stdout becomes the `app` source. */
@@ -37,7 +44,7 @@ export async function startDaemon(script: string, opts: { port?: number; dir?: s
   const cfg = path.join(dir, 'tailflow.toml')
   fs.writeFileSync(cfg, `[[sources.process]]\nlabel = "app"\ncmd = "sh ${sh}"\n\n[storage]\nenabled = ${opts.storage ? 'true' : 'false'}\n`)
   const proc = spawn(path.join(binDir(), 'tailflow-daemon'), ['--config', cfg, '--port', String(port), '--no-agents'], {
-    env: { ...process.env, TAILFLOW_DATA_DIR: path.join(dir, 'data'), RUST_LOG: 'warn' },
+    env: { ...process.env, TAILFLOW_DATA_DIR: path.join(dir, 'data'), TAILFLOW_TOKEN: E2E_TOKEN, RUST_LOG: 'warn' },
     stdio: 'ignore',
   })
   const base = `http://127.0.0.1:${port}`
@@ -57,6 +64,11 @@ export async function startDaemon(script: string, opts: { port?: number; dir?: s
       await d.stop()
       return startDaemon(script, { port, dir, storage: opts.storage })
     },
+    signIn: async (page: Page) => {
+      const res = await page.goto(await signInUrl(base))
+      if (!res?.ok()) throw new Error(`sign-in failed: ${res?.status()}`)
+    },
+    api: async (p: string) => (await fetch(`${base}${p}`, { headers: authHeaders })).json(),
   }
   return d
 }

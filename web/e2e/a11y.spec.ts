@@ -54,7 +54,7 @@ test('keyboard: skip link, search shortcut, focus ring, row activation', async (
 test('status badges carry text, not only color', async ({ page }) => {
   await page.goto('/#/sessions')
   const badges = page.locator('tbody .badge')
-  expect(await badges.count()).toBeGreaterThan(0)
+  await expect(badges.first()).toBeVisible()
   for (const t of await badges.allTextContents()) expect(t.trim().length).toBeGreaterThan(1)
 })
 

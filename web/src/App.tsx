@@ -15,6 +15,8 @@ import { Files } from './pages/Files'
 import { Commands } from './pages/Commands'
 import { Integrations } from './pages/Integrations'
 import { SettingsPage } from './pages/Settings'
+import { SignIn } from './components/SignIn'
+import { authState, checkSession, subscribeAuth, type AuthState } from './lib/auth.ts'
 
 const NAV: { page: Page; label: string; icon: IconName; section?: string }[] = [
   { page: 'overview', label: 'Overview', icon: 'overview' },
@@ -35,7 +37,25 @@ const TITLES: Record<Page, string> = {
   integrations: 'Integrations & storage', settings: 'Settings',
 }
 
+/** Checks the browser session first: nothing that reads data (pages, the
+ *  live stream) mounts until the daemon accepts it. */
 export function App() {
+  const [auth, setAuth] = useState<AuthState>(authState)
+  useEffect(() => {
+    const off = subscribeAuth(() => setAuth(authState()))
+    void checkSession()
+    return off
+  }, [])
+  useEffect(() => applySettings(loadSettings()), [])
+  if (auth.status === 'signed_out') {
+    document.title = 'Sign in · TailFlow'
+    return <SignIn reason={auth.reason} />
+  }
+  if (auth.status === 'checking') return <div class="signin" aria-busy="true" />
+  return <Dashboard />
+}
+
+function Dashboard() {
   const [settings, setSettings] = useState<Settings>(loadSettings)
   const update = (p: Partial<Settings>) => setSettings(s => {
     const next = { ...s, ...p }

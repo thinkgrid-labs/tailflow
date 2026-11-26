@@ -2,6 +2,7 @@ import { Fragment } from 'preact'
 import { useSettings } from '../lib/hooks.ts'
 import { dateTime } from '../lib/format.ts'
 import { Card, Segmented } from '../components/ui'
+import { signOut } from '../lib/auth.ts'
 
 const SHORTCUTS: [string, string][] = [
   ['/', 'Focus search'],
@@ -47,6 +48,14 @@ export function SettingsPage() {
         <dl class="kv">
           {SHORTCUTS.map(([k, v]) => (<Fragment key={k}><dt><kbd class="mono">{k}</kbd></dt><dd>{v}</dd></Fragment>))}
         </dl>
+      </Card>
+      <Card title="Access">
+        <p class="note">
+          This browser is signed in to the daemon with a session cookie that only this dashboard's origin can use.
+          It survives daemon restarts on this port and ends after 12 hours without use, after 7 days, when you sign out,
+          or when someone runs <code>tailflow-daemon dashboard --revoke-sessions</code>.
+        </p>
+        <button class="btn" onClick={() => void signOut()}>Sign out of this daemon</button>
       </Card>
       <Card title="About this dashboard">
         <p class="note">

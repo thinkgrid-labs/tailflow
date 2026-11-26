@@ -38,6 +38,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(__file__))
 import procstat  # noqa: E402
 
+# Daemons from M4 require an API token. Every daemon this script starts
+# inherits this one through the environment (older daemons ignore it).
+TOKEN = os.environ.setdefault("TAILFLOW_TOKEN", "tailflow-bench-token-0123456789abcdef")
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
 FIXTURES = os.path.join(os.path.dirname(__file__), "../../crates/tailflow-core/tests/fixtures/claude-code-2.1.331")
 MB = 1024 * 1024
 
@@ -110,7 +115,7 @@ def sc_hook(binary, n=300, prefill=0, big=False):
 
 def get(port, path, timeout=5):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=AUTH), timeout=timeout) as r:
             return json.loads(r.read())
     except Exception:
         return None

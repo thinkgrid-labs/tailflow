@@ -418,3 +418,15 @@ table.table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
   .kv { grid-template-columns: 1fr; gap: 2px; }
   .kv dd { margin-bottom: 6px; }
 }
+
+/* Sign-in screen (no session for this daemon) */
+.signin { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: var(--sp-4); background: var(--bg); }
+.signin-card { width: 100%; max-width: 560px; }
+.signin-brand { margin-bottom: var(--sp-4); }
+.signin-title { font-size: var(--fs-xl); font-weight: 600; margin-bottom: var(--sp-2); }
+.signin-text { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.55; margin: var(--sp-2) 0; }
+.signin-text.muted { color: var(--text-muted); }
+.signin-text.small { font-size: var(--fs-xs); margin-top: var(--sp-4); }
+.signin-cmd { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
+.signin-cmd code { flex: 1; font-family: var(--font-mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.signin-actions { margin-top: var(--sp-3); }
