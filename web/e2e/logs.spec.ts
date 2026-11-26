@@ -20,6 +20,7 @@ test.describe('live log feed', () => {
   test.afterAll(async () => { await d.stop() })
 
   test('renders 5,000 lines with a bounded DOM', async ({ page }) => {
+    await d.signIn(page)
     await page.goto(`${d.base}/#/logs`)
     await expect(page.getByText(/5,000 live lines shown|of 5,000 live lines/)).toBeVisible({ timeout: 15_000 })
     const rows = await page.locator('.log-row').count()
@@ -32,6 +33,7 @@ test.describe('live log feed', () => {
   })
 
   test('filters, expands JSON, pauses without moving, and resumes', async ({ page }) => {
+    await d.signIn(page)
     await page.goto(`${d.base}/#/logs`)
     await expect(page.getByText(/of 5,000 live lines/)).toBeVisible({ timeout: 15_000 })
     await page.getByLabel('Filter live log lines').fill('json line')
@@ -60,6 +62,7 @@ test.describe('live log feed', () => {
 test('reconnects after a daemon restart and resets to the new process', async ({ page }) => {
   let d = await startDaemon('while true; do echo "INFO alive $(date +%s)"; sleep 0.5; done\n')
   try {
+    await d.signIn(page)
     await page.goto(`${d.base}/#/logs`)
     await expect(page.getByRole('status', { name: 'Live log stream: live' })).toBeVisible()
     await expect(page.locator('.log-row').first()).toBeVisible()
@@ -87,7 +90,8 @@ while [ $i -lt 3000 ]; do echo "INFO backlog $i"; i=$((i+1)); done
 while true; do echo "INFO live"; sleep 0.02; done
 `)
   try {
-    await expect.poll(async () => (await (await fetch(`${d.base}/health`)).json()).buffered).toBeGreaterThan(3000)
+    await expect.poll(async () => (await d.api('/health')).buffered).toBeGreaterThan(3000)
+    await d.signIn(page)
     await page.goto(`${d.base}/#/logs`)
     await expect(page.getByText(/of [3-5],\d{3} live lines/)).toBeVisible({ timeout: 4_000 })
     await page.getByLabel('Filter live log lines').fill('backlog 0')
@@ -107,6 +111,7 @@ test('a fast stream keeps following; only the user leaves the tail', async ({ pa
 done
 `)
   try {
+    await d.signIn(page)
     await page.goto(`${d.base}/#/logs`)
     await expect(page.locator('.log-row').first()).toBeVisible()
     for (let i = 0; i < 4; i++) {

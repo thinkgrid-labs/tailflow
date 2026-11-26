@@ -119,7 +119,8 @@ npm install -g tailflow
 cd your-project
 tailflow init
 
-# 3. Start the collector, then open http://127.0.0.1:7878
+# 3. Start the collector, then open the one-time sign-in link it prints
+#    (or later: tailflow-daemon dashboard)
 tailflow-daemon
 ```
 
@@ -172,7 +173,7 @@ configuration, Docker and file sources, custom ports, and troubleshooting.
 | Topic | Behavior |
 |---|---|
 | **Where data lives** | One SQLite file per user: `~/Library/Application Support/tailflow/events.db` (macOS), `~/.local/share/tailflow/events.db` (Linux), `%LOCALAPPDATA%\tailflow\events.db` (Windows). Override with `TAILFLOW_DATA_DIR`, `[storage] path`, or `--db`. |
-| **Network** | The daemon listens on `127.0.0.1` only and rejects non-loopback Host headers. TailFlow has no telemetry and no hosted service; nothing is uploaded. |
+| **Network** | The daemon listens on `127.0.0.1` only, rejects non-loopback Host headers, and requires a credential for every data endpoint (a per-run token that local CLI and MCP clients read automatically, or a browser sign-in link). See [security](docs/security.md). TailFlow has no telemetry and no hosted service; nothing is uploaded. |
 | **What is collected** | Only the sources you configure: processes it starts, containers on the local Docker daemon, files you name, and piped stdin. |
 | **Retention** | `retention_days = 30` and `max_size_mb = 2048` by default in `[storage]`. The size cap always applies, even with `retention_days = "unlimited"`. `--no-storage` keeps everything in memory. |
 | **Redaction** | `capture = "metadata"` (the default) redacts common credential formats, such as API keys, bearer tokens, URL passwords, and private keys, before display and storage. Redaction is pattern-based and will not catch every secret. |
@@ -182,7 +183,7 @@ configuration, Docker and file sources, custom ports, and troubleshooting.
 Durable history, retention, redaction, and agent capture ship in the next release. Read
 [durable history and privacy](docs/storage.md) and
 [limitations](docs/limitations.md) before using TailFlow with sensitive logs.
-TailFlow has no authentication, so do not expose the daemon to a network.
+The daemon serves plain HTTP on loopback; do not expose it to a network.
 
 ## Supported coding agents
 

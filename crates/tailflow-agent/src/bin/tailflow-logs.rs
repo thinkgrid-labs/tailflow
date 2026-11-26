@@ -22,6 +22,8 @@ mod exit {
     pub const NO_MATCH: i32 = 2;
     /// No daemon is listening.
     pub const NO_DAEMON: i32 = 3;
+    /// The daemon refused the credential (no token, or a stale one).
+    pub const UNAUTHORIZED: i32 = 4;
 }
 
 #[derive(Parser)]
@@ -31,7 +33,7 @@ mod exit {
     long_about = "One-shot reads of your running local stack, for agents and scripts.\n\n\
                   Requires a running daemon (`tailflow-daemon` in your project root).\n\n\
                   Exit codes: 0 ok / matched, 1 bad request, 2 wait timed out, \
-                  3 no daemon.",
+                  3 no daemon, 4 not authorized.",
     version
 )]
 struct Cli {
@@ -250,6 +252,7 @@ fn fail(e: ClientError) -> i32 {
     eprintln!("tailflow-logs: {e}");
     match e {
         ClientError::NotRunning { .. } => exit::NO_DAEMON,
+        ClientError::Unauthorized { .. } => exit::UNAUTHORIZED,
         ClientError::Http { status: 400, .. } => exit::BAD_REQUEST,
         _ => exit::BAD_REQUEST,
     }

@@ -1,6 +1,7 @@
 // Typed, abortable access to the daemon's read-only API. Same origin only:
 // the dashboard never talks to anything but the daemon that served it.
 
+import { isRefusal, markSignedOut } from './auth.ts'
 import type {
   AgentsStatus, Collector, EventPage, FilesPage, Health, SessionDetail,
   SessionPage, Stats, StorageStatus, StoredEvent,
@@ -44,6 +45,7 @@ export async function getJSON<T>(path: string, params: Params = {}, signal?: Abo
       if (typeof body.error === 'string') message = body.error
       if (typeof body.kind === 'string') kind = body.kind
     } catch { /* non-JSON error body */ }
+    if (isRefusal(res.status, kind)) markSignedOut(kind)
     throw new ApiError(res.status, kind, message)
   }
   return res.json() as Promise<T>
@@ -72,6 +74,7 @@ export function describeError(e: unknown): string {
     if (e.kind === 'storage_disabled') return 'Durable history is disabled on this daemon (--no-storage or [storage] enabled = false). Live logs still work.'
     if (e.kind === 'storage_unavailable') return 'Durable history is unavailable. See Integrations → Storage for the reason.'
     if (e.kind === 'query_timeout') return 'The query hit the 3-second budget. Narrow the time range or add a filter.'
+    if (isRefusal(e.status, e.kind)) return 'This browser is not signed in to the daemon.'
     return e.message
   }
   return 'Unexpected error.'

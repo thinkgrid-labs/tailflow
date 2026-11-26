@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
 import type { ConnectionStatus, Health, LogRecord } from '../lib/types.ts'
 import { append, boundPending, lastSeq, MAX_RECORDS } from '../lib/logStore.ts'
+import { checkSession } from '../lib/auth.ts'
 
 /**
  * Live runtime log stream, shared by the whole app (one EventSource).
@@ -86,6 +87,10 @@ class LiveStream {
       // from the newest record held when the stream broke.
       if (this.status === 'connected') this.resumeAfter = this.newestHeld()
       this.set({ status: es.readyState === EventSource.CLOSED ? 'disconnected' : 'connecting' })
+      // A refused credential (daemon restarted, session expired) closes the
+      // stream for good; find out whether that is why, so the app can ask
+      // the user to sign in again instead of showing "Disconnected".
+      if (es.readyState === EventSource.CLOSED) void checkSession()
     }
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') this.schedule()

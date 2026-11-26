@@ -24,9 +24,13 @@ fn main() {
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     s.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    // M4: the daemon requires a token; benches pass it in $TAILFLOW_TOKEN.
+    let auth = std::env::var("TAILFLOW_TOKEN")
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     write!(
         s,
-        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n"
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Accept: text/event-stream\r\n\r\n"
     )
     .unwrap();
     let mut r = BufReader::new(s);

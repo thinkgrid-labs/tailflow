@@ -62,6 +62,8 @@ pub struct Pipeline {
     pub shutdown: CancellationToken,
     /// Agent spool ingestion status (shared with the ingest thread).
     pub agent_ingest: crate::agent_ingest::SharedStatus,
+    /// API token, browser sessions and sign-in codes for this run.
+    pub auth: Arc<crate::auth::Auth>,
 }
 
 /// Loss and throughput at the live ingestion point. These cover the ring,
@@ -117,6 +119,9 @@ pub struct AppState {
     /// ever stopping.
     pub shutdown: CancellationToken,
     pub agent_ingest: crate::agent_ingest::SharedStatus,
+    /// Access control: every route except the static UI shell, `/health`
+    /// and the sign-in link requires a credential (see `auth.rs`).
+    pub auth: Arc<crate::auth::Auth>,
     /// Identifies this daemon process. The live ring's `seq` restarts with
     /// every process, so a client compares this before resuming a cursor.
     pub instance_id: String,
@@ -205,6 +210,7 @@ impl AppState {
                 run_key: "memory".into(),
                 shutdown: CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("memory-only state"),
+                auth: Arc::new(crate::auth::Auth::generate()),
             },
         )
         .0
@@ -225,6 +231,7 @@ impl AppState {
             run_key,
             shutdown,
             agent_ingest,
+            auth,
         } = pipeline;
         let state = Arc::new(AppState {
             tx: tx.clone(),
@@ -234,6 +241,7 @@ impl AppState {
             ingest: Arc::new(IngestStats::default()),
             shutdown,
             agent_ingest,
+            auth,
             instance_id: format!("{}-{}", std::process::id(), Utc::now().timestamp_micros()),
             sources: Mutex::new(HashMap::new()),
             collectors: Arc::new(Mutex::new(HashMap::new())),

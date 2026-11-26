@@ -36,6 +36,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Daemons from M4 require an API token. Every daemon this script starts
+# inherits this one through the environment (older daemons ignore it).
+TOKEN = os.environ.setdefault("TAILFLOW_TOKEN", "tailflow-bench-token-0123456789abcdef")
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
 WINDOWS = os.name == "nt"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FILE_LINES = 50
@@ -61,7 +66,7 @@ def free_port():
 
 def get(port, path, timeout=5):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=AUTH), timeout=timeout) as r:
             return json.loads(r.read())
     except (urllib.error.URLError, OSError, ValueError):
         return None
@@ -172,7 +177,7 @@ def run(binary, report):
     # 6. Graceful shutdown — with a live SSE client connected, as when a
     # dashboard tab is open (the stream must end so the server can stop).
     sse = socket.create_connection(("127.0.0.1", port), timeout=5)
-    sse.sendall(f"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n".encode())
+    sse.sendall(f"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nAccept: text/event-stream\r\n\r\n".encode())
     check(sse.recv(64).startswith(b"HTTP/1.1 200"), "SSE stream did not open")
     report["sse_client_connected_at_stop"] = True
     code, ms = graceful_stop(p)

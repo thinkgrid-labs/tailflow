@@ -87,8 +87,10 @@ ring, and serves:
 - an SSE stream for the browser; and
 - long-polling for event-driven agent workflows.
 
-The server binds to loopback and validates the Host header. It is a local API,
-not a remotely exposed service.
+The server binds to loopback, validates the Host header, and requires a
+credential on every data endpoint: a per-run API token for CLI and MCP
+clients, or a browser session created by a one-time sign-in link
+([security](security.md)). It is a local API, not a remotely exposed service.
 
 ### Dashboard (`web/`)
 
@@ -223,7 +225,12 @@ Windows so development servers are not left behind.
 The daemon is intentionally loopback-only, has no permissive CORS layer, and
 rejects nonlocal Host headers. Browser requests carrying a non-loopback
 `Origin`, and cross-site requests other than top-level navigation, are refused.
-No HTTP endpoint mutates or deletes data; purging is a local CLI command.
+Every route except the static UI, `/health` (liveness only without a
+credential) and the sign-in link requires the API token or a same-origin
+browser session (`auth.rs`, `require_auth` in `routes.rs`). The only POST
+endpoints manage credentials (mint a sign-in link and revoke sessions, both
+token-only; sign out). No HTTP endpoint mutates or deletes data; purging is
+a local CLI command.
 Remote access would require a separate security model rather than an
 accidental bind-address change.
 

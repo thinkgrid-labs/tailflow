@@ -1,3 +1,4 @@
+use crate::auth::{Credential, Denied};
 use crate::state::AppState;
 use axum::{
     extract::{
@@ -10,7 +11,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json, Response,
     },
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use rust_embed::RustEmbed;
@@ -41,9 +42,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sources", get(sources_handler))
         .route("/api/wait", get(wait_handler))
         .route("/health", get(health_handler))
+        // Access control (M4-A): sign-in link, session probe, sign-in link
+        // minting (token holders only), sign-out.
+        .route("/auth/login/{code}", get(login_handler))
+        .route("/api/v1/auth/session", get(session_handler))
+        .route("/api/v1/auth/login-links", post(mint_login_link_handler))
+        .route("/api/v1/auth/logout", post(logout_handler))
+        .route(
+            "/api/v1/auth/sessions/revoke",
+            post(revoke_sessions_handler),
+        )
         .merge(crate::api_v1::router())
         // Everything else → embedded web UI
         .fallback(static_handler)
+        // Innermost: runs after the Host and Origin checks below.
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(guard_browser_origin))
         .layer(middleware::from_fn(validate_local_host))
@@ -135,6 +148,238 @@ async fn validate_local_host(request: Request, next: Next) -> Response {
             .into_response();
     }
     next.run(request).await
+}
+
+// ── Access control ────────────────────────────────────────────────────────────
+
+/// The credential that authorized a request (`None` on public paths reached
+/// without one). Inserted by [`require_auth`] on every request.
+#[derive(Clone, Copy)]
+pub(crate) struct AuthOutcome(pub(crate) Option<Credential>);
+
+/// Paths served without a credential: the static dashboard shell (it holds
+/// no data), liveness, and the sign-in link itself. Everything else —
+/// including any endpoint added later and unknown paths — requires one, so a
+/// new route cannot ship unauthenticated by accident.
+fn is_public(path: &str) -> bool {
+    if path == "/" || path == "/health" {
+        return true;
+    }
+    if let Some(code) = path.strip_prefix("/auth/login/") {
+        return !code.is_empty() && !code.contains('/');
+    }
+    let asset = path.trim_start_matches('/');
+    !asset.is_empty() && !asset.starts_with("api/") && WebAssets::get(asset).is_some()
+}
+
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let outcome = state.auth.authorize(request.headers());
+    if is_public(request.uri().path()) {
+        request.extensions_mut().insert(AuthOutcome(outcome.ok()));
+        return next.run(request).await;
+    }
+    match outcome {
+        Ok(credential) => {
+            request
+                .extensions_mut()
+                .insert(AuthOutcome(Some(credential)));
+            next.run(request).await
+        }
+        Err(denied) => {
+            state.auth.note_refused();
+            denied_response(denied)
+        }
+    }
+}
+
+/// The same answer for every protected path, existing or not: a refused
+/// caller cannot probe which sessions, events or files exist.
+fn denied_response(denied: Denied) -> Response {
+    let status = match denied {
+        Denied::CrossOrigin => StatusCode::FORBIDDEN,
+        Denied::Missing | Denied::BadToken | Denied::SessionExpired => StatusCode::UNAUTHORIZED,
+    };
+    let mut response = (
+        status,
+        Json(serde_json::json!({ "error": denied.message(), "kind": denied.kind() })),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"tailflow\""),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Longest sign-in code accepted (codes are 64 hex characters).
+const MAX_CODE_LEN: usize = 128;
+
+/// `GET /auth/login/<code>`: redeem a one-time sign-in code for a session
+/// cookie, then redirect to the dashboard. The code is dead after this
+/// request, so its appearance in browser history is harmless; the redirect
+/// keeps it out of the address bar and `Referrer-Policy: no-referrer` out
+/// of any request the dashboard makes.
+async fn login_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(code): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Only a link the user opened (`none`: terminal, address bar) or our own
+    // page. A page on another localhost port navigating here is `same-site`.
+    let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    if !matches!(site, None | Some("none" | "same-origin")) {
+        state.auth.note_refused();
+        return login_page(
+            StatusCode::FORBIDDEN,
+            "This sign-in link was opened by another web page, so it was not used. \
+             Open it directly from your terminal instead.",
+        );
+    }
+    let redeemed = if code.len() <= MAX_CODE_LEN {
+        state.auth.redeem_code(&code)
+    } else {
+        Err(())
+    };
+    let Ok(session) = redeemed else {
+        state.auth.note_refused();
+        return login_page(
+            StatusCode::UNAUTHORIZED,
+            "This sign-in link has expired or was already used. Run \
+             `tailflow-daemon dashboard` for a new one.",
+        );
+    };
+    let cookie = crate::auth::session_cookie(&state.auth.cookie_name(), &session);
+    let mut response = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, "/")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    if let Ok(v) = HeaderValue::from_str(&cookie) {
+        response = response.header(header::SET_COOKIE, v);
+    }
+    response
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// A plain page (no script, no styles) for a refused sign-in link.
+fn login_page(status: StatusCode, message: &str) -> Response {
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>TailFlow sign-in</title></head><body><h1>TailFlow</h1><p>{}</p>\
+         <p><a href=\"/\">Open the dashboard</a></p></body></html>",
+        html_escape(message)
+    );
+    let mut response = (status, Html(body)).into_response();
+    let headers = response.headers_mut();
+    for (name, value) in UI_SECURITY_HEADERS {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `GET /api/v1/auth/session`: which credential this request carries. The
+/// dashboard calls it to decide between the app and the sign-in screen.
+async fn session_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(outcome): axum::Extension<AuthOutcome>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "authenticated": outcome.0.is_some(),
+        "credential": outcome.0,
+        "instance_id": state.instance_id,
+        "session_idle_timeout_secs": crate::auth::SESSION_IDLE.as_secs(),
+    }))
+}
+
+/// `POST /api/v1/auth/login-links`: mint a one-time sign-in link. API token
+/// only — a browser session cannot mint links, so a session never becomes
+/// more than it was.
+async fn mint_login_link_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(outcome): axum::Extension<AuthOutcome>,
+) -> Response {
+    if outcome.0 != Some(Credential::Token) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "sign-in links can be created only with the API token",
+                "kind": "token_required",
+            })),
+        )
+            .into_response();
+    }
+    match state.auth.mint_code(crate::auth::MINTED_CODE_TTL) {
+        Ok((code, _)) => {
+            let mut response = Json(serde_json::json!({
+                "path": format!("/auth/login/{code}"),
+                "expires_in_secs": crate::auth::MINTED_CODE_TTL.as_secs(),
+                "single_use": true,
+            }))
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "could not mint a sign-in code");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "no random source", "kind": "internal" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/auth/sessions/revoke`: end every browser session. API
+/// token only (`tailflow-daemon dashboard --revoke-sessions`).
+async fn revoke_sessions_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(outcome): axum::Extension<AuthOutcome>,
+) -> Response {
+    if outcome.0 != Some(Credential::Token) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "sessions can be revoked only with the API token",
+                "kind": "token_required",
+            })),
+        )
+            .into_response();
+    }
+    let revoked = state.auth.revoke_all_sessions();
+    Json(serde_json::json!({ "revoked": revoked })).into_response()
+}
+
+/// `POST /api/v1/auth/logout`: end this browser's session.
+async fn logout_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    for value in state.auth.session_cookies(&headers) {
+        let _was_ours = state.auth.end_session(&value);
+    }
+    let mut response = Json(serde_json::json!({ "signed_out": true })).into_response();
+    if let Ok(v) = HeaderValue::from_str(&crate::auth::clear_cookie(&state.auth.cookie_name())) {
+        response.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    response
 }
 
 // ── Shared filter params ──────────────────────────────────────────────────────
@@ -267,7 +512,23 @@ impl serde::Serialize for SharedRecords {
     }
 }
 
-async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn health_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(outcome): axum::Extension<AuthOutcome>,
+) -> Response {
+    if outcome.0.is_none() {
+        // Liveness for anyone (supervisors, `curl`), and nothing else: no
+        // counters, ids or storage state without a credential.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "auth_required": true,
+            })),
+        )
+            .into_response();
+    }
     let ingest = state.ingest.view();
     let storage = match &state.storage {
         crate::state::StorageSlot::Enabled(s) => {
@@ -297,8 +558,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "cursor": state.store.cursor(),
             "ingest_dropped": ingest.records_dropped,
             "storage": storage,
+            "auth": state.auth.view(),
         })),
     )
+        .into_response()
 }
 
 /// Add the live-ingestion loss counter to a legacy response. Additive: older
@@ -722,9 +985,21 @@ mod tests {
         state
     }
 
+    /// `Authorization: Bearer <this run's token>`, as a local CLI sends it.
+    fn bearer(state: &AppState) -> String {
+        format!("Bearer {}", state.auth.token().expose())
+    }
+
     async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        let auth = bearer(&state);
         let response = router(state)
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = response.status();
@@ -755,6 +1030,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/events")
+                    .header(header::AUTHORIZATION, bearer(&state))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1297,5 +1573,392 @@ mod tests {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none());
+    }
+
+    // ── access control (M4-A) ─────────────────────────────────────────────────
+
+    async fn raw(
+        state: &Arc<AppState>,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut b = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, v.as_str());
+        }
+        let response = router(state.clone())
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let hdrs = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, hdrs, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Mint a code with the token and redeem it the way a browser does when
+    /// the user opens the link. Returns the `name=value` cookie pair.
+    async fn browser_session(state: &Arc<AppState>) -> String {
+        let (status, _, body) = raw(
+            state,
+            "POST",
+            "/api/v1/auth/login-links",
+            &[("authorization", bearer(state))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let path = v["path"].as_str().unwrap().to_string();
+        let (status, headers, _) =
+            raw(state, "GET", &path, &[("sec-fetch-site", "none".into())]).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/");
+        let set = headers[header::SET_COOKIE].to_str().unwrap().to_string();
+        assert!(set.contains("HttpOnly"), "{set}");
+        assert!(set.contains("SameSite=Strict"), "{set}");
+        set.split(';').next().unwrap().to_string()
+    }
+
+    const PROTECTED: &[&str] = &[
+        "/events",
+        "/api/records",
+        "/api/query",
+        "/api/errors",
+        "/api/sources",
+        "/api/wait?timeout_ms=1",
+        "/api/v1/events",
+        "/api/v1/events/1",
+        "/api/v1/storage/status",
+        "/api/v1/storage/retention",
+        "/api/v1/collectors/status",
+        "/api/v1/schema",
+        "/api/v1/privacy",
+        "/api/v1/sessions",
+        "/api/v1/sessions/claude_code:does-not-exist",
+        "/api/v1/agents/status",
+        "/api/v1/stats",
+        "/api/v1/files",
+        "/api/v1/auth/session",
+        "/api/v1/not-a-route",
+        "/some/unknown/path",
+    ];
+
+    #[tokio::test]
+    async fn every_data_endpoint_requires_a_credential_and_answers_identically() {
+        let state = state_with(vec![("api", LogLevel::Error, "secret detail")]);
+        let mut first: Option<(StatusCode, String)> = None;
+        for uri in PROTECTED {
+            let (status, headers, body) = raw(&state, "GET", uri, &[]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+            assert!(!body.contains("secret detail"), "{uri}");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store", "{uri}");
+            // Existing and missing resources are indistinguishable.
+            match &first {
+                None => first = Some((status, body)),
+                Some((s, b)) => assert_eq!((status, &body), (*s, b), "{uri}"),
+            }
+        }
+        // A wrong token is refused everywhere, and counted.
+        for uri in PROTECTED {
+            let (status, _, body) = raw(
+                &state,
+                "GET",
+                uri,
+                &[("authorization", format!("Bearer {}", "0".repeat(64)))],
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            assert!(body.contains("invalid_token"), "{uri}: {body}");
+        }
+        assert!(state.auth.view().refused_requests >= 2 * PROTECTED.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn the_ui_shell_and_liveness_are_public_but_reveal_nothing() {
+        let state = state_with(vec![("api", LogLevel::Info, "hello")]);
+        let (status, _, body) = raw(&state, "GET", "/health", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["auth_required"], true);
+        for hidden in ["instance_id", "buffered", "cursor", "storage", "auth"] {
+            assert!(v.get(hidden).is_none(), "{hidden} leaked: {body}");
+        }
+        let (status, _, body) = raw(
+            &state,
+            "GET",
+            "/health",
+            &[("authorization", bearer(&state))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["buffered"], 1);
+        assert_eq!(v["auth"]["token_source"], "generated_per_run");
+        assert!(
+            !body.contains(state.auth.token().expose()),
+            "token never echoed"
+        );
+        // The dashboard shell is served (or the build hint when the UI is
+        // not built) without a credential.
+        let (status, _, _) = raw(&state, "GET", "/", &[]).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_link_creates_a_same_origin_browser_session() {
+        let state = state_with(vec![("api", LogLevel::Info, "hello")]);
+        let cookie = browser_session(&state).await;
+        assert!(cookie.starts_with("tailflow_session_0="), "{cookie}");
+        // Same-origin fetch (what the dashboard sends).
+        let (status, _, body) = raw(
+            &state,
+            "GET",
+            "/api/sources",
+            &[
+                ("cookie", cookie.clone()),
+                ("sec-fetch-site", "same-origin".into()),
+                ("host", "127.0.0.1:7878".into()),
+                ("origin", "http://127.0.0.1:7878".into()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The session probe says how the request was authorized.
+        let (_, _, body) = raw(
+            &state,
+            "GET",
+            "/api/v1/auth/session",
+            &[
+                ("cookie", cookie.clone()),
+                ("sec-fetch-site", "same-origin".into()),
+            ],
+        )
+        .await;
+        assert!(body.contains("\"credential\":\"session\""), "{body}");
+        // SSE accepts the session too.
+        let (status, headers, _) = raw(
+            &state,
+            "GET",
+            "/api/records",
+            &[
+                ("cookie", cookie.clone()),
+                ("sec-fetch-site", "same-origin".into()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{headers:?}");
+    }
+
+    #[tokio::test]
+    async fn another_localhost_port_cannot_ride_the_session_cookie() {
+        let state = state_with(vec![("api", LogLevel::Error, "secret detail")]);
+        let cookie = browser_session(&state).await;
+        // The browser attaches the cookie to requests from a page on
+        // 127.0.0.1:3000 (cookies ignore ports); Fetch Metadata says
+        // `same-site`. fetch(), <img>/<script> (no Origin) and EventSource.
+        for (site, origin, mode) in [
+            ("same-site", Some("http://127.0.0.1:3000"), "cors"),
+            ("same-site", None, "no-cors"),
+            ("cross-site", Some("http://evil.localhost:3000"), "cors"),
+        ] {
+            let mut headers = vec![
+                ("cookie", cookie.clone()),
+                ("sec-fetch-site", site.to_string()),
+                ("sec-fetch-mode", mode.to_string()),
+            ];
+            if let Some(o) = origin {
+                headers.push(("origin", o.to_string()));
+            }
+            for uri in ["/api/v1/events", "/events", "/api/v1/sessions"] {
+                let (status, _, body) = raw(&state, "GET", uri, &headers).await;
+                assert!(
+                    status == StatusCode::FORBIDDEN,
+                    "{uri} site={site} origin={origin:?}: {status} {body}"
+                );
+                assert!(!body.contains("secret detail"));
+            }
+        }
+        // No Fetch Metadata at all (an old browser, or a replayed cookie).
+        let (status, _, _) = raw(&state, "GET", "/api/v1/events", &[("cookie", cookie)]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sign_in_links_are_single_use_and_refused_from_other_pages() {
+        let state = state_with(vec![]);
+        let (_, _, body) = raw(
+            &state,
+            "POST",
+            "/api/v1/auth/login-links",
+            &[("authorization", bearer(&state))],
+        )
+        .await;
+        let path = serde_json::from_str::<serde_json::Value>(&body).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A page on another localhost port navigating to the link: refused,
+        // and the code is not consumed.
+        let (status, headers, page) = raw(
+            &state,
+            "GET",
+            &path,
+            &[("sec-fetch-site", "same-site".into())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        assert!(headers[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'"));
+        // The user opens it: works once.
+        let (status, headers, _) = raw(&state, "GET", &path, &[]).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers.get(header::SET_COOKIE).is_some());
+        let (status, headers, page) = raw(&state, "GET", &path, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        assert!(page.contains("expired or was already used"), "{page}");
+        // Guessing.
+        for guess in ["/auth/login/0", &format!("/auth/login/{}", "f".repeat(64))] {
+            let (status, _, _) = raw(&state, "GET", guess, &[]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let long = format!("/auth/login/{}", "a".repeat(4000));
+        let (status, _, _) = raw(&state, "GET", &long, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn only_the_api_token_can_mint_sign_in_links() {
+        let state = state_with(vec![]);
+        let cookie = browser_session(&state).await;
+        let (status, _, body) = raw(
+            &state,
+            "POST",
+            "/api/v1/auth/login-links",
+            &[("cookie", cookie), ("sec-fetch-site", "same-origin".into())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("token_required"));
+        let (status, _, _) = raw(&state, "POST", "/api/v1/auth/login-links", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // GET does not mint.
+        let (status, _, _) = raw(
+            &state,
+            "GET",
+            "/api/v1/auth/login-links",
+            &[("authorization", bearer(&state))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn signing_out_ends_the_session() {
+        let state = state_with(vec![]);
+        let cookie = browser_session(&state).await;
+        let same_origin = vec![
+            ("cookie", cookie.clone()),
+            ("sec-fetch-site", "same-origin".to_string()),
+        ];
+        let (status, headers, _) = raw(&state, "POST", "/api/v1/auth/logout", &same_origin).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        let (status, _, body) = raw(&state, "GET", "/api/v1/events", &same_origin).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("session_expired"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn revoking_ends_every_browser_session_and_needs_the_token() {
+        let state = state_with(vec![]);
+        let a = browser_session(&state).await;
+        let b = browser_session(&state).await;
+        let (status, _, _) = raw(
+            &state,
+            "POST",
+            "/api/v1/auth/sessions/revoke",
+            &[
+                ("cookie", a.clone()),
+                ("sec-fetch-site", "same-origin".into()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a session cannot revoke");
+        let (status, _, body) = raw(
+            &state,
+            "POST",
+            "/api/v1/auth/sessions/revoke",
+            &[("authorization", bearer(&state))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"revoked\":2"), "{body}");
+        for c in [a, b] {
+            let (status, _, _) = raw(
+                &state,
+                "GET",
+                "/api/v1/events",
+                &[("cookie", c), ("sec-fetch-site", "same-origin".into())],
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    /// Without a session store (tests, no data directory) nothing survives
+    /// a restart; the token never does. See `e2e_auth` for the persistent
+    /// session store.
+    async fn a_restarted_daemon_rejects_old_credentials() {
+        let before = state_with(vec![]);
+        let cookie = browser_session(&before).await;
+        let old_token = bearer(&before);
+        let after = state_with(vec![]);
+        let (status, _, body) = raw(
+            &after,
+            "GET",
+            "/api/v1/events",
+            &[("cookie", cookie), ("sec-fetch-site", "same-origin".into())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("session_expired"));
+        let (status, _, _) = raw(
+            &after,
+            "GET",
+            "/api/v1/events",
+            &[("authorization", old_token)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dns_rebinding_is_refused_even_with_a_valid_credential() {
+        let state = state_with(vec![]);
+        for host in [
+            "attacker.example:7878",
+            "127.0.0.1.nip.io:7878",
+            "localhost.attacker.example",
+            "localhost.",
+        ] {
+            let (status, _, _) = raw(
+                &state,
+                "GET",
+                "/api/v1/events",
+                &[("host", host.into()), ("authorization", bearer(&state))],
+            )
+            .await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}");
+        }
     }
 }

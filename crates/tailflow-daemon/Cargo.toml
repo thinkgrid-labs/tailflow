@@ -38,6 +38,10 @@ notify = "7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 
+# Per-run API tokens, session and sign-in secrets (OS CSPRNG; already in the
+# tree through tailflow-storage).
+getrandom = "0.4"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

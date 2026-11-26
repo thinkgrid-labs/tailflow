@@ -199,9 +199,21 @@ cmd = "sh ${webLog}"
 }
 
 /** Start a daemon over the prepared dataset and wait until it ingested the spool. */
+/** API token for every daemon the browser tests start (`$TAILFLOW_TOKEN`). */
+export const E2E_TOKEN = 'tailflow-e2e-token-0123456789abcdef0123'
+export const authHeaders = { Authorization: `Bearer ${E2E_TOKEN}` }
+
+/** A fresh one-time sign-in URL for the daemon at `base`. */
+export async function signInUrl(base) {
+  const r = await fetch(`${base}/api/v1/auth/login-links`, { method: 'POST', headers: authHeaders })
+  if (!r.ok) throw new Error(`could not mint a sign-in link: ${r.status} ${await r.text()}`)
+  const { path: p } = await r.json()
+  return `${base}${p}`
+}
+
 export async function startDaemon(binDir, fx, port) {
   const daemon = spawn(path.join(binDir, 'tailflow-daemon'), ['--config', fx.config, '--port', String(port)], {
-    env: { ...process.env, TAILFLOW_DATA_DIR: fx.data, RUST_LOG: 'warn' },
+    env: { ...process.env, TAILFLOW_DATA_DIR: fx.data, TAILFLOW_TOKEN: E2E_TOKEN, RUST_LOG: 'warn' },
     stdio: ['ignore', 'ignore', 'pipe'],
   })
   let stderr = ''
@@ -209,7 +221,7 @@ export async function startDaemon(binDir, fx, port) {
   const base = `http://127.0.0.1:${port}`
   for (let i = 0; i < 400; i++) {
     try {
-      const s = await (await fetch(`${base}/api/v1/sessions?limit=10`)).json()
+      const s = await (await fetch(`${base}/api/v1/sessions?limit=10`, { headers: authHeaders })).json()
       if (Array.isArray(s.sessions) && s.sessions.length >= 5) {
         // Let storage commit runtime lines too.
         await new Promise(r => setTimeout(r, 1200))
@@ -228,5 +240,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const fx = prepare(binDir)
   const port = Number(process.argv[3]) || await freePort()
   const { base } = await startDaemon(binDir, fx, port)
-  console.log(JSON.stringify({ base, root: fx.root, sessions: fx.sessions }))
+  console.log(JSON.stringify({ base, root: fx.root, sessions: fx.sessions, signIn: await signInUrl(base) }))
 }

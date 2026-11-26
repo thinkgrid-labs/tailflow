@@ -340,7 +340,9 @@ Add `--json` to receive the daemon response directly. The exit codes are:
 
 ## Human views
 
-Open <http://127.0.0.1:7878> while the daemon is running, or start the TUI:
+Open the one-time sign-in link the daemon prints at startup, or run
+`tailflow-daemon dashboard` to open the dashboard with a fresh link (see
+[security](security.md)). Or start the TUI:
 
 ```bash
 tailflow
@@ -368,6 +370,15 @@ same `TAILFLOW_URL` in the MCP client configuration. Confirm with:
 tailflow-logs --url http://127.0.0.1:7878 status
 ```
 
+### `401` / "refused access" / exit code 4
+
+From this release the API requires a credential. `tailflow-mcp` and
+`tailflow-logs` read the token from the daemon's runtime file automatically
+when they run as the same user (and the same `TAILFLOW_DATA_DIR`). In a
+container, as another user, or over a port forward, set
+`TAILFLOW_TOKEN=$(tailflow-daemon token)`. A dashboard tab that shows **Sign
+in to this daemon** needs `tailflow-daemon dashboard`.
+
 ### Docker discovery fails
 
 Confirm Docker is running and that the current account can access its local
@@ -393,7 +404,8 @@ daemon run; increase `--buffer` for a longer live horizon. Older and
 pre-restart history is in the durable store:
 
 ```bash
-curl -s 'localhost:7878/api/v1/events?since=2h&order=desc'
+curl -s -H "Authorization: Bearer $(tailflow-daemon token)" \
+  'localhost:7878/api/v1/events?since=2h&order=desc'
 tailflow-daemon storage status
 ```
 

@@ -30,6 +30,11 @@ import tempfile
 import time
 import urllib.request
 
+# Daemons from M4 require an API token. Every daemon this script starts
+# inherits this one through the environment (older daemons ignore it).
+TOKEN = os.environ.setdefault("TAILFLOW_TOKEN", "tailflow-bench-token-0123456789abcdef")
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXAMPLES = os.path.join(ROOT, "target", "release", "examples")
 
@@ -44,7 +49,7 @@ def free_port():
 
 def get(port, path, timeout=5):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=AUTH), timeout=timeout) as r:
             return json.loads(r.read())
     except Exception:
         return None

@@ -11,6 +11,7 @@ import { clock, dateTime, duration, relative, shortPath, relativeTo, compact } f
 import { sanitize, DEFAULT_SETTINGS } from './settings.ts'
 import { statusOf, summary, agentLabel, isFailure } from './events.ts'
 import type { LogRecord, StoredEvent, SessionView } from './types.ts'
+import { isRefusal, signInCommand, markSignedOut, authState, subscribeAuth } from './auth.ts'
 
 const rec = (seq: number, payload = `line ${seq}`): LogRecord =>
   ({ seq, timestamp: '2026-11-25T10:00:00Z', source: 'api', level: 'info', payload })
@@ -237,4 +238,34 @@ test('a missing outcome is never shown as success', () => {
   assert.equal(summary(ev(4, 'command.failed', { status: 'failed', attributes: { 'command.program': 'npm' } })), 'npm failed')
   assert.equal(agentLabel('codex'), 'Codex')
   assert.equal(agentLabel(undefined), 'Runtime')
+})
+
+// ── access control (M4-A) ───────────────────────────────────────────────────
+
+test('only the daemon\'s credential refusals sign the dashboard out', () => {
+  assert.equal(isRefusal(401, 'unauthorized'), true)
+  assert.equal(isRefusal(401, 'session_expired'), true)
+  assert.equal(isRefusal(401, 'invalid_token'), true)
+  assert.equal(isRefusal(403, 'cross_origin'), true)
+  // Other 403s and errors (a disabled store, a bad query) are not sign-outs.
+  assert.equal(isRefusal(403, 'token_required'), false)
+  assert.equal(isRefusal(400, 'invalid_query'), false)
+  assert.equal(isRefusal(503, 'storage_unavailable'), false)
+  assert.equal(isRefusal(401, undefined), false)
+})
+
+test('the sign-in command names the port only when it is not the default', () => {
+  assert.equal(signInCommand('7878'), 'tailflow-daemon dashboard')
+  assert.equal(signInCommand(''), 'tailflow-daemon dashboard')
+  assert.equal(signInCommand('9001'), 'tailflow-daemon dashboard --port 9001')
+})
+
+test('a refusal notifies subscribers once', () => {
+  let calls = 0
+  const off = subscribeAuth(() => { calls++ })
+  markSignedOut('session_expired')
+  markSignedOut('session_expired')
+  off()
+  assert.equal(calls, 1)
+  assert.deepEqual(authState(), { status: 'signed_out', reason: 'session_expired' })
 })

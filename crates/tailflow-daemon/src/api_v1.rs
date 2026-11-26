@@ -818,6 +818,7 @@ mod tests {
                 run_key: "testrun".into(),
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("test"),
+                auth: Arc::new(crate::auth::Auth::generate()),
             },
         );
         Harness {
@@ -865,7 +866,17 @@ mod tests {
         }
     }
 
+    /// Send with this run's API token, as a local CLI does.
     async fn send(
+        state: Arc<AppState>,
+        req: axum::http::request::Builder,
+    ) -> (StatusCode, serde_json::Value) {
+        let auth = format!("Bearer {}", state.auth.token().expose());
+        send_raw(state, req.header(header::AUTHORIZATION, auth)).await
+    }
+
+    /// Send exactly the given headers (no credential added).
+    async fn send_raw(
         state: Arc<AppState>,
         req: axum::http::request::Builder,
     ) -> (StatusCode, serde_json::Value) {
@@ -1109,6 +1120,7 @@ mod tests {
                 run_key: "m".into(),
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("test"),
+                auth: Arc::new(crate::auth::Auth::generate()),
             },
         );
         let (status, body) = send(state.clone(), Request::builder().uri("/api/v1/events")).await;
@@ -1275,6 +1287,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/events")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", h.state.auth.token().expose()),
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1462,7 +1478,16 @@ mod tests {
         let h = harness(PrivacyConfig::default(), false);
         for uri in ["/", "/some/client/route"] {
             let response = router(h.state.clone())
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", h.state.auth.token().expose()),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             let headers = response.headers();

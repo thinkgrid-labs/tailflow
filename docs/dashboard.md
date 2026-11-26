@@ -4,7 +4,10 @@
 > ships in the next version. v0.3.3 has the earlier live-log view only.
 
 The daemon serves a local dashboard at `http://127.0.0.1:7878` (or the port
-you pass with `--port`). It shows what your coding agents did, what your
+you pass with `--port`). Sign in once per browser with the one-time link the
+daemon prints at startup, or run `tailflow-daemon dashboard` to open the
+browser with a fresh link (see [security](security.md)). The session
+survives daemon restarts on the same port. It shows what your coding agents did, what your
 running stack logged, and how the two line up in time. It talks only to the
 daemon that served it, through read-only endpoints, and loads nothing from
 the internet.
@@ -132,8 +135,11 @@ The dashboard is meant to be left open all day.
 - The dashboard cannot change anything. Installing or removing hooks, purging
   history and every other change goes through the `tailflow` CLI, which is
   protected by file-system permissions.
-- The daemon accepts browser requests only from loopback origins. Do not
-  expose it to a network: it has no authentication.
+- Every data endpoint requires a credential. The dashboard holds an
+  `HttpOnly; SameSite=Strict` session cookie that other localhost ports
+  cannot use, and pages on other origins cannot read the API
+  ([security](security.md)). Sign out in **Settings → Access**.
+- The daemon serves plain HTTP on loopback. Do not expose it to a network.
 
 ## API used by the dashboard
 

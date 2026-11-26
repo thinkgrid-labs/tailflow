@@ -21,3 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: checks that src/paths.rs agrees with the daemon's data directory.
+tailflow-core = { path = "../tailflow-core" }
