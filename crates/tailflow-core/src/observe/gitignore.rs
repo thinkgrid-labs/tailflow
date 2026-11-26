@@ -79,6 +79,10 @@ impl IgnoreFile {
         self.rules.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
     /// Match `path` (absolute, under `base`).
     pub fn verdict(&self, path: &Path, is_dir: bool) -> Verdict {
         let Ok(rel) = path.strip_prefix(&self.base) else {

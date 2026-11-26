@@ -27,8 +27,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Changed paths kept per snapshot (the total is always reported).
+/// Changed paths kept per snapshot, the first ones by path (the total is
+/// always reported). A sorted prefix, so two snapshots can be compared up to
+/// the shorter list's last path.
 pub const MAX_CHANGES: usize = 2_000;
+/// Paths parsed before sorting (bounds memory on a huge dirty tree).
+const MAX_PARSED: usize = 20_000;
 /// Bytes read from one Git command's output.
 const MAX_OUTPUT: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -82,6 +86,10 @@ pub struct Snapshot {
     pub numstat_missing: bool,
     pub counts: Counts,
     pub took_ms: u64,
+    /// Filter drivers the repository defines that were disabled for this
+    /// snapshot (their clean/smudge/process programs are not run). Files
+    /// they manage, Git LFS for example, may then show as modified.
+    pub filters_disabled: Vec<String>,
 }
 
 /// Locate `git` on `PATH`.
@@ -118,7 +126,12 @@ fn command(git: &Path, root: &Path) -> Command {
 
 /// Run with a timeout and a bounded read. `Err` on timeout, spawn failure
 /// or a non-zero exit.
-fn run(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, String> {
+fn run(cmd: Command, timeout: Duration) -> Result<Vec<u8>, String> {
+    run_ok(cmd, timeout, &[0])
+}
+
+/// [`run`], accepting the given exit codes.
+fn run_ok(mut cmd: Command, timeout: Duration, ok: &[i32]) -> Result<Vec<u8>, String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("git could not start: {e}"))?;
@@ -144,7 +157,7 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, String> {
         }
     };
     let out = reader.join().map_err(|_| "reader panicked".to_string())?;
-    if !status.success() {
+    if !status.code().is_some_and(|c| ok.contains(&c)) {
         return Err(format!("git exited with {status}"));
     }
     Ok(out)
@@ -195,7 +208,7 @@ pub fn parse_status(out: &[u8]) -> (Option<String>, Option<String>, bool, Vec<Ch
         }
         let mut push = |c: Change| {
             total += 1;
-            if changes.len() < MAX_CHANGES {
+            if changes.len() < MAX_PARSED {
                 changes.push(c);
             }
         };
@@ -280,6 +293,10 @@ pub fn parse_status(out: &[u8]) -> (Option<String>, Option<String>, bool, Vec<Ch
             _ => {}
         }
     }
+    // A deterministic, sorted prefix (git lists tracked changes before
+    // untracked ones, so its order is not comparable across snapshots).
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes.truncate(MAX_CHANGES);
     (head, branch, detached, changes, total)
 }
 
@@ -331,13 +348,68 @@ pub fn is_parent(git: &Path, root: &Path, new: &str, old: &str) -> bool {
     })
 }
 
+/// Filter drivers (`filter.<name>.clean|smudge|process|required`) defined
+/// in any config Git reads for this repository. `None` when they cannot be
+/// listed (timeout, error) or a driver name cannot be passed safely: then
+/// no snapshot is taken, because the filters could not be disabled.
+fn filter_drivers(git: &Path, root: &Path, timeout: Duration) -> Option<Vec<String>> {
+    let mut c = command(git, root);
+    c.args([
+        "config",
+        "--name-only",
+        "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+    ]);
+    // Exit 1 means no match.
+    let out = run_ok(c, timeout, &[0, 1]).ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Some(rest) = line.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((name, _)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        let safe = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+        if !safe {
+            return None;
+        }
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    Some(names)
+}
+
+/// Disable every filter driver for one command: the repository's config
+/// must not be able to run a program in the background.
+fn without_filters(c: &mut Command, names: &[String]) {
+    for n in names {
+        c.args(["-c", &format!("filter.{n}.clean=")])
+            .args(["-c", &format!("filter.{n}.smudge=")])
+            .args(["-c", &format!("filter.{n}.process=")])
+            .args(["-c", &format!("filter.{n}.required=false")]);
+    }
+}
+
 /// Take a snapshot of the worktree at `root` with `git`.
 ///
 /// # Errors
 /// `git status` failed or timed out (the message says why).
 pub fn snapshot(git: &Path, root: &Path, timeout: Duration) -> Result<Snapshot, String> {
     let started = Instant::now();
+    let filters = filter_drivers(git, root, timeout).ok_or_else(|| {
+        "filter drivers could not be listed or disabled safely; snapshot skipped".to_string()
+    })?;
+    let timeout = timeout
+        .saturating_sub(started.elapsed())
+        .max(Duration::from_millis(100));
     let mut st = command(git, root);
+    without_filters(&mut st, &filters);
     st.args([
         "status",
         "--porcelain=v2",
@@ -352,6 +424,7 @@ pub fn snapshot(git: &Path, root: &Path, timeout: Duration) -> Result<Snapshot, 
     if head.is_some() {
         let left = timeout.saturating_sub(started.elapsed());
         let mut d = command(git, root);
+        without_filters(&mut d, &filters);
         d.args([
             "diff",
             "HEAD",
@@ -411,6 +484,7 @@ pub fn snapshot(git: &Path, root: &Path, timeout: Duration) -> Result<Snapshot, 
         numstat_missing,
         counts,
         took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        filters_disabled: filters,
     })
 }
 
@@ -433,12 +507,27 @@ pub struct Delta {
 /// either list was truncated (paths beyond the cap cannot be compared).
 pub fn compare(before: &Snapshot, after: &Snapshot) -> (Vec<Delta>, bool) {
     use std::collections::BTreeMap;
+    // A truncated list is a sorted prefix: beyond its last path nothing is
+    // known, so paths past the shorter known prefix are not compared (a
+    // pre-existing change must never look like it "appeared").
+    let bound: Option<&str> = [before, after]
+        .iter()
+        .filter(|s| s.truncated)
+        .map(|s| s.changes.last().map_or("", |c| c.path.as_str()))
+        .min();
+    let within = |p: &str| bound.is_none_or(|b| p <= b);
     let b: BTreeMap<&str, &Change> = before
         .changes
         .iter()
+        .filter(|c| within(&c.path))
         .map(|c| (c.path.as_str(), c))
         .collect();
-    let a: BTreeMap<&str, &Change> = after.changes.iter().map(|c| (c.path.as_str(), c)).collect();
+    let a: BTreeMap<&str, &Change> = after
+        .changes
+        .iter()
+        .filter(|c| within(&c.path))
+        .map(|c| (c.path.as_str(), c))
+        .collect();
     let mut out = Vec::new();
     for (p, ca) in &a {
         match b.get(p) {
@@ -529,14 +618,17 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         assert_eq!(branch.as_deref(), Some("main"));
         assert!(!detached);
         assert_eq!(total, 4);
-        assert_eq!(changes[0].status, "modified");
-        assert!(changes[0].unstaged && !changes[0].staged);
-        assert_eq!(changes[1].status, "renamed");
-        assert_eq!(changes[1].path, "new name.rs");
-        assert_eq!(changes[1].from.as_deref(), Some("old.rs"));
-        assert_eq!(changes[2].status, "conflicted");
-        assert_eq!(changes[3].status, "untracked");
-        assert_eq!(changes[3].path, "new file.txt");
+        let by = |p: &str| changes.iter().find(|c| c.path == p).unwrap();
+        assert_eq!(by("src/a.rs").status, "modified");
+        assert!(by("src/a.rs").unstaged && !by("src/a.rs").staged);
+        assert_eq!(by("new name.rs").status, "renamed");
+        assert_eq!(by("new name.rs").from.as_deref(), Some("old.rs"));
+        assert_eq!(by("conflict.rs").status, "conflicted");
+        assert_eq!(by("new file.txt").status, "untracked");
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "a sorted, deterministic list");
     }
 
     #[test]
@@ -661,6 +753,61 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
     }
 
     #[test]
+    fn truncated_snapshots_are_compared_only_within_their_common_prefix() {
+        let ch = |p: &str| Change {
+            path: p.into(),
+            status: "modified",
+            staged: false,
+            unstaged: true,
+            from: None,
+            size: Some(1),
+            mtime_ns: Some(1),
+            lines_added: None,
+            lines_deleted: None,
+        };
+        let snap = |paths: &[&str], truncated: bool| Snapshot {
+            worktree_root: PathBuf::from("/r"),
+            head: None,
+            branch: None,
+            detached: false,
+            changes: paths.iter().map(|p| ch(p)).collect(),
+            total_changes: 100,
+            truncated,
+            numstat_missing: false,
+            counts: Counts::default(),
+            took_ms: 0,
+            filters_disabled: Vec::new(),
+        };
+        // "before" lists a..c (truncated), "after" lists a..e (truncated):
+        // d and e are past what "before" knows and must not "appear".
+        let (deltas, complete) = compare(
+            &snap(&["a", "b", "c"], true),
+            &snap(&["a", "b", "c", "d", "e"], true),
+        );
+        assert!(!complete);
+        assert!(deltas.iter().all(|d| d.path.as_str() <= "c"), "{deltas:?}");
+        assert!(deltas.iter().all(|d| d.kind == "unchanged"));
+    }
+
+    #[test]
+    fn repository_filter_drivers_are_not_run() {
+        let Some(git) = git_available() else { return };
+        let d = repo();
+        let marker = d.path().join("FILTER-RAN");
+        let cmd = if cfg!(windows) {
+            format!("cmd /c type nul > {} & more", marker.display())
+        } else {
+            format!("sh -c 'touch {}; cat'", marker.display())
+        };
+        sh(d.path(), &["config", "filter.evil.clean", &cmd]);
+        std::fs::write(d.path().join(".gitattributes"), "*.rs filter=evil\n").unwrap();
+        std::fs::write(d.path().join("a.rs"), "changed\n").unwrap();
+        let s = snapshot(&git, d.path(), DEFAULT_TIMEOUT).unwrap();
+        assert_eq!(s.filters_disabled, vec!["evil".to_string()]);
+        assert!(!marker.exists(), "the clean filter must not run");
+    }
+
+    #[test]
     fn a_hanging_git_is_killed_at_the_timeout() {
         if cfg!(windows) {
             return;
@@ -675,7 +822,12 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         }
         let t = Instant::now();
         let err = snapshot(&fake, d.path(), Duration::from_millis(300)).unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        // The first call (listing filter drivers) hangs: the snapshot fails
+        // closed, before `git status` could run with unknown filters.
+        assert!(
+            err.contains("could not be listed") || err.contains("timed out"),
+            "{err}"
+        );
         assert!(t.elapsed() < Duration::from_secs(5));
     }
 }

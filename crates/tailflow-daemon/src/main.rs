@@ -501,6 +501,29 @@ async fn run() -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr().unwrap_or(addr);
+    // `localhost` resolves to ::1 first on many systems. Listen there too, so
+    // a client (or curl) given `localhost` reaches this daemon and never a
+    // different process holding [::1]:port, which would receive its token.
+    let listener_v6 = match tokio::net::TcpListener::bind(SocketAddr::from((
+        std::net::Ipv6Addr::LOCALHOST,
+        addr.port(),
+    )))
+    .await
+    {
+        Ok(l) => Some(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!(
+                "[::1]:{} is in use by another process. Refusing to start: clients that resolve \
+                 `localhost` to ::1 would send their credentials to it. Stop that process or use \
+                 another --port.",
+                addr.port()
+            );
+        }
+        Err(e) => {
+            tracing::info!(err = %e, "IPv6 loopback unavailable; listening on 127.0.0.1 only");
+            None
+        }
+    };
     auth.set_port(addr.port());
     // Browser sessions from a previous run on this port stay valid, so open
     // dashboards reconnect after a restart instead of asking to sign in.
@@ -565,15 +588,25 @@ async fn run() -> Result<()> {
     eprintln!("  observe     {observe_line}");
 
     let shutdown_signal = shutdown.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                () = terminate_signal() => {}
-            }
-            shutdown_signal.cancel();
-        })
-        .await?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = terminate_signal() => {}
+        }
+        shutdown_signal.cancel();
+    });
+    let v4 = axum::serve(listener, app.clone())
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    match listener_v6 {
+        Some(l6) => {
+            let v6 =
+                axum::serve(l6, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+            let (a, b) = tokio::join!(v4, v6);
+            a?;
+            b?;
+        }
+        None => v4.await?,
+    }
     shutdown.cancel();
     if let Some(path) = &runtime_file {
         auth::remove_runtime_file(path, &instance_id);
@@ -587,6 +620,16 @@ async fn run() -> Result<()> {
             .is_err()
         {
             tracing::warn!("filesystem observers did not stop within 10 s; continuing");
+        }
+        // Close every observation claim of this run, including any whose
+        // observer did not stop in time: coverage must not outlive the run.
+        if let Some(storage) = &storage_handle {
+            let storage = storage.clone();
+            match tokio::task::spawn_blocking(move || storage.coverage_close_run()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(err = %e, "could not close observation coverage"),
+                Err(_) => tracing::warn!("coverage close task failed"),
+            }
         }
     }
     // Agent ingestion stops first: its in-flight pass flushes into a storage

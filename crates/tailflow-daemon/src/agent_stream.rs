@@ -69,6 +69,9 @@ const PAGES_PER_WAKE: usize = 8;
 const CHANNEL_BATCHES: usize = 64;
 /// History a (re)connecting subscriber receives before a `reset`.
 pub const MAX_CATCHUP_EVENTS: usize = 5_000;
+/// Storage pages a catch-up reads before a `reset`, whatever it delivered
+/// (a narrow filter over a long history must not scan without bound).
+const MAX_CATCHUP_PAGES: usize = 40;
 /// Concurrent stream subscribers per daemon.
 pub const MAX_SUBSCRIBERS: usize = 32;
 /// Recently reported gaps remembered per subscriber (to report each once).
@@ -439,6 +442,9 @@ struct Subscriber {
     reported_gaps: VecDeque<(u64, u64, String)>,
     sub: Subscription,
     caught_up: bool,
+    /// Storage failed: deliver what is queued (ending with a `reset`),
+    /// then end the stream; the client reconnects from its cursor.
+    ending: bool,
     shutdown: CancellationToken,
     feed: Arc<AgentFeed>,
 }
@@ -463,26 +469,47 @@ impl Subscriber {
     }
 
     /// Read committed history after `self.cursor` from storage, up to the
-    /// catch-up bound. Returns `false` when the bound was hit.
-    async fn catch_up(&mut self) -> bool {
+    /// catch-up bound (events delivered, pages read). Past the bound, or
+    /// when the cursor is ahead of the newest committed seq, it queues a
+    /// `reset`. A storage failure queues a `reset` and ends the stream.
+    async fn catch_up(&mut self) {
         let mut delivered = 0usize;
+        let mut pages = 0usize;
         loop {
             let s = self.storage.clone();
             let after = self.cursor;
             let page = tokio::task::spawn_blocking(move || {
                 let newest = s.newest_seq()?;
+                let issued = s.issued_seq()?;
                 let page = s.query(&stream_query(after, PAGE))?;
-                Ok::<_, tailflow_storage::StorageError>((newest, page))
+                Ok::<_, tailflow_storage::StorageError>((newest, issued, page))
             })
             .await;
-            let (newest, page) = match page {
+            let (newest, issued, page) = match page {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     tracing::warn!(err = %e, "agent stream: catch-up read failed");
-                    return true;
+                    self.fail();
+                    return;
                 }
-                Err(_) => return true,
+                Err(_) => {
+                    self.fail();
+                    return;
+                }
             };
+            pages += 1;
+            if after > issued {
+                // A seq this database never issued: the cursor comes from
+                // another database (replaced or recreated). Nothing after
+                // it can be trusted. Restart at the newest.
+                self.cursor = newest;
+                self.feed.resets.fetch_add(1, Ordering::Relaxed);
+                self.queue.push_back(Out::Reset {
+                    reason: "cursor_ahead",
+                    cursor: newest,
+                });
+                return;
+            }
             // Retention removed events this subscriber never saw.
             let evicted = page.completeness.evicted_through_seq;
             if evicted > after && after > 0 {
@@ -507,9 +534,9 @@ impl Subscriber {
             let to = page.next_cursor.unwrap_or(after).max(after);
             self.cursor = to;
             if !page.has_more || to == after {
-                return true;
+                return;
             }
-            if delivered >= MAX_CATCHUP_EVENTS {
+            if delivered >= MAX_CATCHUP_EVENTS || pages >= MAX_CATCHUP_PAGES {
                 // Too far behind to stream: skip to the newest seq and let
                 // the client reload its views from the REST API.
                 self.cursor = self.cursor.max(newest);
@@ -518,9 +545,17 @@ impl Subscriber {
                     reason: "catchup_limit",
                     cursor: self.cursor,
                 });
-                return false;
+                return;
             }
         }
+    }
+
+    fn fail(&mut self) {
+        self.ending = true;
+        self.queue.push_back(Out::Reset {
+            reason: "storage_unavailable",
+            cursor: self.cursor,
+        });
     }
 
     fn apply(&mut self, batch: &Batch) {
@@ -540,7 +575,7 @@ impl Subscriber {
             if let Some(out) = self.queue.pop_front() {
                 return Some(out);
             }
-            if self.shutdown.is_cancelled() {
+            if self.shutdown.is_cancelled() || self.ending {
                 return None;
             }
             if !self.start_resolved {
@@ -557,7 +592,10 @@ impl Subscriber {
                 self.start_resolved = true;
             }
             if !self.caught_up {
-                let _within_bound = self.catch_up().await;
+                self.catch_up().await;
+                if self.ending {
+                    continue;
+                }
                 self.caught_up = true;
                 self.queue.push_back(Out::Ready {
                     cursor: self.cursor,
@@ -579,14 +617,17 @@ impl Subscriber {
                     if batch.after > self.cursor {
                         // A hole between what we read and this batch: fill it
                         // from storage first (self-healing; should not happen).
-                        let _within_bound = self.catch_up().await;
+                        self.catch_up().await;
+                        if self.ending {
+                            continue;
+                        }
                     }
                     self.apply(&batch);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     self.feed.lag_recoveries.fetch_add(1, Ordering::Relaxed);
                     self.queue.push_back(Out::Lag { skipped_batches: n });
-                    let _within_bound = self.catch_up().await;
+                    self.catch_up().await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -616,6 +657,7 @@ pub fn subscribe(
         sub,
         // A live-only subscriber has nothing to catch up on.
         caught_up: false,
+        ending: false,
         shutdown: state.shutdown.clone(),
         feed,
     };

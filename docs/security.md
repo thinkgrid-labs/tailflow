@@ -47,7 +47,7 @@ Other clients:
 
 ```sh
 # curl and scripts
-curl -H "Authorization: Bearer $(tailflow-daemon token)" localhost:7878/api/v1/sessions
+curl -H "Authorization: Bearer $(tailflow-daemon token)" 127.0.0.1:7878/api/v1/sessions
 
 # A container, another user, or an SSH port forward: pass the token explicitly
 TAILFLOW_TOKEN=$(tailflow-daemon token) tailflow-logs errors

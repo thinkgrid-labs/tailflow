@@ -419,7 +419,7 @@ pre-restart history is in the durable store:
 
 ```bash
 curl -s -H "Authorization: Bearer $(tailflow-daemon token)" \
-  'localhost:7878/api/v1/events?since=2h&order=desc'
+  '127.0.0.1:7878/api/v1/events?since=2h&order=desc'
 tailflow-daemon storage status
 ```
 

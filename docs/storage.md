@@ -242,8 +242,8 @@ tailflow-daemon storage status         # size, events, oldest/newest, gaps
 tailflow-daemon storage status --json
 tailflow-daemon storage check          # full integrity check, read-only
 export TF_AUTH="Authorization: Bearer $(tailflow-daemon token)"
-curl -s -H "$TF_AUTH" localhost:7878/api/v1/storage/status
-curl -s -H "$TF_AUTH" localhost:7878/api/v1/collectors/status
+curl -s -H "$TF_AUTH" 127.0.0.1:7878/api/v1/storage/status
+curl -s -H "$TF_AUTH" 127.0.0.1:7878/api/v1/collectors/status
 ```
 
 The dashboard's **Integrations** page shows the same information.
@@ -325,8 +325,8 @@ request scans a bounded range of history; if it stops early it sets
 always advances — keep paging.
 
 ```bash
-curl -s -H "$TF_AUTH" 'localhost:7878/api/v1/events?type=runtime.error&since=24h&order=desc&limit=20'
-curl -s -H "$TF_AUTH" 'localhost:7878/api/v1/events?q=connection%20refused&source=api'
+curl -s -H "$TF_AUTH" '127.0.0.1:7878/api/v1/events?type=runtime.error&since=24h&order=desc&limit=20'
+curl -s -H "$TF_AUTH" '127.0.0.1:7878/api/v1/events?q=connection%20refused&source=api'
 ```
 
 ## Moving from memory-only versions

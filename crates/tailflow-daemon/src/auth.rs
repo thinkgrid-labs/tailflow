@@ -71,7 +71,16 @@ const MAX_CODES: usize = 16;
 pub const STARTUP_CODE_TTL: Duration = Duration::from_secs(60 * 60);
 /// Lifetime of a code minted with `tailflow-daemon dashboard`, which opens
 /// the browser right away.
-pub const MINTED_CODE_TTL: Duration = Duration::from_secs(5 * 60);
+///
+/// Short: the link is opened right away, and on Linux another user may read
+/// process arguments (the browser opener is given a private file, not the
+/// link, but a printed link can still be copied around).
+pub const MINTED_CODE_TTL: Duration = Duration::from_secs(60);
+/// Persisted sessions are restored only if the store was written this
+/// recently (a restart, not a daemon that has been gone for a while). Bounds
+/// how long a cookie captured by something listening on the port while the
+/// daemon was down stays useful (see docs/security.md).
+pub const RESTORE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// Accepted `$TAILFLOW_TOKEN` length. 32 characters is the minimum that
 /// still carries a reasonable amount of entropy.
@@ -170,7 +179,8 @@ pub enum Denied {
     /// A bearer token that is not this run's token.
     BadToken,
     /// A session cookie that is unknown or expired (for example after a
-    /// daemon restart, which rotates every credential).
+    /// sign-out, a revocation, idle or age expiry, or a restart more than
+    /// `RESTORE_WINDOW` after the session store was last written).
     SessionExpired,
     /// A valid session cookie on a request the browser says did not come
     /// from this origin (another localhost port, another site) or without
@@ -240,6 +250,9 @@ impl Session {
 struct SessionFile {
     version: u32,
     port: u16,
+    /// Unix seconds of the write (older stores are not restored).
+    #[serde(default)]
+    saved_at: i64,
     sessions: Vec<Session>,
 }
 
@@ -270,6 +283,10 @@ pub struct Auth {
     runtime_file: OnceLock<PathBuf>,
     /// Where sessions persist across restarts (owner-only). Unset: memory.
     session_file: OnceLock<PathBuf>,
+    /// Held across a snapshot and its write, so writes land in order and an
+    /// older snapshot (with a since-revoked session) never overwrites a
+    /// newer one.
+    persist_lock: Mutex<()>,
     sessions: Mutex<Vec<Session>>,
     /// Unix seconds of the last persisted `last_used` refresh.
     last_touch_persist: AtomicI64,
@@ -317,6 +334,7 @@ impl Auth {
             port: OnceLock::new(),
             runtime_file: OnceLock::new(),
             session_file: OnceLock::new(),
+            persist_lock: Mutex::new(()),
             sessions: Mutex::new(Vec::new()),
             last_touch_persist: AtomicI64::new(0),
             codes: Mutex::new(Vec::new()),
@@ -360,6 +378,7 @@ impl Auth {
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
             .filter(|f| f.version == RUNTIME_FILE_VERSION && f.port == port)
+            .filter(|f| now.saturating_sub(f.saved_at) <= secs(RESTORE_WINDOW))
             .map(|f| {
                 f.sessions
                     .into_iter()
@@ -378,6 +397,7 @@ impl Auth {
         let Some(path) = self.session_file.get() else {
             return;
         };
+        let _ordered = lock(&self.persist_lock);
         let now = now_secs();
         let sessions: Vec<Session> = {
             let mut guard = lock(&self.sessions);
@@ -387,6 +407,7 @@ impl Auth {
         let file = SessionFile {
             version: RUNTIME_FILE_VERSION,
             port: self.port.get().copied().unwrap_or(0),
+            saved_at: now,
             sessions,
         };
         let result = serde_json::to_vec(&file)
@@ -688,30 +709,56 @@ pub fn write_runtime_file(path: &Path, info: &RuntimeInfo) -> std::io::Result<()
 /// Atomically replace `path` with `body`, owner-only (`0600` in a `0700`
 /// directory on Unix).
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        tailflow_core::paths::create_private_dir(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        std::io::Write::write_all(&mut f, body)?;
-        f.sync_all()?;
-    }
+    use std::sync::atomic::AtomicU64 as Counter;
+    static NEXT: Counter = Counter::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    tailflow_core::paths::create_private_dir(dir)?;
+    // A unique name created exclusively: an existing file or symlink planted
+    // at the temporary path makes the write fail instead of following it.
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .map_or_else(|| "file".into(), |n| n.to_string_lossy()),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        // `mode` only applies when the file is created; a stale temp file
-        // from a crashed run must not keep looser permissions.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    std::fs::rename(&tmp, path)
+    let mut f = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        // The directory must be ours and private: a pre-created run
+        // directory (a shared TAILFLOW_DATA_DIR) could otherwise expose or
+        // redirect the credential.
+        use std::os::unix::fs::MetadataExt;
+        let mine = f.metadata()?.uid();
+        let d = std::fs::metadata(dir)?;
+        if d.uid() != mine || d.mode() & 0o077 != 0 {
+            drop(f);
+            let _cleanup = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not a private directory owned by this user; not writing credentials there",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    let written = std::io::Write::write_all(&mut f, body).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written {
+        let _cleanup = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _cleanup = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Read a runtime file, bounded in size.
@@ -1016,6 +1063,38 @@ mod tests {
     }
 
     #[test]
+    fn stale_session_stores_are_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions-7878.json");
+        let now = now_secs();
+        let file = serde_json::json!({
+            "version": RUNTIME_FILE_VERSION, "port": 7878,
+            "saved_at": now - secs(RESTORE_WINDOW) - 1,
+            "sessions": [{"secret": "a".repeat(64), "created": now - 10, "last_used": now - 10}],
+        });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let a = auth();
+        a.attach_session_store(path);
+        assert_eq!(a.view().sessions_active, 0, "the daemon was gone too long");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_are_not_written_into_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("run");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = write_private(&shared.join("daemon-1.json"), b"secret").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            std::fs::read_dir(&shared).unwrap().next().is_none(),
+            "nothing left behind"
+        );
+    }
+
+    #[test]
     fn expired_or_malformed_stored_sessions_are_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions-7878.json");
@@ -1023,6 +1102,7 @@ mod tests {
         let file = serde_json::json!({
             "version": RUNTIME_FILE_VERSION,
             "port": 7878,
+            "saved_at": now,
             "sessions": [
                 {"secret": "a".repeat(64), "created": now - 10, "last_used": now - 10},
                 {"secret": "b".repeat(64), "created": now - 100, "last_used": now - secs(SESSION_IDLE) - 1},

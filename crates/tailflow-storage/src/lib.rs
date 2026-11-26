@@ -742,6 +742,59 @@ impl Storage {
         Ok(())
     }
 
+    /// The watches of observation `id` are in place: coverage starts now
+    /// (not at the claim, which precedes a possibly long directory walk).
+    /// Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_ready(&self, id: i64, watched_dirs: u64, unwatched_dirs: u64) -> Result<()> {
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        conn.execute(
+            "UPDATE fs_coverage SET started_at = ?2, watched_dirs = ?3, unwatched_dirs = ?4 WHERE id = ?1",
+            params![
+                id,
+                Utc::now().timestamp_micros(),
+                i64::try_from(watched_dirs).unwrap_or(i64::MAX),
+                i64::try_from(unwatched_dirs).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether observation `id` is still open. Another daemon closes it
+    /// when it declares this run dead (for example after a long sleep);
+    /// the observer must then re-claim the root or stop. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_is_open(&self, id: i64) -> Result<bool> {
+        self.inner.readers.with(|c| {
+            let open: Option<i64> = c
+                .query_row(
+                    "SELECT 1 FROM fs_coverage WHERE id = ?1 AND stopped_at IS NULL",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(open.is_some())
+        })
+    }
+
+    /// Close every open observation of this run (shutdown: also when an
+    /// observer did not stop in time). Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_close_run(&self) -> Result<()> {
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        conn.execute(
+            "UPDATE fs_coverage SET stopped_at = ?2 WHERE run_id = ?1 AND stopped_at IS NULL",
+            params![self.inner.run_id, Utc::now().timestamp_micros()],
+        )?;
+        Ok(())
+    }
+
     /// Record that observation `id` stopped. Blocking.
     ///
     /// # Errors
@@ -793,6 +846,25 @@ impl Storage {
             let seq: Option<i64> = c
                 .query_row(
                     "SELECT seq FROM events ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(seq.and_then(|s| u64::try_from(s).ok()).unwrap_or(0))
+        })
+    }
+
+    /// The highest seq ever issued by this database (`AUTOINCREMENT`
+    /// never reuses one, even after every event is deleted). A cursor
+    /// above it comes from another database. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn issued_seq(&self) -> Result<u64> {
+        self.inner.readers.with(|c| {
+            let seq: Option<i64> = c
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
                     [],
                     |r| r.get(0),
                 )
@@ -1026,6 +1098,28 @@ impl Storage {
         self.inner
             .readers
             .with(|c| query::get(c, seq, include_payload))
+    }
+
+    /// Events of `session` within `since..=until` linked to an operation
+    /// by reported ids (same, child, parent or sibling operation), at most
+    /// `limit`, plus the number that matched. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure or the query time budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn operation_links(
+        &self,
+        session: &str,
+        op: Option<&str>,
+        parent: Option<&str>,
+        exclude_seq: u64,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<(Vec<StoredEvent>, u64)> {
+        self.inner.readers.with(|c| {
+            query::operation_links(c, session, op, parent, exclude_seq, since, until, limit)
+        })
     }
 
     /// Whether `seq` is below the retention horizon (expired, not unknown).

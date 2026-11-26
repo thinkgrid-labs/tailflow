@@ -139,6 +139,10 @@ struct CommandOutcome {
     /// no recorded relationship.
     nearby_errors: Vec<NearbyRef>,
     nearby_errors_total: u64,
+    /// Not every runtime error in this command's window was examined (the
+    /// range held more than the cap); the total is a lower bound.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    nearby_errors_incomplete: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -200,18 +204,26 @@ fn compute_outcomes(storage: &Storage, p: OutcomeParams) -> Result<Value, V1Erro
             slot.1 = Some(e);
         }
     }
-    // Runtime errors over the range (+ the nearby margin), once.
-    let errors = storage
-        .query(&EventQuery {
-            event_types: vec!["runtime.error".into()],
-            since: Some(since),
-            until: Some(until + NEARBY_AFTER),
-            order: Order::Asc,
-            limit: MAX_RUNTIME_ERRORS,
-            ..EventQuery::default()
-        })
-        .map(|p| p.events)
-        .unwrap_or_default();
+    // Runtime errors over the range (+ the nearby margin), once, newest
+    // first like the commands listed first. Past the cap, the oldest are
+    // not examined: their commands say so instead of showing none.
+    let error_page = storage.query(&EventQuery {
+        event_types: vec!["runtime.error".into()],
+        since: Some(since),
+        until: Some(until + NEARBY_AFTER),
+        order: Order::Desc,
+        limit: MAX_RUNTIME_ERRORS,
+        ..EventQuery::default()
+    })?;
+    let errors_truncated = error_page.has_more;
+    let mut errors = error_page.events;
+    errors.reverse();
+    // Errors before this time were not examined.
+    let errors_from = if errors_truncated {
+        errors.first().map(|e| e.event.timestamp)
+    } else {
+        None
+    };
 
     let mut items: Vec<CommandOutcome> = Vec::new();
     for (start, end) in ops.into_values() {
@@ -296,6 +308,7 @@ fn compute_outcomes(storage: &Storage, p: OutcomeParams) -> Result<Value, V1Erro
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             nearby_errors_total: near.len() as u64,
+            nearby_errors_incomplete: errors_from.is_some_and(|f| from < f),
             nearby_errors: near
                 .iter()
                 .take(3)
@@ -340,6 +353,7 @@ fn compute_outcomes(storage: &Storage, p: OutcomeParams) -> Result<Value, V1Erro
         "total": shown,
         "truncated": truncated || shown > limit,
         "nearby_after_ms": NEARBY_AFTER.num_milliseconds(),
+        "nearby_errors_truncated": errors_truncated,
         "outcomes": {
             "reported_success": "the agent reported completion; for Claude Code a failing exit fires a separate failure hook",
             "reported_failure": "the agent reported a failure (with its exit code when given)",
@@ -436,47 +450,35 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
     let mut seen: HashSet<u64> = HashSet::from([seq]);
     let mut tiers = Vec::new();
 
-    // Tier 1: direct identifiers.
+    // Tier 1: direct identifiers, matched in SQL (session index, time
+    // budget) so a busy session cannot push a link out of a scan window.
     let mut t1 = Vec::new();
     let mut t1_total = 0u64;
-    if let (Some(sid), true) = (
-        &ev.session_id,
-        ev.operation_id.is_some() || ev.parent_operation_id.is_some(),
-    ) {
-        let page = storage.query(&EventQuery {
-            sessions: vec![sid.clone()],
-            since: Some(at - CD::minutes(30)),
-            until: Some(at + CD::minutes(30)),
-            order: Order::Asc,
-            limit: 1_000,
-            ..EventQuery::default()
-        })?;
-        for x in &page.events {
-            if x.seq == seq {
-                continue;
-            }
+    if let Some(sid) = &ev.session_id {
+        let (links, total) = storage.operation_links(
+            sid,
+            ev.operation_id.as_deref(),
+            ev.parent_operation_id.as_deref(),
+            seq,
+            at - CD::minutes(30),
+            at + CD::minutes(30),
+            20,
+        )?;
+        t1_total = total;
+        for x in &links {
             let xe = &x.event;
             let why = if ev.operation_id.is_some() && xe.operation_id == ev.operation_id {
-                Some("same operation id (reported by the source)")
+                "same operation id (reported by the source)"
             } else if ev.operation_id.is_some() && xe.parent_operation_id == ev.operation_id {
-                Some("child of this operation (reported by the source)")
+                "child of this operation (reported by the source)"
             } else if ev.parent_operation_id.is_some() && xe.operation_id == ev.parent_operation_id
             {
-                Some("parent operation (reported by the source)")
-            } else if ev.parent_operation_id.is_some()
-                && xe.parent_operation_id == ev.parent_operation_id
-            {
-                Some("same parent operation (reported by the source)")
+                "parent operation (reported by the source)"
             } else {
-                None
+                "same parent operation (reported by the source)"
             };
-            if let Some(why) = why {
-                t1_total += 1;
-                seen.insert(x.seq);
-                if t1.len() < 20 {
-                    t1.push(rel(x, at, why.to_string()));
-                }
-            }
+            seen.insert(x.seq);
+            t1.push(rel(x, at, why.to_string()));
         }
     }
     tiers.push(Tier {
@@ -484,9 +486,15 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
         name: "Direct identifiers",
         strength: "recorded link",
         description: "Linked by operation or session ids the source reported.",
+        note: (t1_total > t1.len() as u64).then(|| {
+            format!(
+                "{} linked events within ±30 min; the first {} are listed.",
+                t1_total,
+                t1.len()
+            )
+        }),
         total: t1_total,
         items: t1,
-        note: None,
     });
 
     // Tier 2: independent observation (file changes only).
@@ -588,15 +596,47 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
         limit: 200,
         ..EventQuery::default()
     })?;
+    // Tier 5 first (one stated heuristic: a later runtime error whose
+    // message names the changed file), so an item listed there is not
+    // also listed as merely nearby.
+    let base = FILE_CHANGES
+        .contains(&ev.event_type.as_str())
+        .then(|| {
+            ev.path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| n.len() >= 4)
+        })
+        .flatten();
+    let mut t5 = Vec::new();
     let mut t4 = Vec::new();
     let mut t4_total = 0u64;
-    let mut later_errors: Vec<StoredEvent> = Vec::new();
     for x in page.events {
         if !seen.insert(x.seq) {
             continue;
         }
-        t4_total += 1;
         let d = (x.event.timestamp - at).num_milliseconds();
+        if let Some(base) = &base {
+            if d >= 0
+                && x.event.event_type == "runtime.error"
+                && x.event
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(base.as_str()))
+            {
+                t5.push(rel(
+                    &x,
+                    at,
+                    format!(
+                        "heuristic: this runtime error {} the change mentions `{base}`; possibly related, not confirmed",
+                        ago(d)
+                    ),
+                ));
+                continue;
+            }
+        }
+        t4_total += 1;
         let same = related_project(x.event.project_id.as_deref(), ev.project_id.as_deref());
         if t4.len() < 15 {
             t4.push(rel(
@@ -609,10 +649,8 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
                 ),
             ));
         }
-        if d >= 0 && x.event.event_type == "runtime.error" {
-            later_errors.push(x);
-        }
     }
+    let window_truncated = page.has_more;
     tiers.push(Tier {
         tier: 4,
         name: "Temporal proximity",
@@ -620,41 +658,11 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
         description: "Close in time only. Being nearby does not make events related.",
         total: t4_total,
         items: t4,
-        note: page
-            .has_more
-            .then(|| "More events in the window than listed.".into()),
+        note: window_truncated.then(|| {
+            "More events in the window than were examined; the earliest are listed.".into()
+        }),
     });
 
-    // Tier 5: inference. One stated heuristic: a later runtime error whose
-    // message names the changed file.
-    let mut t5 = Vec::new();
-    if FILE_CHANGES.contains(&ev.event_type.as_str()) {
-        let base = ev
-            .path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| n.len() >= 4);
-        if let Some(base) = base {
-            for x in &later_errors {
-                if x.event
-                    .message
-                    .as_deref()
-                    .is_some_and(|m| m.contains(&base))
-                {
-                    let d = (x.event.timestamp - at).num_milliseconds();
-                    t5.push(rel(
-                        x,
-                        at,
-                        format!(
-                            "heuristic: this runtime error {} the change mentions `{base}`; possibly related, not confirmed",
-                            ago(d)
-                        ),
-                    ));
-                }
-            }
-        }
-    }
     let t5_total = t5.len() as u64;
     tiers.push(Tier {
         tier: 5,
@@ -663,10 +671,12 @@ fn compute_related(storage: &Storage, seq: u64, window_ms: i64) -> Result<Option
         description: "Heuristics that may be useful but are not confirmed.",
         total: t5_total,
         items: t5,
-        note: Some(
+        note: Some(if window_truncated {
+            "Rule: a runtime error after a file change whose message contains the file's name. Only the events examined for tier 4 were checked.".into()
+        } else {
             "Rule: a runtime error after a file change whose message contains the file's name."
-                .into(),
-        ),
+                .into()
+        }),
     });
 
     Ok(Some(serde_json::json!({

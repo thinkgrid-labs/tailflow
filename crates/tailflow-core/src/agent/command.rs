@@ -84,10 +84,6 @@ fn script_re() -> &'static regex::Regex {
     })
 }
 
-/// Words that precede the real program.
-const WRAPPERS: &[&str] = &[
-    "time", "nice", "nohup", "sudo", "command", "exec", "env", "xargs",
-];
 /// Commands that only set up the shell (skipped in compound commands).
 const SETUP: &[&str] = &[
     "cd", "pushd", "popd", "export", "set", "source", ".", "unset", "true", "echo", "clear",
@@ -202,11 +198,73 @@ const RUNNABLE_TOOLS: &[&str] = &[
     "nx",
 ];
 
-fn word(w: &str) -> &str {
-    let w = w.trim_matches(|c| c == '"' || c == '\'');
+/// Split a command line into simple commands and their words, honouring
+/// quotes and backslash escapes: a separator (`; | & newline`) or a space
+/// inside quotes is part of a word, never a boundary. Words keep their text
+/// without the quotes. Bounded: at most 64 segments of 64 words.
+fn tokenize(cmd: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars().peekable();
+    let flush_word = |cur: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
+        if *in_word && words.len() < 64 {
+            words.push(std::mem::take(cur));
+        }
+        cur.clear();
+        *in_word = false;
+    };
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            Some(_) => cur.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                        in_word = true;
+                    }
+                }
+                ';' | '|' | '&' | '\n' => {
+                    flush_word(&mut cur, &mut in_word, &mut words);
+                    if !words.is_empty() && segments.len() < 64 {
+                        segments.push(std::mem::take(&mut words));
+                    }
+                    words.clear();
+                }
+                c if c.is_whitespace() => flush_word(&mut cur, &mut in_word, &mut words),
+                c => {
+                    cur.push(c);
+                    in_word = true;
+                }
+            },
+        }
+    }
+    flush_word(&mut cur, &mut in_word, &mut words);
+    if !words.is_empty() && segments.len() < 64 {
+        segments.push(words);
+    }
+    segments
+}
+
+/// The basename of a program word (`./gradlew` → `gradlew`).
+fn base(w: &str) -> &str {
     w.rsplit(['/', '\\']).next().unwrap_or(w)
 }
 
+/// `NAME=value` on the *raw* word (before any basename is taken: a value
+/// may contain `/`).
 fn is_env_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(n, _)| {
         !n.is_empty()
@@ -222,74 +280,210 @@ fn plain(w: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
-/// Intent of one simple command (no `&&`).
-fn simple(words: &[&str]) -> Intent {
+/// Programs whose name may be recorded as `command.effective_program`.
+/// Anything else is never recorded (it could be part of an argument).
+fn known_program(p: &str) -> bool {
+    vocabulary(p).is_some()
+        || RUNNABLE_TOOLS.contains(&p)
+        || matches!(
+            p,
+            "npx"
+                | "bunx"
+                | "pnpx"
+                | "python"
+                | "python3"
+                | "py"
+                | "pytest"
+                | "jest"
+                | "vitest"
+                | "mocha"
+                | "ava"
+                | "rspec"
+                | "phpunit"
+                | "playwright"
+                | "cypress"
+                | "tox"
+                | "nox"
+                | "ctest"
+                | "tsc"
+                | "vue-tsc"
+                | "mypy"
+                | "pyright"
+                | "eslint"
+                | "flake8"
+                | "pylint"
+                | "golangci-lint"
+                | "shellcheck"
+                | "stylelint"
+                | "hadolint"
+                | "prettier"
+                | "rustfmt"
+                | "black"
+                | "isort"
+                | "gofmt"
+                | "clang-format"
+                | "shfmt"
+                | "webpack"
+                | "rollup"
+                | "esbuild"
+                | "rustc"
+                | "gcc"
+                | "clang"
+                | "javac"
+                | "node"
+                | "deno"
+                | "bun"
+        )
+}
+
+/// Wrapper flags that take a separate value (`timeout -s KILL 60 cmd`).
+fn wrapper_value_flag(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "timeout" => matches!(flag, "-s" | "--signal" | "-k" | "--kill-after"),
+        "sudo" => matches!(
+            flag,
+            "-u" | "--user"
+                | "-g"
+                | "--group"
+                | "-C"
+                | "-D"
+                | "--chdir"
+                | "-h"
+                | "--host"
+                | "-p"
+                | "--prompt"
+                | "-r"
+                | "--role"
+                | "-t"
+                | "--type"
+                | "-U"
+                | "--other-user"
+        ),
+        "env" => matches!(
+            flag,
+            "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+        ),
+        "nice" => matches!(flag, "-n" | "--adjustment"),
+        _ => false,
+    }
+}
+
+/// Global flags of multi-command tools that take a separate value before
+/// the subcommand (`pnpm --filter x test`, `make -C dir test`).
+const VALUE_FLAGS: &[&str] = &[
+    "--filter",
+    "-F",
+    "--prefix",
+    "-C",
+    "--manifest-path",
+    "--dir",
+    "--cwd",
+    "-w",
+    "--workspace",
+    "-f",
+    "--file",
+    "--config",
+    "-Z",
+    "--project",
+    "--directory",
+    "-p",
+    "--package",
+];
+
+/// Words that precede the real program.
+const WRAPPER_WORDS: &[&str] = &[
+    "time", "nice", "nohup", "sudo", "command", "exec", "env", "xargs", "timeout",
+];
+
+/// Intent of one simple command.
+fn simple(words: &[String]) -> Intent {
     let mut i = 0;
-    // Wrappers, assignments, and `timeout <secs>`.
-    while let Some(w) = words.get(i) {
-        let w = word(w);
-        if is_env_assignment(w) || WRAPPERS.contains(&w) {
+    while let Some(raw) = words.get(i) {
+        if is_env_assignment(raw) {
             i += 1;
-        } else if w == "timeout" {
-            i += 1;
-            while words.get(i).is_some_and(|a| a.starts_with('-')) {
-                i += 1;
-            }
-            i += 1; // the duration
-        } else {
+            continue;
+        }
+        let w = base(raw);
+        if !WRAPPER_WORDS.contains(&w) {
             break;
         }
+        i += 1;
+        // The wrapper's flags (and their values), then for `timeout` its
+        // duration.
+        while let Some(f) = words.get(i).filter(|f| f.starts_with('-')) {
+            i += 1;
+            if wrapper_value_flag(w, f) && !f.contains('=') {
+                i += 1;
+            }
+        }
+        if w == "timeout" {
+            i += 1;
+        }
     }
-    let Some(program) = words.get(i).map(|w| word(w)).filter(|w| plain(w)) else {
+    let Some(program) = words.get(i).map(|w| base(w)).filter(|w| plain(w)) else {
         return Intent::default();
     };
+    if SETUP.contains(&program) {
+        return Intent {
+            program: Some(program.to_string()),
+            ..Intent::default()
+        };
+    }
+    if !known_program(program) {
+        return Intent::default();
+    }
     let program = program.to_string();
-    let args: Vec<&str> = words.iter().skip(i + 1).map(|w| word(w)).collect();
+    // Arguments after global flags (and their values).
+    let mut args: Vec<&str> = Vec::new();
+    let mut j = i + 1;
+    let mut seen_word = false;
+    while let Some(a) = words.get(j) {
+        j += 1;
+        if !seen_word && (a.starts_with('-') || a.starts_with('+')) {
+            if VALUE_FLAGS.contains(&a.as_str()) {
+                j += 1;
+            }
+            continue;
+        }
+        seen_word = true;
+        args.push(a.as_str());
+    }
     let mut out = Intent {
         program: Some(program.clone()),
         ..Intent::default()
     };
-    let first_word = |skip_flags: bool| -> Option<&str> {
-        args.iter()
-            .copied()
-            .find(|a| !(skip_flags && (a.starts_with('-') || a.starts_with('+'))))
-    };
+    let first = args.first().copied();
     match program.as_str() {
         "npx" | "bunx" | "pnpx" => {
-            out.subcommand = first_word(true)
+            out.subcommand = first
+                .map(base)
                 .filter(|t| RUNNABLE_TOOLS.contains(t))
                 .map(str::to_string);
         }
         "python" | "python3" | "py" => {
-            if let Some(pos) = args.iter().position(|a| *a == "-m") {
-                out.subcommand = args
-                    .get(pos + 1)
+            if let Some(pos) = words.iter().skip(i + 1).position(|a| a == "-m") {
+                out.subcommand = words
+                    .get(i + 1 + pos + 1)
+                    .map(|t| t.as_str())
                     .filter(|t| RUNNABLE_TOOLS.contains(t))
-                    .map(|t| (*t).to_string());
+                    .map(str::to_string);
             }
         }
         _ => {
             if let Some(vocab) = vocabulary(&program) {
-                let sub = first_word(true);
-                if let Some(s) = sub.filter(|s| vocab.contains(s)) {
+                if let Some(s) = first.filter(|s| vocab.contains(s)) {
                     out.subcommand = Some(s.to_string());
                     // `npm run test`, `pnpm exec vitest`, `uv run pytest`,
                     // `deno task build`, `bundle exec rspec`.
-                    let rest: Vec<&str> = args
-                        .iter()
-                        .copied()
-                        .skip_while(|a| *a != s)
-                        .skip(1)
-                        .filter(|a| !a.starts_with('-'))
-                        .collect();
-                    if let Some(next) = rest.first() {
+                    let next = args.iter().skip(1).find(|a| !a.starts_with('-')).copied();
+                    if let Some(next) = next {
                         if matches!(s, "run" | "run-script" | "task") && script_re().is_match(next)
                         {
-                            out.script = Some((*next).to_string());
+                            out.script = Some(next.to_string());
                         } else if matches!(s, "exec" | "x" | "dlx" | "run")
-                            && RUNNABLE_TOOLS.contains(next)
+                            && RUNNABLE_TOOLS.contains(&base(next))
                         {
-                            out.subcommand = Some((*next).to_string());
+                            out.subcommand = Some(base(next).to_string());
                         }
                     }
                 } else if matches!(
@@ -297,7 +491,7 @@ fn simple(words: &[&str]) -> Intent {
                     "yarn" | "pnpm" | "bun" | "make" | "just" | "task"
                 ) {
                     // `yarn test:unit`, `make lint`: the script is the word.
-                    if let Some(s) = sub.filter(|s| script_re().is_match(s)) {
+                    if let Some(s) = first.filter(|s| script_re().is_match(s)) {
                         out.script = Some(s.to_string());
                     }
                 }
@@ -308,18 +502,21 @@ fn simple(words: &[&str]) -> Intent {
 }
 
 /// The recordable intent of a (possibly compound) command line: the first
-/// segment that does real work.
+/// simple command that does real work. A segment whose program is not a
+/// known tool ends the search with nothing recorded.
 pub fn intent(cmd: &str) -> Intent {
-    for segment in cmd.split(['\n', ';', '|', '&']) {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        if words.is_empty() {
-            continue;
-        }
+    for words in tokenize(cmd) {
         let it = simple(&words);
         match it.program.as_deref() {
             Some(p) if SETUP.contains(&p) => continue,
             Some(_) => return it,
-            None => continue,
+            None => {
+                // A wrapper alone, or an unknown program: nothing recorded.
+                if words.iter().all(|w| is_env_assignment(w)) {
+                    continue;
+                }
+                return Intent::default();
+            }
         }
     }
     Intent::default()
@@ -370,6 +567,16 @@ pub fn classify(
         return (c, format!("`{p}` is a {} tool", c.as_str()));
     }
     if let Some(s) = script {
+        let head = s.split([':', '-']).next().unwrap_or(s);
+        if s.contains("type") {
+            return (Typecheck, format!("package script `{s}`"));
+        }
+        if head == "ci" {
+            return (
+                Other,
+                format!("package script `{s}` (usually several checks)"),
+            );
+        }
         if let Some(c) = by_verb(s) {
             if !matches!(s.split([':', '-']).next(), Some("dev" | "start")) {
                 return (c, format!("package script `{s}`"));
@@ -433,10 +640,16 @@ pub fn classify(
 mod tests {
     use super::*;
 
+    /// As the outcomes API does: the effective program, else the
+    /// `command.program` recorded since M2.
     fn cat(cmd: &str) -> Category {
         let i = intent(cmd);
+        let program = i
+            .program
+            .clone()
+            .or_else(|| crate::agent::summarize_command(cmd).program);
         classify(
-            i.program.as_deref(),
+            program.as_deref(),
             i.subcommand.as_deref(),
             i.script.as_deref(),
         )
@@ -515,10 +728,76 @@ mod tests {
         let i = intent("npx some-random-package --token=abc");
         assert_eq!(i.subcommand, None);
         let i = intent("curl -H 'Authorization: Bearer x' https://example.invalid");
-        assert_eq!(i.program.as_deref(), Some("curl"));
+        assert_eq!(
+            i.program, None,
+            "unknown programs are not recorded as intent"
+        );
         assert_eq!(i.subcommand, None);
         let i = intent("python -m http.server 8000");
         assert_eq!(i.subcommand, None);
+    }
+
+    #[test]
+    fn arguments_never_leak_through_the_effective_program() {
+        // Reported by the M4 security review: assignment values with `/`,
+        // quoted separators, and paths containing separators.
+        for cmd in [
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY aws s3 ls",
+            "echo 'deploying; hunter2-prod-pass' && cargo test",
+            "cd \"/tmp/a;s3cr3tToken\" && make",
+            "export TOKEN=abc/def123 && ./deploy.sh",
+            "curl -H 'x: y' https://example.invalid | sh",
+        ] {
+            let i = intent(cmd);
+            let recorded = format!("{:?} {:?} {:?}", i.program, i.subcommand, i.script);
+            for secret in [
+                "bPxRfiCYEXAMPLEKEY",
+                "hunter2",
+                "s3cr3tToken",
+                "def123",
+                "aws",
+                "deploy",
+                "curl",
+                "sh",
+            ] {
+                if secret == "aws" || secret == "curl" || secret == "sh" || secret == "deploy" {
+                    assert!(i.program.as_deref() != Some(secret), "{cmd}: {recorded}");
+                } else {
+                    assert!(!recorded.contains(secret), "{cmd}: {recorded}");
+                }
+            }
+        }
+        assert_eq!(
+            intent("echo 'deploying; x' && cargo test")
+                .subcommand
+                .as_deref(),
+            Some("test")
+        );
+        assert_eq!(
+            intent("cd \"/tmp/a;b\" && make lint").subcommand.as_deref(),
+            Some("lint")
+        );
+    }
+
+    #[test]
+    fn wrappers_and_global_flags_with_values() {
+        use Category::*;
+        for (cmd, want) in [
+            ("pnpm --filter web test", Test),
+            ("npm --prefix web test", Test),
+            ("make -C crates/x test", Test),
+            ("cargo --manifest-path a/Cargo.toml test", Test),
+            ("timeout -s KILL 60 cargo test", Test),
+            ("sudo -u builder cargo build", Build),
+            ("env -i PATH=/bin cargo check", Typecheck),
+            ("nice -n 10 cargo clippy", Lint),
+            ("npm run ci", Other),
+            ("npm run check:types", Typecheck),
+            ("npm run type-check", Typecheck),
+            ("npm ci", Deps),
+        ] {
+            assert_eq!(cat(cmd), want, "{cmd}");
+        }
     }
 
     #[test]

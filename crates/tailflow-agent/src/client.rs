@@ -217,6 +217,12 @@ impl DaemonClient {
         } else {
             format!("{without_scheme}:7878")
         };
+        // Connect to the IPv4 loopback for `localhost`: never let name
+        // resolution pick an address another process might hold.
+        let authority = match authority.strip_prefix("localhost:") {
+            Some(port) => format!("127.0.0.1:{port}"),
+            None => authority,
+        };
         let runtime_file = runtime_file_for(&authority);
         Self::with_runtime_file(authority, runtime_file)
     }
@@ -426,7 +432,7 @@ mod tests {
 
     #[test]
     fn resolve_accepts_host_without_port() {
-        assert_eq!(DaemonClient::new("localhost").authority, "localhost:7878");
+        assert_eq!(DaemonClient::new("localhost").authority, "127.0.0.1:7878");
     }
 
     #[test]

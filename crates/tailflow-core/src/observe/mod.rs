@@ -72,6 +72,14 @@ pub const BUILTIN_EXCLUDED_DIRS: &[&str] = &[
 const QUEUE: usize = 8_192;
 /// Paths with a change waiting to be coalesced.
 const MAX_PENDING: usize = 10_000;
+/// Files reported from one directory that appeared at once (moved in, or
+/// created and filled before its watch existed). Beyond this a rescan loss
+/// is recorded rather than an unbounded walk.
+const MAX_NEW_DIR_FILES: usize = 10_000;
+/// Ignore rules kept over all ignore files of a root. Beyond this, further
+/// nested `.gitignore` files are not applied (the observer then records
+/// *more*, never less) and the status says so.
+pub const MAX_TOTAL_IGNORE_RULES: usize = 20_000;
 /// A path is reported at most this long after its first notification even
 /// if notifications keep arriving (a file written continuously).
 const MAX_HOLD: Duration = Duration::from_secs(2);
@@ -258,6 +266,11 @@ pub struct Rules {
     ignores: Vec<IgnoreFile>,
     /// Extra absolute directories never observed (TailFlow's own data).
     excluded_dirs: Vec<PathBuf>,
+    /// Directories whose `.gitignore` was already considered.
+    ignore_dirs: HashSet<PathBuf>,
+    ignore_rules: usize,
+    /// Nested ignore files skipped because of [`MAX_TOTAL_IGNORE_RULES`].
+    pub ignore_files_skipped: u64,
 }
 
 impl Rules {
@@ -277,23 +290,34 @@ impl Rules {
                 ignores.push(f);
             }
         }
+        let ignore_rules = ignores.iter().map(IgnoreFile::len).sum();
         Self {
             root: root.to_path_buf(),
             globs,
             ignores,
             excluded_dirs,
+            ignore_dirs: HashSet::from([root.to_path_buf()]),
+            ignore_rules,
+            ignore_files_skipped: 0,
         }
     }
 
     /// Add a nested `.gitignore` (found while walking `dir`).
+    /// Bounded in total ([`MAX_TOTAL_IGNORE_RULES`]) and once per directory.
     pub fn add_ignore_file(&mut self, dir: &Path) {
-        if dir == self.root || self.ignores.len() >= 4_096 {
+        if !self.ignore_dirs.insert(dir.to_path_buf()) {
             return;
         }
         if let Some(f) = IgnoreFile::load(dir, &dir.join(".gitignore")) {
-            if !f.is_empty() {
-                self.ignores.push(f);
+            if f.is_empty() {
+                return;
             }
+            if self.ignore_rules.saturating_add(f.len()) > MAX_TOTAL_IGNORE_RULES {
+                self.ignore_files_skipped += 1;
+                return;
+            }
+            self.ignore_rules += f.len();
+            self.ignores.push(f);
         }
     }
 
@@ -387,6 +411,10 @@ pub struct Stats {
     pub unwatched_dirs: AtomicU64,
     pub pending_paths: AtomicU64,
     pub errors: AtomicU64,
+    /// When the queue first overflowed since the last loss report (µs).
+    pub first_overflow_us: std::sync::atomic::AtomicI64,
+    /// Nested ignore files not applied because of the rule budget.
+    pub ignore_files_skipped: AtomicU64,
 }
 
 pub struct Options {
@@ -436,6 +464,12 @@ impl Observer {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     cb_stats.overflowed.fetch_add(1, Ordering::Relaxed);
+                    let _first_wins = cb_stats.first_overflow_us.compare_exchange(
+                        0,
+                        Utc::now().timestamp_micros(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
                 Err(TrySendError::Disconnected(_)) => {}
             }
@@ -468,6 +502,9 @@ impl Observer {
             collect_nested_ignores(&root, &mut rules, opts.max_directories);
             stats.watched_dirs.store(1, Ordering::Relaxed);
         }
+        stats
+            .ignore_files_skipped
+            .store(rules.ignore_files_skipped, Ordering::Relaxed);
         let thread_stats = stats.clone();
         let thread = std::thread::Builder::new()
             .name("tailflow-observe".into())
@@ -641,7 +678,17 @@ impl<S: Sink> Loop<S> {
             return;
         }
         let now = Utc::now();
-        let first = self.loss_first.take().unwrap_or(now);
+        let overflow_at = self.stats.first_overflow_us.swap(0, Ordering::Relaxed);
+        let first = [
+            self.loss_first.take(),
+            (overflow_at > 0)
+                .then(|| DateTime::from_timestamp_micros(overflow_at))
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(now);
         if new_overflow > 0 {
             self.overflow_reported = overflowed;
             self.sink.lost(false, new_overflow, first, now);
@@ -652,37 +699,120 @@ impl<S: Sink> Loop<S> {
         }
     }
 
+    /// A directory appeared under the root (created, moved in, renamed):
+    /// watch it (Linux) and report the files already in it. Without this,
+    /// files written right after `mkdir`, or a whole tree moved in, would
+    /// never be observed while coverage still claimed to be complete.
+    fn new_directory(&mut self, dir: &Path) {
+        if cfg!(target_os = "linux") {
+            let budget = self.opts.max_directories;
+            let (_, unwatched) = walk_and_watch(
+                &mut self.watcher,
+                &self.root,
+                dir,
+                &mut self.rules,
+                &mut self.watched,
+                budget,
+            );
+            let w = self.watched.len() as u64;
+            let u = self
+                .stats
+                .unwatched_dirs
+                .load(Ordering::Relaxed)
+                .saturating_add(unwatched);
+            self.stats.watched_dirs.store(w, Ordering::Relaxed);
+            self.stats.unwatched_dirs.store(u, Ordering::Relaxed);
+            self.sink.coverage(w, u);
+        }
+        let mut queue = VecDeque::from([dir.to_path_buf()]);
+        let mut files = 0usize;
+        while let Some(d) = queue.pop_front() {
+            let Some(display) = self.root.to_display(&d) else {
+                continue;
+            };
+            if self.rules.excluded(&display, true) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(t) = entry.file_type() else { continue };
+                if t.is_dir() {
+                    queue.push_back(entry.path());
+                } else if files < MAX_NEW_DIR_FILES {
+                    files += 1;
+                    if let Some(f) = self.root.to_display(&entry.path()) {
+                        self.note(&f, |p| p.create = true);
+                    }
+                } else {
+                    // Too many to list: say that changes may be missing.
+                    self.rescans_pending = self.rescans_pending.saturating_add(1);
+                    self.loss_first.get_or_insert_with(Utc::now);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn sync_ignore_stats(&self) {
+        self.stats
+            .ignore_files_skipped
+            .store(self.rules.ignore_files_skipped, Ordering::Relaxed);
+    }
+
+    /// Forget watches of a directory that was removed or renamed away.
+    fn forget_directory(&mut self, dir: &Path) {
+        self.watched.retain(|w| !w.starts_with(dir));
+        self.stats
+            .watched_dirs
+            .store(self.watched.len() as u64, Ordering::Relaxed);
+    }
+
     fn on_event(&mut self, ev: Event) {
         let kind = ev.kind;
-        // Directory creation (Linux): watch the new subtree.
-        if cfg!(target_os = "linux") {
-            if let EventKind::Create(notify::event::CreateKind::Folder) = kind {
-                for p in &ev.paths {
-                    let budget = self.opts.max_directories;
-                    let (_, unwatched) = walk_and_watch(
-                        &mut self.watcher,
-                        &self.root,
-                        p,
-                        &mut self.rules,
-                        &mut self.watched,
-                        budget,
-                    );
-                    let w = self.watched.len() as u64;
-                    let u = self
-                        .stats
-                        .unwatched_dirs
-                        .load(Ordering::Relaxed)
-                        .saturating_add(unwatched);
-                    self.stats.watched_dirs.store(w, Ordering::Relaxed);
-                    self.stats.unwatched_dirs.store(u, Ordering::Relaxed);
-                    self.sink.coverage(w, u);
-                }
+        let appeared = matches!(
+            kind,
+            EventKind::Create(_)
+                | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Any))
+        );
+        if appeared {
+            let dirs: Vec<PathBuf> = ev
+                .paths
+                .iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                .cloned()
+                .collect();
+            for d in &dirs {
+                self.new_directory(d);
+            }
+            self.sync_ignore_stats();
+            if !dirs.is_empty() && dirs.len() == ev.paths.len() {
                 return;
             }
-            if let EventKind::Remove(notify::event::RemoveKind::Folder) = kind {
-                for p in &ev.paths {
-                    self.watched.remove(p);
+        }
+        if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = kind {
+            if let [from, to] = ev.paths.as_slice() {
+                if std::fs::symlink_metadata(to).is_ok_and(|m| m.is_dir()) {
+                    self.forget_directory(from);
+                    if self.root.to_display(to).is_some() {
+                        self.new_directory(to);
+                    }
+                    return;
                 }
+            }
+        }
+        if matches!(
+            kind,
+            EventKind::Remove(notify::event::RemoveKind::Folder)
+                | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+        ) {
+            for p in &ev.paths {
+                if self.watched.contains(p) {
+                    self.forget_directory(p);
+                }
+            }
+            if matches!(kind, EventKind::Remove(notify::event::RemoveKind::Folder)) {
                 return;
             }
         }
@@ -694,10 +824,18 @@ impl<S: Sink> Loop<S> {
                 if let [from, to] = ev.paths.as_slice() {
                     let from_d = self.root.to_display(from);
                     let to_d = self.root.to_display(to);
+                    // An atomic save (an excluded temporary file renamed over
+                    // the real one) is a modification of the real file.
+                    let from_d = from_d.filter(|f| !self.rules.excluded(f, false));
                     if let Some(to_d) = to_d {
+                        let from_known = from_d.is_some();
                         self.note(&to_d, |p| {
-                            p.rename_to = true;
-                            p.rename_from = from_d.clone();
+                            if from_known {
+                                p.rename_to = true;
+                                p.rename_from = from_d.clone();
+                            } else {
+                                p.modify = true;
+                            }
                         });
                     } else if let Some(from_d) = from_d {
                         // Moved out of the root: gone from here.
@@ -1168,6 +1306,62 @@ mod tests {
         let t = Instant::now();
         obs.stop();
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_directory_moved_in_is_watched_and_its_files_reported() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = outside.path().join("pkg");
+        std::fs::create_dir_all(src.join("deep")).unwrap();
+        std::fs::write(src.join("a.rs"), "x").unwrap();
+        std::fs::write(src.join("deep/b.rs"), "x").unwrap();
+        let (obs, sink, _root) = start(dir.path(), &ObserveConfig::default());
+        std::fs::rename(&src, dir.path().join("pkg")).unwrap();
+        let ev = wait_for(&sink, |e| {
+            !by_path(e, "/pkg/a.rs").is_empty() && !by_path(e, "/pkg/deep/b.rs").is_empty()
+        });
+        assert!(!by_path(&ev, "/pkg/deep/b.rs").is_empty(), "{ev:?}");
+        // And later changes inside it are observed too.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dir.path().join("pkg/deep/c.rs"), "x").unwrap();
+        let ev = wait_for(&sink, |e| !by_path(e, "/pkg/deep/c.rs").is_empty());
+        assert!(!by_path(&ev, "/pkg/deep/c.rs").is_empty(), "{ev:?}");
+        obs.stop();
+    }
+
+    #[test]
+    fn a_file_written_right_after_mkdir_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (obs, sink, _root) = start(dir.path(), &ObserveConfig::default());
+        std::fs::create_dir_all(dir.path().join("new/nested")).unwrap();
+        std::fs::write(dir.path().join("new/nested/mod.ts"), "x").unwrap();
+        let ev = wait_for(&sink, |e| !by_path(e, "/new/nested/mod.ts").is_empty());
+        assert!(!by_path(&ev, "/new/nested/mod.ts").is_empty(), "{ev:?}");
+        obs.stop();
+    }
+
+    #[test]
+    fn ignore_rules_are_bounded_in_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_text: String = (0..1_500).map(|i| format!("gen{i}.out\n")).collect();
+        for i in 0..20 {
+            let d = dir.path().join(format!("d{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(".gitignore"), &rules_text).unwrap();
+        }
+        let root = Root::resolve(dir.path(), Path::new("/"), None).unwrap();
+        let mut rules = Rules::new(&root.display, &ObserveConfig::default(), Vec::new());
+        for i in 0..20 {
+            let d = root.display.join(format!("d{i}"));
+            rules.add_ignore_file(&d);
+            rules.add_ignore_file(&d); // once per directory
+        }
+        assert!(rules.ignore_rules <= MAX_TOTAL_IGNORE_RULES);
+        assert_eq!(
+            rules.ignore_files_skipped,
+            20 - (MAX_TOTAL_IGNORE_RULES / 1_500) as u64
+        );
     }
 
     #[test]
