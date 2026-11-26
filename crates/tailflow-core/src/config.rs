@@ -18,6 +18,10 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub privacy: crate::privacy::PrivacyConfig,
+    /// Filesystem and Git observation of selected project directories
+    /// (M4). Strict, like `[storage]`.
+    #[serde(default)]
+    pub observe: crate::observe::ObserveConfig,
 }
 
 // ── [storage] ────────────────────────────────────────────────────────────────

@@ -4,7 +4,8 @@ import { useAsync, navigate, useSettings } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
 import { between, count, dateTime, duration, projectName, relativeTo } from '../lib/format.ts'
 import { ACTIVITY_NAME, COMPLETENESS_REASON, COVERAGE_REASON, GAP_REASON, HISTORY_TEXT, LEVEL_TEXT } from '../lib/events.ts'
-import type { SessionDetail, StoredEvent } from '../lib/types.ts'
+import type { SessionChanges, SessionDetail, StoredEvent } from '../lib/types.ts'
+import { CHANGE_EVIDENCE, CHANGE_KIND } from '../lib/evidence.ts'
 import {
   Agent, Badge, Callout, Card, CopyButton, Empty, ErrorState, HistoryBadge, Loading, Segmented, SessionStatusBadge, Stat,
 } from '../components/ui'
@@ -16,7 +17,7 @@ const PAGE = 500
 /** Events kept in the browser for one session view; beyond this, narrow with Activity filters. */
 const MAX_LOADED = 20_000
 
-type Tab = 'events' | 'summary' | 'coverage'
+type Tab = 'events' | 'summary' | 'changes' | 'coverage'
 
 export function SessionDetailPage({ id, params }: { id: string; params: URLSearchParams }) {
   const p = toRecord(params)
@@ -47,6 +48,7 @@ export function SessionDetailPage({ id, params }: { id: string; params: URLSearc
         <Segmented label="Session view" value={tab} onChange={v => set({ tab: v === 'events' ? null : v })} options={[
           { value: 'events', label: `Events (${count(d.counts.events)})` },
           { value: 'summary', label: 'Tools, files & failures' },
+          { value: 'changes', label: 'Git changes' },
           { value: 'coverage', label: 'Coverage' },
         ]} />
         <div class="grow" />
@@ -59,6 +61,7 @@ export function SessionDetailPage({ id, params }: { id: string; params: URLSearc
       </div>
       {tab === 'events' && <SessionEvents id={id} selected={selected} onSelect={seq => set({ event: seq })} onClose={() => set({ event: null })} />}
       {tab === 'summary' && <Summary d={d} />}
+      {tab === 'changes' && <Changes id={id} />}
       {tab === 'coverage' && <Coverage d={d} />}
     </div>
   )
@@ -278,5 +281,87 @@ function Coverage({ d }: { d: SessionDetail }) {
         </p>
       </Card>
     </div>
+  )
+}
+
+/** Git worktree state before and after the session, with the evidence for
+ *  each changed path. Never credits pre-existing changes. */
+function Changes({ id }: { id: string }) {
+  const c = useAsync<SessionChanges>(s => api.sessionChanges(id, s), [id], 30_000,
+    e => e.event_type === 'git.snapshot' || e.session_id === id)
+  const { settings } = useSettings()
+  if (c.error) return <Card><ErrorState error={c.error} onRetry={c.reload} /></Card>
+  if (!c.data) return <Card><Loading rows={4} /></Card>
+  const v = c.data
+  if (!v.available) {
+    return <Card><Empty icon="branch" title="No Git evidence for this session">{v.reason}</Empty></Card>
+  }
+  const changes = v.changes ?? []
+  const snap = (label: string, r: NonNullable<SessionChanges['baseline']>) => (
+    <div>
+      <div class="dim">{label}</div>
+      <div><span class="mono">{r.head?.slice(0, 10) ?? 'no HEAD'}</span>{r.branch ? <> on <Badge tone="outline" icon="branch">{r.branch}</Badge></> : null}</div>
+      <div class="note">{dateTime(r.at, settings.tz)} · {r.trigger?.replace('_', ' ') ?? 'snapshot'} · {count(r.changes_total)} path{r.changes_total === 1 ? '' : 's'} differ from HEAD{r.complete ? '' : ' (list partial)'}</div>
+    </div>
+  )
+  return (
+    <>
+      <Card title="Worktree before and after" sub={v.repository}>
+        <div class="grid two">
+          {v.baseline && snap('Baseline', v.baseline)}
+          {v.after && snap('After', v.after)}
+        </div>
+      </Card>
+      {(v.limitations ?? []).length > 0 && (
+        <Callout tone="muted">
+          <div>
+            <strong>What this can and cannot show</strong>
+            <ul class="plain">{(v.limitations ?? []).map(l => <li key={l}>{l}</li>)}</ul>
+          </div>
+        </Callout>
+      )}
+      <Card title="Changed during the session" sub={`${count(changes.length)} path${changes.length === 1 ? '' : 's'} · pre-existing changes are listed separately`} flush>
+        {changes.length === 0
+          ? <Empty icon="branch" title="No worktree changes between the snapshots" />
+          : (
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>Path</th><th>Change</th><th>Evidence</th><th class="num">Observed</th><th class="num hide-sm">Lines</th></tr></thead>
+                <tbody>
+                  {changes.map(ch => {
+                    const after = ch.after ?? ch.before
+                    const lines = after && (after.lines_added !== undefined || after.lines_deleted !== undefined)
+                      ? `+${after.lines_added ?? '?'} −${after.lines_deleted ?? '?'}` : '—'
+                    return (
+                      <tr key={ch.path}>
+                        <td class="mono" title={ch.path}>{ch.path}</td>
+                        <td title={CHANGE_KIND[ch.kind]}>{after?.status ?? ch.kind} <span class="dim hide-sm">· {CHANGE_KIND[ch.kind]}</span></td>
+                        <td>
+                          <Badge tone={CHANGE_EVIDENCE[ch.evidence].tone} title={CHANGE_EVIDENCE[ch.evidence].detail}>{CHANGE_EVIDENCE[ch.evidence].label}</Badge>
+                          {ch.other_sessions.length > 0 && <span class="note"> also {ch.other_sessions.map(o => o.split(':').pop()?.slice(0, 8)).join(', ')}</span>}
+                        </td>
+                        <td class="num" title="File watcher observations of this path between the snapshots">{count(ch.observations)}</td>
+                        <td class="num hide-sm mono">{lines}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+      </Card>
+      {(v.pre_existing ?? []).length > 0 && (
+        <Card title="Pre-existing changes" sub="Already different from HEAD at the baseline and unchanged since: not credited to this session">
+          <ul class="plain mono">{(v.pre_existing ?? []).map(p => <li key={p}>{p}</li>)}</ul>
+        </Card>
+      )}
+      {(v.concurrent_sessions ?? []).length > 0 && (
+        <Card title="Other sessions in this repository" sub="Active between the snapshots">
+          <span class="chips">{(v.concurrent_sessions ?? []).map(o => (
+            <a key={o.session_id} href={href('session', {}, o.session_id)}><Agent name={o.agent} /> <span class="mono">{o.session_id.split(':').pop()?.slice(0, 8)}</span></a>
+          ))}</span>
+        </Card>
+      )}
+    </>
   )
 }

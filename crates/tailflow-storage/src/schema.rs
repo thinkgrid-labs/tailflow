@@ -18,7 +18,7 @@ use tailflow_core::config::SyncMode;
 pub const APPLICATION_ID: i32 = 0x5446_4c57;
 
 /// Highest schema version this build understands.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// How long a connection waits on a lock held by another connection or
 /// process before reporting `SQLITE_BUSY`.
@@ -193,6 +193,45 @@ CREATE INDEX IF NOT EXISTS events_agent_activity
     WHERE agent_name IS NOT NULL;
 ";
 
+/// Schema v4 (M4): filesystem observation coverage and a path index for
+/// evidence correlation.
+///
+/// - `fs_coverage`: one row per observed root per daemon run (started,
+///   stopped, watch backend, directories watched and over budget). It says
+///   whether a path *could* have been observed at a time, which separates
+///   "reported but not observed" from "not verifiable". Rows of runs that
+///   died are closed at their last heartbeat by dead-run recovery.
+/// - `events_path_ts`: partial index over filesystem observations and agent
+///   hook events that carry a path, for "what happened to this path near
+///   this time" lookups. Runtime log lines have no path and are not in it,
+///   so runtime ingestion is unaffected. Building it scans the table once.
+/// - `events_fs_ts`: partial index over filesystem observations by time
+///   (observations are not in the agent-activity index).
+///
+/// Rollback: a v3 build refuses a v4 file (`NewerSchema`) and runs
+/// memory-only without modifying it.
+const V4: &str = r"
+CREATE TABLE fs_coverage (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    root           TEXT    NOT NULL,
+    run_id         INTEGER NOT NULL,
+    started_at     INTEGER NOT NULL,
+    stopped_at     INTEGER,
+    backend        TEXT    NOT NULL,
+    watched_dirs   INTEGER NOT NULL DEFAULT 0,
+    unwatched_dirs INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX fs_coverage_root ON fs_coverage(root, started_at);
+
+CREATE INDEX IF NOT EXISTS events_path_ts
+    ON events(path, ts)
+    WHERE path IS NOT NULL AND source_type IN ('fs_watcher', 'agent_hook');
+
+CREATE INDEX IF NOT EXISTS events_fs_ts
+    ON events(ts)
+    WHERE source_type = 'fs_watcher';
+";
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -208,6 +247,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "agent activity index for dashboard aggregates",
         sql: V3,
+    },
+    Migration {
+        version: 4,
+        name: "filesystem coverage and path evidence index",
+        sql: V4,
     },
 ];
 
@@ -345,6 +389,24 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
             current = now;
             continue;
         }
+        // Index builds scan the whole table once; on a multi-gigabyte
+        // database that can take tens of seconds. Say so before starting,
+        // so a slow first start is not mistaken for a hang.
+        let rows: i64 = tx
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'event_count'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if rows > 100_000 {
+            eprintln!(
+                "tailflow: upgrading the event store to schema v{} ({}) over ~{rows} events; \
+                 this runs once and may take a while on a large database",
+                m.version, m.name
+            );
+        }
+        let started = std::time::Instant::now();
         tx.execute_batch(m.sql).map_err(|e| {
             StorageError::Config(format!(
                 "migration {} ({}) failed and was rolled back: {e}",
@@ -356,8 +418,16 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
         tracing::info!(
             version = m.version,
             name = m.name,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "applied storage migration"
         );
+        if rows > 100_000 {
+            eprintln!(
+                "tailflow: schema v{} applied in {:.1} s",
+                m.version,
+                started.elapsed().as_secs_f64()
+            );
+        }
         current = m.version;
     }
     Ok(current)
@@ -590,6 +660,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(activity, 1, "v3 agent activity index created");
+        for name in ["fs_coverage", "events_path_ts", "events_fs_ts"] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "v4 {name} created");
+        }
         let idx: i64 = c
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name = 'events_ts'",
@@ -620,6 +700,68 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// Every older schema upgrades to the current one with its history, and
+    /// the evidence index is usable for path lookups afterwards.
+    #[test]
+    fn v2_and_v3_databases_upgrade_to_v4_keeping_history() {
+        for from in [2usize, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.db");
+            {
+                let c = open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..from]).unwrap();
+                for (i, (st, p)) in [
+                    ("agent_hook", Some("/w/a.rs")),
+                    ("process", None),
+                    ("agent_hook", None),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    c.execute(
+                        "INSERT INTO events (event_id, schema_version, ts, observed_at, event_type, provenance,
+                         source_type, source_id, severity, run_id, path)
+                         VALUES (?1, 1, ?2, ?2, 'file.modified', 'agent_reported', ?3, 's', 0, 1, ?4)",
+                        rusqlite::params![format!("e{i}"), 1_000 + i64::try_from(i).unwrap(), st, p],
+                    )
+                    .unwrap();
+                }
+            }
+            let c = open_writer(&path, SyncMode::Normal).unwrap();
+            let v: i32 = c
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION, "from v{from}");
+            let n: i64 = c
+                .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 3, "history kept from v{from}");
+            // The partial index holds only path-carrying fs/agent rows.
+            let indexed: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM events INDEXED BY events_path_ts
+                     WHERE path IS NOT NULL AND source_type IN ('fs_watcher', 'agent_hook')
+                       AND path = '/w/a.rs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(indexed, 1);
+            assert!(integrity_problems(&c, true).unwrap().is_empty());
+            drop(c);
+            let err = open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..3]).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StorageError::NewerSchema {
+                        found: 4,
+                        supported: 3
+                    }
+                ),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

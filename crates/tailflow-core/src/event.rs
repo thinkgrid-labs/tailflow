@@ -116,8 +116,11 @@ pub struct EventTypeSpec {
     /// Provenance a well-behaved producer of this type normally has.
     pub typical_provenance: Provenance,
     /// Implemented by a collector in this release (`false` = schema only).
-    /// For `file.*` and `command.*` this means *agent-reported* (M2 agent
-    /// hooks); no filesystem watcher or process tracer produces them yet.
+    /// `file.*` comes from agent hooks (`agent_reported`) and, for projects
+    /// listed in `[observe]`, from the filesystem observer
+    /// (`filesystem_observed`). `command.*` is agent-reported only (no
+    /// process tracer). `git.*` comes from bounded, read-only Git snapshots
+    /// of observed projects.
     pub collected: bool,
     pub description: &'static str,
 }
@@ -230,13 +233,35 @@ pub const EVENT_TYPES: &[EventTypeSpec] = &[
         true,
         "A shell command exited non-zero",
     ),
-    spec("git.commit", FO, false, "A commit was created"),
-    spec("git.checkout", FO, false, "HEAD moved to another ref"),
+    spec(
+        "git.commit",
+        FO,
+        true,
+        "HEAD advanced to a new commit whose parent was the previous HEAD, on the same branch",
+    ),
+    spec(
+        "git.checkout",
+        FO,
+        true,
+        "The checked-out branch changed between two snapshots",
+    ),
     spec(
         "git.branch.changed",
         FO,
         false,
         "The current branch changed",
+    ),
+    spec(
+        "git.head.moved",
+        FO,
+        true,
+        "HEAD changed without a new commit on the same branch (reset, rebase, pull, amend)",
+    ),
+    spec(
+        "git.snapshot",
+        FO,
+        true,
+        "Worktree status of an observed repository: changed paths, counts, HEAD (no contents)",
     ),
     spec(
         "system.collector.started",

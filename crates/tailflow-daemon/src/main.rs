@@ -3,6 +3,8 @@ mod agent_stream;
 mod api_v1;
 mod auth;
 mod dashboard_cli;
+mod evidence_api;
+mod observe;
 mod routes;
 mod session_cli;
 mod state;
@@ -92,6 +94,11 @@ struct Cli {
     /// another daemon or `tailflow-daemon agent ingest`)
     #[arg(long)]
     no_agents: bool,
+
+    /// Observe this project directory's file changes (and Git status) as
+    /// independent evidence. Repeatable; adds to `[observe] paths`.
+    #[arg(long = "observe", value_name = "DIR")]
+    observe: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -238,6 +245,10 @@ async fn run() -> Result<()> {
         .as_ref()
         .map(|c| c.privacy.clone())
         .unwrap_or_default();
+    let mut observe_cfg = config
+        .as_ref()
+        .map(|c| c.observe.clone())
+        .unwrap_or_default();
     if let Some(db) = &cli.db {
         storage_cfg.path = Some(db.clone());
     }
@@ -262,6 +273,19 @@ async fn run() -> Result<()> {
     // Invalid storage or privacy settings are fatal: a typo must not silently
     // turn redaction off or retention into something else.
     storage_cfg.validate()?;
+    // `--observe` paths are relative to the working directory; config
+    // paths to the config file's directory (resolved below).
+    let cwd = std::env::current_dir()?;
+    observe_cfg.paths.extend(cli.observe.iter().map(|p| {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        }
+    }));
+    observe_cfg
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [observe] configuration: {e}"))?;
     let policy = Arc::new(
         CapturePolicy::from_config(&privacy_cfg).context("invalid [privacy] configuration")?,
     );
@@ -295,14 +319,18 @@ async fn run() -> Result<()> {
         .and_then(|d| tailflow_core::agent::install::IntegrationState::load(&d).ok())
         .is_some_and(|s| !s.integrations.is_empty());
     let agents_wanted = !cli.no_agents && storage_cfg.enabled;
-    if sources.is_empty() && !(agents_wanted && (cli.agents || integrations_installed)) {
+    if sources.is_empty()
+        && observe_cfg.paths.is_empty()
+        && !(agents_wanted && (cli.agents || integrations_installed))
+    {
         eprintln!(
             "tailflow-daemon: no sources. Add a tailflow.toml or use --docker / --file \
-             (or --agents to record coding-agent activity only)."
+             (or --agents to record coding-agent activity only, or --observe DIR)."
         );
         std::process::exit(1);
     }
 
+    let observe_base = project_root.clone();
     let project_id = std::fs::canonicalize(&project_root)
         .unwrap_or(project_root)
         .display()
@@ -370,6 +398,36 @@ async fn run() -> Result<()> {
             None,
         ),
     };
+    let (observe_status, observe_handle) = match (&storage_handle, observe_cfg.paths.is_empty()) {
+        (_, true) => (observe::disabled("no [observe] paths"), None),
+        (Some(storage), false) => observe::spawn(
+            observe_cfg.clone(),
+            &observe_base,
+            storage.clone(),
+            &shutdown,
+        ),
+        (None, false) => {
+            eprintln!("tailflow-daemon: [observe] needs durable storage; observation is off");
+            (observe::disabled("durable storage is not available"), None)
+        }
+    };
+    let observe_line = {
+        let s = observe_status.lock().unwrap_or_else(|p| p.into_inner());
+        if s.enabled {
+            format!(
+                "{} director{}{}",
+                s.roots.len(),
+                if s.roots.len() == 1 { "y" } else { "ies" },
+                if s.git_enabled {
+                    " + Git snapshots"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            format!("off ({})", s.disabled_reason.clone().unwrap_or_default())
+        }
+    };
     let agents_line = if agent_handle.is_some() {
         format!(
             "recording coding-agent hooks{}",
@@ -403,6 +461,7 @@ async fn run() -> Result<()> {
             shutdown: shutdown.clone(),
             agent_ingest: agent_status,
             auth: auth.clone(),
+            observe: observe_status,
         },
     );
     let instance_id = shared.instance_id.clone();
@@ -502,6 +561,7 @@ async fn run() -> Result<()> {
     eprintln!("  history     {storage_line}");
     eprintln!("  privacy     capture = {}", policy.mode.as_str());
     eprintln!("  agents      {agents_line}");
+    eprintln!("  observe     {observe_line}");
 
     let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
@@ -518,6 +578,16 @@ async fn run() -> Result<()> {
         auth::remove_runtime_file(path, &instance_id);
     }
     auth.persist();
+    // Observers flush pending observations into a storage that still runs.
+    if let Some(h) = observe_handle {
+        let stopping = tokio::task::spawn_blocking(move || h.stop());
+        if tokio::time::timeout(Duration::from_secs(10), stopping)
+            .await
+            .is_err()
+        {
+            tracing::warn!("filesystem observers did not stop within 10 s; continuing");
+        }
+    }
     // Agent ingestion stops first: its in-flight pass flushes into a storage
     // that is still running, and unfinished claims go back to the spool.
     if let Some(h) = agent_handle {

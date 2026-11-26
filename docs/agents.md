@@ -377,6 +377,17 @@ History that survives restarts, with persistent cursors and a `completeness`
 verdict, is served under `/api/v1/events`. See
 [durable history](storage.md#http-api-v1) for parameters and guarantees.
 
+### File and Git evidence
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/v1/observe/status` | Observed directories, backend, counts, coverage, Git repositories and snapshot status |
+| `GET /api/v1/evidence/files?since=&until=&session=&agent=&path_prefix=&window_ms=&status=&limit=` | Each reported or observed file change with `status` (`matched_observation`, `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`), an explanation, and the event seqs behind it; coverage and observer loss over the range |
+| `GET /api/v1/sessions/{id}/changes` | The session's worktree before/after comparison: changed paths with evidence, pre-existing changes, concurrent sessions, limitations |
+
+`git.snapshot`, `git.commit`, `git.checkout` and `git.head.moved` events are
+also available through `/api/v1/events`. See [evidence](evidence.md).
+
 ### Live agent activity: `/api/v1/stream/agent`
 
 Server-Sent Events carrying agent, command, file and git events as they are

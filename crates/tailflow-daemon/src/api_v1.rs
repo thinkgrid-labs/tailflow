@@ -42,6 +42,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/files", get(files))
         .route("/api/v1/stream/agent", get(stream_agent))
+        .merge(crate::evidence_api::router())
 }
 
 // ── GET /api/v1/stream/agent ─────────────────────────────────────────────────
@@ -118,13 +119,13 @@ async fn stream_agent(
 }
 
 pub struct V1Error {
-    status: StatusCode,
-    kind: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
 }
 
 impl V1Error {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             kind: "invalid_query",
@@ -164,7 +165,7 @@ impl From<StorageError> for V1Error {
     }
 }
 
-fn storage_of(state: &AppState) -> Result<&tailflow_storage::Storage, V1Error> {
+pub(crate) fn storage_of(state: &AppState) -> Result<&tailflow_storage::Storage, V1Error> {
     match &state.storage {
         StorageSlot::Enabled(s) => Ok(s),
         StorageSlot::Disabled => Err(V1Error {
@@ -184,7 +185,7 @@ fn storage_of(state: &AppState) -> Result<&tailflow_storage::Storage, V1Error> {
     }
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, V1Error> + Send + 'static,
 ) -> Result<T, V1Error> {
     tokio::task::spawn_blocking(f).await.map_err(|_| V1Error {
@@ -416,7 +417,7 @@ struct SessionParams {
     limit: Option<usize>,
 }
 
-fn parse_time(
+pub(crate) fn parse_time(
     name: &str,
     v: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, V1Error> {
@@ -893,6 +894,7 @@ mod tests {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("test"),
                 auth: Arc::new(crate::auth::Auth::generate()),
+                observe: crate::observe::disabled("test"),
             },
         );
         Harness {
@@ -1195,6 +1197,7 @@ mod tests {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("test"),
                 auth: Arc::new(crate::auth::Auth::generate()),
+                observe: crate::observe::disabled("test"),
             },
         );
         let (status, body) = send(state.clone(), Request::builder().uri("/api/v1/events")).await;

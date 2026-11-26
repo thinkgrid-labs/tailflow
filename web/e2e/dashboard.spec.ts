@@ -106,7 +106,7 @@ test('file events are worded as reported, never verified', async ({ page }) => {
   await expect(insp.getByText(/not independently verified/)).toBeVisible()
 
   await page.goto('/#/files')
-  await expect(page.getByText(/none of these are independently verified/)).toBeVisible()
+  await expect(page.getByText(/These are claims/)).toBeVisible()
   await page.getByText('Touched by more than one agent').click()
   await expect(page.locator('tbody tr')).toHaveCount(2)
   await expect(page.locator('tbody').getByText('shared')).toHaveCount(2)

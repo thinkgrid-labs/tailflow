@@ -118,6 +118,7 @@ export function Integrations() {
           )}
         </Card>
       </div>
+      <ObserveCard />
       <Card title="Collectors" sub="Runtime sources this daemon reads" flush>
         {!collectors.data ? <Loading /> : (collectors.data.collectors ?? []).length === 0
           ? <p class="note" style={{ padding: '16px' }}>No collectors reported.</p>
@@ -178,5 +179,44 @@ function AgentCards({ a }: { a: AgentsStatus }) {
         )
       })}
     </div>
+  )
+}
+
+/** Filesystem and Git observation of selected projects (M4). */
+function ObserveCard() {
+  const o = useAsync(s => api.observe(s), [], 10_000)
+  if (!o.data) return null
+  const d = o.data
+  return (
+    <Card title="File & Git observation" sub="Independent evidence for agent-reported file changes, in the projects you selected">
+      {!d.enabled ? (
+        <p class="note">Off ({d.disabled_reason}). Run <code>tailflow-daemon --observe .</code> or set <code>[observe] paths</code> in <code>tailflow.toml</code>. Only the listed directories are watched; contents are never read.</p>
+      ) : (
+        <>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>Directory</th><th>State</th><th class="num">Observed</th><th class="num">Excluded</th><th class="num">Lost</th><th class="hide-sm">Watch</th></tr></thead>
+              <tbody>
+                {d.roots.map(r => (
+                  <tr key={r.root}>
+                    <td class="mono" title={r.root}>{r.root}</td>
+                    <td><Badge tone={r.state === 'observing' ? 'ok' : r.state === 'waiting' ? 'info' : 'error'} title={r.detail}>{r.state}</Badge></td>
+                    <td class="num">{r.observations.toLocaleString('en-US')}</td>
+                    <td class="num">{r.excluded.toLocaleString('en-US')}</td>
+                    <td class="num">{(r.overflowed + r.rescans).toLocaleString('en-US')}</td>
+                    <td class="hide-sm dim">{r.backend ?? '—'}{r.unwatched_dirs > 0 ? ` · ${r.unwatched_dirs} dirs over budget (partial)` : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p class="note">
+            Git snapshots: {d.git_enabled ? `on (${d.git_binary})` : 'off'}
+            {d.repos.map(r => ` · ${r.worktree_root}: ${r.snapshots} snapshot${r.snapshots === 1 ? '' : 's'}${r.last_error ? ` (last error: ${r.last_error})` : ''}`).join('')}
+          </p>
+          {d.errors.length > 0 && <Callout tone="warn">{d.errors.join('; ')}</Callout>}
+        </>
+      )}
+    </Card>
   )
 }

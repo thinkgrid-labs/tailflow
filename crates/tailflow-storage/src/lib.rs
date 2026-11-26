@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod evidence;
 pub mod health;
 pub mod ingest;
 pub mod paths;
@@ -41,6 +42,15 @@ use tailflow_core::config::StorageConfig;
 use tailflow_core::event::ObservabilityEvent;
 use tailflow_core::privacy::CapturePolicy;
 use writer::{Command, Shared, Writer, WriterConfig};
+
+/// Outcome of [`Storage::coverage_started`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageClaim {
+    /// This run observes the root; the coverage row id.
+    Claimed(i64),
+    /// Another live daemon run already observes it.
+    HeldBy { run_id: i64, pid: i64 },
+}
 
 /// A run whose heartbeat is older than this is considered dead even if a
 /// process with its pid exists (pid reuse).
@@ -272,6 +282,11 @@ pub(crate) fn recover_dead_runs(
             if changed == 0 {
                 return Ok(()); // another daemon recovered it first
             }
+            // Its filesystem observers stopped when it died (at the latest).
+            c.execute(
+                "UPDATE fs_coverage SET stopped_at = ?2 WHERE run_id = ?1 AND stopped_at IS NULL",
+                rusqlite::params![id, heartbeat],
+            )?;
             let first = hb.unwrap_or(now);
             // Cover everything committed since the dead run's last commit:
             // with a shared database another daemon may have written past
@@ -633,6 +648,113 @@ impl Storage {
         self.inner.shared.add_loss(reason, count, first, last);
     }
 
+    /// Record filesystem-observer loss ([`LossReason::FsObserverOverflow`]
+    /// or [`LossReason::FsWatcherRescan`]). Written as a gap with the next
+    /// batch, plus a `system.events.dropped` marker.
+    pub fn record_observer_loss(
+        &self,
+        reason: LossReason,
+        count: u64,
+        first: DateTime<Utc>,
+        last: DateTime<Utc>,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.inner
+            .shared
+            .health
+            .dropped_fs_observer
+            .fetch_add(count, Ordering::Relaxed);
+        self.inner.shared.add_loss(reason, count, first, last);
+        let (ack, _rx) = mpsc::sync_channel(1);
+        let _queue_full_is_fine = self.inner.tx.try_send(Command::Flush(ack));
+    }
+
+    /// Claim filesystem observation of `root` for this run. Two daemons
+    /// sharing the database must not both observe one directory (every
+    /// change would be recorded twice): the claim fails while another live
+    /// run (heartbeat within the last minute) holds an open claim on the
+    /// same root. Check and insert happen in one write transaction.
+    /// Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_started(
+        &self,
+        root: &str,
+        backend: &str,
+        watched_dirs: u64,
+        unwatched_dirs: u64,
+    ) -> Result<CoverageClaim> {
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        let run_id = self.inner.run_id;
+        let fresh = Utc::now().timestamp_micros()
+            - i64::try_from(STALE_RUN.as_micros()).unwrap_or(i64::MAX);
+        retention::immediate(&conn, |c| {
+            let held: Option<(i64, i64)> = c
+                .query_row(
+                    "SELECT f.run_id, r.pid FROM fs_coverage f JOIN runs r ON r.id = f.run_id
+                     WHERE f.root = ?1 AND f.stopped_at IS NULL AND f.run_id != ?2
+                       AND r.ended_at IS NULL AND r.heartbeat_at >= ?3
+                     LIMIT 1",
+                    params![root, run_id, fresh],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((other_run, pid)) = held {
+                return Ok(CoverageClaim::HeldBy {
+                    run_id: other_run,
+                    pid,
+                });
+            }
+            c.execute(
+                "INSERT INTO fs_coverage (root, run_id, started_at, backend, watched_dirs, unwatched_dirs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    root,
+                    run_id,
+                    Utc::now().timestamp_micros(),
+                    backend,
+                    i64::try_from(watched_dirs).unwrap_or(i64::MAX),
+                    i64::try_from(unwatched_dirs).unwrap_or(i64::MAX)
+                ],
+            )?;
+            Ok(CoverageClaim::Claimed(c.last_insert_rowid()))
+        })
+    }
+
+    /// Update the directory counts of a running observation (directories
+    /// added or over budget since it started). Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_update(&self, id: i64, watched_dirs: u64, unwatched_dirs: u64) -> Result<()> {
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        conn.execute(
+            "UPDATE fs_coverage SET watched_dirs = ?2, unwatched_dirs = ?3 WHERE id = ?1",
+            params![
+                id,
+                i64::try_from(watched_dirs).unwrap_or(i64::MAX),
+                i64::try_from(unwatched_dirs).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record that observation `id` stopped. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn coverage_stopped(&self, id: i64) -> Result<()> {
+        let conn = schema::open_writer(&self.inner.path, self.inner.config.synchronous)?;
+        conn.execute(
+            "UPDATE fs_coverage SET stopped_at = ?2 WHERE id = ?1 AND stopped_at IS NULL",
+            params![id, Utc::now().timestamp_micros()],
+        )?;
+        Ok(())
+    }
+
     /// Count events a hook's capture policy excluded before spooling
     /// (deliberate, not loss), so `events_excluded` covers them.
     pub fn add_excluded(&self, n: u64) {
@@ -701,6 +823,27 @@ impl Storage {
     /// Invalid filters, the query time budget, or a SQLite failure.
     pub fn files(&self, q: &stats::FilesQuery) -> Result<stats::FilesPage> {
         self.inner.readers.with(|c| stats::files(c, q))
+    }
+
+    /// Agent-reported file changes compared with filesystem observations.
+    /// Blocking.
+    ///
+    /// # Errors
+    /// Invalid filters, the query time budget, or a SQLite failure.
+    pub fn file_evidence(
+        &self,
+        q: &evidence::FileEvidenceQuery,
+    ) -> Result<evidence::FileEvidencePage> {
+        self.inner.readers.with(|c| evidence::files(c, q))
+    }
+
+    /// Run `f` on a pooled read connection (for daemon-side read helpers
+    /// that need several statements). Blocking.
+    ///
+    /// # Errors
+    /// Whatever `f` returns.
+    pub fn read<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        self.inner.readers.with(f)
     }
 
     /// One agent session with summaries. Blocking.

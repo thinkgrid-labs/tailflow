@@ -4,13 +4,20 @@ import { api } from '../lib/api.ts'
 import { useAsync, navigate } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
 import { count, projectName, relativeTo } from '../lib/format.ts'
-import type { FileActivity } from '../lib/types.ts'
+import type { EvidenceStatus, FileActivity, FileEvidencePage } from '../lib/types.ts'
+import { EVIDENCE } from '../lib/evidence.ts'
+import { GAP_REASON } from '../lib/events.ts'
 import { Agent, Badge, Callout, Card, CopyButton, Empty, ErrorState, Loading, RANGES, Segmented, Time } from '../components/ui'
 import { Icon } from '../components/icons'
 
 type Group = 'path' | 'project' | 'agent'
 
 export function Files({ params }: { params: URLSearchParams }) {
+  // Two components, so each view's hooks run in a stable order.
+  return toRecord(params).view === 'verified' ? <Verified params={params} /> : <Reported params={params} />
+}
+
+function Reported({ params }: { params: URLSearchParams }) {
   const p = toRecord(params)
   const since = p.since ?? '7d'
   const group = (p.group as Group) || 'path'
@@ -31,10 +38,11 @@ export function Files({ params }: { params: URLSearchParams }) {
       <div class="page-head">
         <div>
           <h2>Files</h2>
-          <p>File operations agents <strong>reported</strong> through their hooks, grouped by path. TailFlow does not watch the file system: none of these are independently verified.</p>
+          <p>File operations agents <strong>reported</strong> through their hooks, grouped by path. These are claims; the <strong>Verified</strong> view compares them with what the file watcher saw in observed projects.</p>
         </div>
         <CopyButton text={location.href} label="Copy filter URL" />
       </div>
+      <ViewSwitch params={params} view="reported" />
       <Callout tone="muted">
         Claude Code reports reads (Read tool) and writes (Write/Edit/MultiEdit/NotebookEdit); edits made by shell commands are invisible.
         Codex reports only <code>apply_patch</code> changes and no reads — a file with zero reported reads may still have been read.
@@ -110,6 +118,111 @@ function FileTable({ files, root }: { files: FileActivity[]; root?: string }) {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+function ViewSwitch({ params, view }: { params: URLSearchParams; view: 'reported' | 'verified' }) {
+  return (
+    <div class="toolbar">
+      <Segmented label="Files view" value={view} onChange={v => navigate(href('files', withParams(params, { view: v === 'reported' ? null : v, status: null })), true)} options={[
+        { value: 'reported', label: 'Reported by agents' },
+        { value: 'verified', label: 'Verified on disk' },
+      ]} />
+    </div>
+  )
+}
+
+const STATUS_ORDER: EvidenceStatus[] = ['matched_observation', 'reported_only', 'unverified', 'filesystem_observed', 'ambiguous']
+
+/** Agent-reported changes compared with independent filesystem observations. */
+function Verified({ params }: { params: URLSearchParams }) {
+  const p = toRecord(params)
+  const since = p.since ?? '24h'
+  const set = (c: Record<string, string | null>) => navigate(href('files', withParams(params, c)), true)
+  const status = p.status as EvidenceStatus | undefined
+  const observe = useAsync(s => api.observe(s), [], 30_000)
+  const data = useAsync<FileEvidencePage>(s => api.fileEvidence({
+    since, session: p.session, agent: p.agent, path_prefix: p.path_prefix, limit: 300,
+  }, s), [since, p.session, p.agent, p.path_prefix], 30_000, e => e.event_type.startsWith('file.'))
+  const items = (data.data?.items ?? []).filter(i => !status || i.status === status)
+  const off = observe.data && !observe.data.enabled
+  return (
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <h2>Files</h2>
+          <p>What agents <strong>reported</strong> changing, compared with what TailFlow&apos;s file watcher <strong>observed</strong> on disk in the projects you chose to observe. A watcher cannot see who wrote a file: a match is an association, not proof of authorship.</p>
+        </div>
+        <CopyButton text={location.href} label="Copy filter URL" />
+      </div>
+      <ViewSwitch params={params} view="verified" />
+      {off && (
+        <Callout tone="info">
+          File observation is off on this daemon ({observe.data?.disabled_reason}). Start it with <code>tailflow-daemon --observe .</code> or add
+          <code> [observe] paths = [&quot;.&quot;]</code> to <code>tailflow.toml</code>. Until then every reported change is <strong>unverified</strong>.
+        </Callout>
+      )}
+      <div class="toolbar">
+        <Segmented label="Time range" value={since} options={RANGES} onChange={v => set({ since: v === '24h' ? null : v })} />
+        <select class="select" aria-label="Evidence status" value={status ?? ''} onChange={e => set({ status: (e.target as HTMLSelectElement).value || null })}>
+          <option value="">Every status</option>
+          {STATUS_ORDER.map(s => <option key={s} value={s}>{EVIDENCE[s].label}</option>)}
+        </select>
+        {p.session && <span class="chip"><span>session: {p.session}</span><button aria-label="Remove session filter" onClick={() => set({ session: null })}><Icon name="x" size="sm" /></button></span>}
+      </div>
+      {data.data && (
+        <div class="chips" role="list" aria-label="Counts by status">
+          {STATUS_ORDER.map(s => (
+            <span role="listitem" key={s}>
+              <Badge tone={EVIDENCE[s].tone} title={EVIDENCE[s].detail}>{`${EVIDENCE[s].label} ${count(data.data!.counts[s] ?? 0)}`}</Badge>
+            </span>
+          ))}
+          <span class="note">window ±{(data.data.window_ms / 1000).toFixed(0)} s</span>
+        </div>
+      )}
+      {data.data && data.data.loss.length > 0 && (
+        <Callout tone="warn">
+          The file watcher lost notifications in this range ({data.data.loss.map(l => GAP_REASON[l.reason] ?? l.reason).join('; ')}).
+          Reports near those times are marked unverified.
+        </Callout>
+      )}
+      {data.data?.truncated && <Callout tone="muted">More changes exist in this range than were compared. Narrow the time range or filter by session.</Callout>}
+      {data.error ? <Card><ErrorState error={data.error} onRetry={data.reload} /></Card>
+        : !data.data ? <Card><Loading rows={6} /></Card>
+        : items.length === 0 ? <Card><Empty icon="files" title="No file changes">No reported or observed file changes in this range{status ? ' with this status' : ''}.</Empty></Card>
+        : (
+          <Card flush>
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>Path</th><th>Evidence</th><th>Reported by</th><th class="num">Observed</th><th>When</th></tr></thead>
+                <tbody>
+                  {items.map(i => (
+                    <tr key={`${i.status}|${i.path}|${i.at}`}>
+                      <td class="mono" title={i.path} style={{ maxWidth: '460px' }}>
+                        <a href={href('activity', { type: 'files', path: i.path, since: '30d' })}>{relativeTo(i.path, data.data!.coverage.find(c => i.path.startsWith(c.root))?.root)}</a>
+                      </td>
+                      <td><Badge tone={EVIDENCE[i.status].tone} title={`${EVIDENCE[i.status].detail} ${i.explanation}`}>{EVIDENCE[i.status].label}</Badge></td>
+                      <td>
+                        <span class="chips">
+                          {i.reported.length === 0 ? <span class="dim">no report</span> : [...new Set(i.reported.map(r => r.session_id ?? '?'))].map(sid => (
+                            <a key={sid} class="mono" href={href('session', {}, sid)} title={sid}>{sid.split(':').pop()?.slice(0, 8)}</a>
+                          ))}
+                        </span>
+                      </td>
+                      <td class="num">{count(i.observed.length)}</td>
+                      <td class="dim"><Time at={i.at} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+      {data.data && data.data.coverage.length > 0 && (
+        <p class="note">Observed roots in this range: {[...new Set(data.data.coverage.map(c => c.root))].map(r => projectName(r)).join(', ')}
+          {data.data.coverage.some(c => c.unwatched_dirs > 0) ? ' · coverage was partial for some (watch budget)' : ''}.</p>
+      )}
     </div>
   )
 }

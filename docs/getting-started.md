@@ -318,6 +318,20 @@ tailflow sessions
 
 See [agent capture](agent-capture.md) for coverage, privacy and uninstalling.
 
+### Verify what changed on disk (opt-in)
+
+Agent hooks report what the agent *says* it did. To compare that with what
+actually changed in your project, observe it:
+
+```bash
+tailflow-daemon --observe .        # or [observe] paths = ["."] in tailflow.toml
+```
+
+**Files → Verified on disk** then marks each reported change as reported and
+observed, reported but not seen, unverified, or observed but unreported, and
+**Session → Git changes** separates a session's worktree changes from
+changes that were already there. See [evidence](evidence.md).
+
 ## Use TailFlow without MCP
 
 An agent with shell access can use the same capabilities:

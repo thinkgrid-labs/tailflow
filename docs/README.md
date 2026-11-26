@@ -15,6 +15,7 @@ Use this page to find the shortest path to the information you need.
 | Use the web dashboard and read what it shows | [Dashboard](dashboard.md) |
 | Keep history, set retention, or control what is recorded | [Durable history](storage.md) |
 | Sign in to the dashboard, use the API token, understand who can read the API | [Security](security.md) |
+| Compare what agents report with what changed on disk and in Git | [Evidence](evidence.md) |
 | Understand the internals | [Architecture](architecture.md) |
 | Evaluate production or automation use | [Limitations](limitations.md) |
 | See planned work | [Roadmap](roadmap.md) |

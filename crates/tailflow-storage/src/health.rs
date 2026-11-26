@@ -39,6 +39,13 @@ pub enum LossReason {
     AgentInputRejected,
     /// A spool record that could not be read or parsed. Count unknown.
     AgentSpoolCorrupt,
+    /// Filesystem notifications dropped because TailFlow's observer queue
+    /// was full. The count is exact.
+    FsObserverOverflow,
+    /// The operating system's watcher reported that it lost notifications
+    /// (inotify queue overflow, FSEvents "must rescan"). The count is the
+    /// number of such reports: a lower bound, the real number is unknown.
+    FsWatcherRescan,
 }
 
 impl LossReason {
@@ -54,6 +61,8 @@ impl LossReason {
             LossReason::AgentSpoolOverflow => "agent_spool_overflow",
             LossReason::AgentInputRejected => "agent_input_rejected",
             LossReason::AgentSpoolCorrupt => "agent_spool_corrupt",
+            LossReason::FsObserverOverflow => "fs_observer_overflow",
+            LossReason::FsWatcherRescan => "fs_watcher_rescan",
         }
     }
 }
@@ -164,6 +173,8 @@ pub struct Health {
     pub(crate) last_commit_latency_us: AtomicI64,
     /// Agent losses recorded from the spool (overflow, rejected, corrupt).
     pub(crate) dropped_agent: AtomicU64,
+    /// Filesystem observations lost (observer overflow, watcher rescans).
+    pub(crate) dropped_fs_observer: AtomicU64,
     /// Retention passes that stopped early because the ingestion queue was
     /// deep (the remaining work resumes after the next batch).
     pub(crate) maintenance_yields: AtomicU64,
@@ -205,6 +216,7 @@ impl Health {
             writer_stopped: load(&self.dropped_writer_stopped),
             invalid: load(&self.invalid),
             agent: load(&self.dropped_agent),
+            filesystem_observer: load(&self.dropped_fs_observer),
         };
         let last_error = self
             .last_error
@@ -256,6 +268,9 @@ pub struct DroppedCounts {
     /// Agent hook calls lost before reaching storage (spool overflow,
     /// rejected input, corrupt records), as recorded from the spool.
     pub agent: u64,
+    /// Filesystem observations lost (queue overflow, watcher rescans; the
+    /// latter is a lower bound).
+    pub filesystem_observer: u64,
 }
 
 /// Retention/full-text maintenance under ingestion pressure.
@@ -274,6 +289,7 @@ impl DroppedCounts {
             .saturating_add(self.writer_stopped)
             .saturating_add(self.invalid)
             .saturating_add(self.agent)
+            .saturating_add(self.filesystem_observer)
     }
 }
 
