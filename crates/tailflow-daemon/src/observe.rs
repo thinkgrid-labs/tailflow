@@ -61,6 +61,15 @@ pub struct RootStatus {
     pub watched_dirs: u64,
     pub unwatched_dirs: u64,
     pub pending_paths: u64,
+    /// OS notifications received (several per write are common; they are
+    /// not observations).
+    pub notifications: u64,
+    /// Notifications merged into a path already queued (used no slot).
+    pub coalesced: u64,
+    /// Access and attribute-only notifications dropped before the queue.
+    pub filtered: u64,
+    /// Most notifications waiting in the queue at once (capacity 8,192).
+    pub queue_peak: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_root: Option<String>,
 }
@@ -123,6 +132,10 @@ fn fill_counts(r: &mut RootStatus, st: &observe::Stats) {
     r.watched_dirs = ld(&st.watched_dirs);
     r.unwatched_dirs = ld(&st.unwatched_dirs);
     r.pending_paths = ld(&st.pending_paths);
+    r.notifications = ld(&st.notifications);
+    r.coalesced = ld(&st.coalesced);
+    r.filtered = ld(&st.filtered);
+    r.queue_peak = ld(&st.queue_peak);
 }
 
 pub type Shared = Arc<Mutex<ObserveStatus>>;
@@ -639,10 +652,30 @@ fn set_root(status: &Shared, i: usize, f: impl FnOnce(&mut RootStatus)) {
 /// `cursor`. Returns the new cursor.
 fn session_boundaries(
     storage: &Storage,
-    cursor: u64,
+    mut cursor: u64,
     repos: &[Option<PathBuf>],
     tx: &mpsc::SyncSender<GitMsg>,
 ) -> u64 {
+    // A wake reads every boundary committed so far (bounded: 10 pages of
+    // 100); anything beyond waits for the next poll.
+    for _ in 0..10 {
+        let (next, more) = session_page(storage, cursor, repos, tx);
+        cursor = next;
+        if !more {
+            break;
+        }
+    }
+    cursor
+}
+
+/// One page of session boundaries after `cursor`: the new cursor, and
+/// whether more remain.
+fn session_page(
+    storage: &Storage,
+    cursor: u64,
+    repos: &[Option<PathBuf>],
+    tx: &mpsc::SyncSender<GitMsg>,
+) -> (u64, bool) {
     let q = EventQuery {
         event_types: vec!["agent.session.started".into(), "agent.session.ended".into()],
         after_seq: Some(cursor),
@@ -651,7 +684,7 @@ fn session_boundaries(
         ..EventQuery::default()
     };
     let Ok(page) = storage.query(&q) else {
-        return cursor;
+        return (cursor, false);
     };
     for e in &page.events {
         let ev = &e.event;
@@ -682,7 +715,8 @@ fn session_boundaries(
             });
         }
     }
-    page.next_cursor.unwrap_or(cursor).max(cursor)
+    let next = page.next_cursor.unwrap_or(cursor).max(cursor);
+    (next, page.has_more && next > cursor)
 }
 
 struct RepoState {

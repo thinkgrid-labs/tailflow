@@ -89,6 +89,18 @@ under one of two reasons:
 - `fs_watcher_rescan`: the OS reported that it dropped notifications; the
   count is a lower bound.
 
+The queue between the OS watcher and TailFlow holds 8,192 entries. A
+create, modify or delete notification for a path that is already waiting is
+merged into its entry (`coalesced` in the status) and takes no slot; renames
+(each one may produce up to three notifications) and rescans each take a
+slot. Access and attribute-only notifications (`filtered`), and changes
+under the built-in excluded directories (`node_modules/`, `target/`, `.git/`,
+…, counted in `excluded`), never enter it, so a build or a package install
+does not crowd out real changes. Overflow therefore needs thousands of distinct
+paths, or renames, changing faster than TailFlow processes them.
+`/api/v1/observe/status` also reports raw OS `notifications` and the queue's
+high-water mark (`queue_peak`).
+
 ## Git snapshots
 
 For each Git repository that contains an observed directory, TailFlow takes
@@ -208,7 +220,8 @@ None of these is a claim that one event caused another.
   editing one repository at once can only be told apart by their own
   reports.
 - A session-start snapshot is taken when the daemon sees the session start
-  (within about a second). Changes in that first moment can appear as
+  (at once when this daemon recorded it, within about 2 seconds when another
+  daemon sharing the database did). Changes in that first moment can appear as
   session changes.
 - `.gitignore` files created after the observer started apply from the next
   start. The ignore syntax supported is a subset; character classes such as

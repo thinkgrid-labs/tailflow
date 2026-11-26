@@ -92,6 +92,9 @@ const LOSS_REPORT_EVERY: Duration = Duration::from_secs(1);
 const LOSS_SETTLE: Duration = Duration::from_secs(1);
 /// Notifications handled per wakeup before deadlines are looked at again.
 const DRAIN_BATCH: usize = 1_024;
+/// Distinct notification kinds merged into one queued path (there are
+/// fewer kinds than this; the bound only makes it explicit).
+const MAX_MERGED_KINDS: usize = 16;
 
 /// `[observe]` in `tailflow.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -427,6 +430,31 @@ pub struct Stats {
     /// Times the observer thread woke up (a notification batch or a
     /// deadline). Idle observation should leave this flat.
     pub loop_wakeups: AtomicU64,
+    /// Notifications merged into a path already waiting in the queue (they
+    /// used no queue slot and cannot overflow it). Counted in
+    /// `fs.notifications` of the resulting observation.
+    pub coalesced: AtomicU64,
+    /// Notifications that never need the queue: access and attribute-only
+    /// changes, which are not content changes.
+    pub filtered: AtomicU64,
+    /// Entries in the queue now, and the most there have been.
+    pub queue_depth: AtomicU64,
+    pub queue_peak: AtomicU64,
+    /// OS callbacks running now. The loss re-check after a burst waits
+    /// for this to reach 0, so an overflow counted late by a descheduled
+    /// callback is still reported promptly.
+    pub callbacks_in_flight: AtomicU64,
+}
+
+/// Decrements [`Stats::callbacks_in_flight`] when a callback returns.
+struct InFlight<'a>(&'a AtomicU64);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // SeqCst: the loop reads 0 here only after every counter update
+        // this callback made (overflow) is visible to it.
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct Options {
@@ -451,8 +479,81 @@ pub struct Observer {
 
 enum Msg {
     Fs(Event),
+    /// Single-path notifications merged in the callback: the details are in
+    /// the [`Inbox`] under this path.
+    Path(PathBuf),
     Rescan,
     Stop,
+}
+
+/// What the callback merged for one queued path.
+struct Merged {
+    /// Distinct kinds, in arrival order (at most [`MAX_MERGED_KINDS`]).
+    kinds: Vec<EventKind>,
+    /// Notifications merged (at least 1).
+    count: u64,
+}
+
+/// Paths that have a [`Msg::Path`] in the queue, with what has been merged
+/// into it since. Holds at most one entry per queued message, so it is
+/// bounded by the queue capacity. The callback inserts an entry only while
+/// holding the lock across a successful send, and the loop removes it
+/// under the same lock after receiving the message, so an entry never
+/// outlives its message and a later notification is never merged into one
+/// already processed.
+type Inbox = Arc<std::sync::Mutex<HashMap<PathBuf, Merged>>>;
+
+fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Merged>> {
+    // A panic while holding the lock leaves a consistent map (single
+    // insert/remove/update operations).
+    inbox
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Notifications the observer never acts on (see `Loop::on_event`).
+fn ignorable(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Other | EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
+/// A single-path notification whose handling depends only on its kind and
+/// the path's state when it is processed, so several for one path can
+/// share a queue entry. Renames are not merged (they pair paths).
+fn mergeable(ev: &Event) -> Option<&Path> {
+    let [path] = ev.paths.as_slice() else {
+        return None;
+    };
+    match ev.kind {
+        EventKind::Create(_)
+        | EventKind::Remove(_)
+        | EventKind::Any
+        | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any | ModifyKind::Other) => {
+            Some(path.as_path())
+        }
+        _ => None,
+    }
+}
+
+/// Whether every path of `ev` lies under a built-in excluded directory of
+/// `root` (`target/`, `node_modules/`, `.git/`, …). Such notifications are
+/// never recorded; dropping them in the callback keeps a build or a package
+/// install from filling the queue that real changes need.
+fn under_builtin_exclusion(root: &Root, ev: &Event) -> bool {
+    !ev.paths.is_empty()
+        && ev.paths.iter().all(|p| {
+            let rel = p
+                .strip_prefix(&root.canonical)
+                .or_else(|_| p.strip_prefix(&root.display));
+            rel.is_ok_and(|rel| {
+                rel.components().any(|c| {
+                    matches!(c, Component::Normal(s)
+                        if s.to_str().is_some_and(|s| BUILTIN_EXCLUDED_DIRS.contains(&s)))
+                })
+            })
+        })
 }
 
 impl Observer {
@@ -471,28 +572,82 @@ impl Observer {
         let stats = Arc::new(Stats::default());
         let cb_tx = tx.clone();
         let cb_stats = stats.clone();
+        let inbox: Inbox = Arc::default();
+        let cb_inbox = inbox.clone();
+        let cb_root = root.clone();
+        let cap = u64::try_from(capacity).unwrap_or(u64::MAX);
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            cb_stats.notifications.fetch_add(1, Ordering::Relaxed);
-            let msg = match res {
-                Ok(ev) if ev.need_rescan() => Msg::Rescan,
-                Ok(ev) => Msg::Fs(ev),
+            let st = &cb_stats;
+            st.callbacks_in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlight(&st.callbacks_in_flight);
+            st.notifications.fetch_add(1, Ordering::Relaxed);
+            // Queue a message; a full queue is counted as loss (exact).
+            let send = |msg: Msg| -> bool {
+                let depth = st.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+                match cb_tx.try_send(msg) {
+                    Ok(()) => {
+                        // The loop decrements after receiving, so `depth`
+                        // can briefly read one above the capacity.
+                        st.queue_peak.fetch_max(depth.min(cap), Ordering::Relaxed);
+                        true
+                    }
+                    Err(e) => {
+                        st.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        if matches!(e, TrySendError::Full(_)) {
+                            st.overflowed.fetch_add(1, Ordering::Relaxed);
+                            let _first_wins = st.first_overflow_us.compare_exchange(
+                                0,
+                                Utc::now().timestamp_micros(),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        false
+                    }
+                }
+            };
+            let ev = match res {
+                Ok(ev) => ev,
                 Err(_) => {
-                    cb_stats.errors.fetch_add(1, Ordering::Relaxed);
+                    st.errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
-            match cb_tx.try_send(msg) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    cb_stats.overflowed.fetch_add(1, Ordering::Relaxed);
-                    let _first_wins = cb_stats.first_overflow_us.compare_exchange(
-                        0,
-                        Utc::now().timestamp_micros(),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+            if ev.need_rescan() {
+                send(Msg::Rescan);
+                return;
+            }
+            if ignorable(ev.kind) {
+                st.filtered.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if under_builtin_exclusion(&cb_root, &ev) {
+                st.excluded.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let Some(path) = mergeable(&ev) else {
+                send(Msg::Fs(ev));
+                return;
+            };
+            let mut inbox = lock_inbox(&cb_inbox);
+            if let Some(m) = inbox.get_mut(path) {
+                m.count = m.count.saturating_add(1);
+                if !m.kinds.contains(&ev.kind) && m.kinds.len() < MAX_MERGED_KINDS {
+                    m.kinds.push(ev.kind);
                 }
-                Err(TrySendError::Disconnected(_)) => {}
+                st.coalesced.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // The lock is held across the send so the loop cannot receive
+            // the message and look for the entry before it exists.
+            if send(Msg::Path(path.to_path_buf())) {
+                inbox.insert(
+                    path.to_path_buf(),
+                    Merged {
+                        kinds: vec![ev.kind],
+                        count: 1,
+                    },
+                );
             }
         })?;
         let mut rules = rules;
@@ -545,6 +700,7 @@ impl Observer {
                     rescans_pending: 0,
                     loss_first: None,
                     next_flush: None,
+                    inbox,
                 };
                 state.run(&rx);
             })
@@ -666,6 +822,7 @@ struct Loop<S: Sink> {
     loss_first: Option<DateTime<Utc>>,
     /// When the next flush pass is due (`None`: nothing pending).
     next_flush: Option<Instant>,
+    inbox: Inbox,
 }
 
 impl<S: Sink> Loop<S> {
@@ -705,8 +862,12 @@ impl<S: Sink> Loop<S> {
             // flush pass per batch, not per notification.
             let mut handled = 0usize;
             while let Some(msg) = next.take() {
+                if !matches!(msg, Msg::Stop) {
+                    self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                }
                 match msg {
                     Msg::Fs(ev) => self.on_event(ev),
+                    Msg::Path(path) => self.on_merged(path),
                     Msg::Rescan => {
                         self.stats.rescans.fetch_add(1, Ordering::Relaxed);
                         self.rescans_pending = self.rescans_pending.saturating_add(1);
@@ -727,7 +888,10 @@ impl<S: Sink> Loop<S> {
             if handled > 0 {
                 settle_at = Some(now + LOSS_SETTLE);
             } else if settle_at.is_some_and(|t| now >= t) {
-                settle_at = None;
+                // A callback still running may count an overflow after
+                // this check: look again later rather than block for good.
+                settle_at = (self.stats.callbacks_in_flight.load(Ordering::SeqCst) > 0)
+                    .then(|| now + LOSS_SETTLE);
             }
             if self.next_flush.is_some_and(|t| now >= t) {
                 self.flush(false, granule);
@@ -843,6 +1007,39 @@ impl<S: Sink> Loop<S> {
             .store(self.watched.len() as u64, Ordering::Relaxed);
     }
 
+    /// Replay what the callback merged for one path: removals first, then
+    /// creations, then modifications. Every decision below depends only on
+    /// the kind and on the path's state now (`lstat`), and the coalesced
+    /// observation is decided by the final state, so the replay order
+    /// cannot change the result.
+    fn on_merged(&mut self, path: PathBuf) {
+        let Some(mut m) = lock_inbox(&self.inbox).remove(&path) else {
+            return;
+        };
+        let rank = |k: &EventKind| match k {
+            EventKind::Remove(_) => 0,
+            EventKind::Create(_) => 1,
+            _ => 2,
+        };
+        m.kinds.sort_by_key(rank);
+        // Each replayed kind counts once in `note`; add the rest.
+        let replayed = u64::try_from(m.kinds.len()).unwrap_or(u64::MAX);
+        let extra = m.count.saturating_sub(replayed);
+        for kind in m.kinds {
+            self.on_event(Event::new(kind).add_path(path.clone()));
+        }
+        // fs.notifications counts every merged notification.
+        if extra > 0 {
+            if let Some(p) = self
+                .root
+                .to_display(&path)
+                .and_then(|d| self.pending.get_mut(&d))
+            {
+                p.count = p.count.saturating_add(extra);
+            }
+        }
+    }
+
     fn on_event(&mut self, ev: Event) {
         let kind = ev.kind;
         let appeared = matches!(
@@ -946,16 +1143,20 @@ impl<S: Sink> Loop<S> {
         if path == self.root.display {
             return;
         }
-        // Directories are not observations (their files are).
-        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-        if is_dir {
-            return;
-        }
-        if self.rules.excluded(path, false) {
-            self.stats.excluded.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+        // A path already pending passed these checks when it was added
+        // (the final `lstat` decides its type when it is reported), so a
+        // burst of notifications for one path costs one `lstat` and one
+        // rule check, not one per notification.
         if !self.pending.contains_key(path) {
+            // Directories are not observations (their files are).
+            let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+            if is_dir {
+                return;
+            }
+            if self.rules.excluded(path, false) {
+                self.stats.excluded.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if self.pending.len() >= MAX_PENDING {
                 // Report the oldest now rather than drop anything.
                 if let Some(oldest) = self.order.pop_front() {
@@ -1477,6 +1678,158 @@ mod tests {
             self.0.lost(rescan, count, a, b);
         }
         fn coverage(&self, _: u64, _: u64) {}
+    }
+
+    /// A sink that blocks until released: the observer thread stalls in
+    /// its first report, so everything after it waits in the queue.
+    #[derive(Clone, Default)]
+    struct Gate {
+        inner: Collect,
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Gate {
+        fn release(&self) {
+            let (m, cv) = &*self.open;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
+    impl Sink for Gate {
+        fn observed(&self, e: ObservabilityEvent) {
+            let (m, cv) = &*self.open;
+            let mut open = m.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            drop(open);
+            self.inner.observed(e);
+        }
+        fn lost(&self, rescan: bool, count: u64, a: DateTime<Utc>, b: DateTime<Utc>) {
+            self.inner.lost(rescan, count, a, b);
+        }
+        fn coverage(&self, _: u64, _: u64) {}
+    }
+
+    /// Start an observer with a tiny queue and stall it in its first
+    /// report (of `first.txt`).
+    fn stalled(dir: &Path, capacity: usize) -> (Observer, Gate) {
+        let cfg = ObserveConfig::default();
+        let root = Root::resolve(dir, Path::new("/"), None).unwrap();
+        let gate = Gate::default();
+        let obs = Observer::spawn(
+            root.clone(),
+            Rules::new(&root.display, &cfg, Vec::new()),
+            Options {
+                coalesce: Duration::from_millis(20),
+                max_directories: 100,
+                id_prefix: "t".into(),
+                queue_capacity: capacity,
+            },
+            gate.clone(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        std::fs::write(dir.join("first.txt"), "x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // `observations` is counted just before the (blocking) report.
+        while obs.stats.observations.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "the observer never reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (obs, gate)
+    }
+
+    /// M4-F: notifications for a path already waiting in the queue are
+    /// merged into its entry. M4 queued each one, so a stalled observer
+    /// lost them once the queue was full.
+    #[test]
+    fn notifications_for_one_path_share_a_queue_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (obs, gate) = stalled(dir.path(), 4);
+        for i in 0..500 {
+            std::fs::write(dir.path().join("busy.log"), format!("{i}")).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let stats = obs.stats.clone();
+        gate.release();
+        let ev = wait_for(&gate.inner, |ev| !by_path(ev, "/busy.log").is_empty());
+        obs.stop();
+        assert_eq!(stats.overflowed.load(Ordering::Relaxed), 0);
+        assert!(stats.coalesced.load(Ordering::Relaxed) > 0);
+        assert!(stats.queue_peak.load(Ordering::Relaxed) <= 4);
+        let busy = by_path(&ev, "/busy.log");
+        let notes: u64 = busy
+            .iter()
+            .filter_map(|e| e.attributes.get("fs.notifications")?.as_u64())
+            .sum();
+        // Merged notifications still count in the observation.
+        assert!(notes > 1, "{busy:?}");
+        assert!(gate.inner.lost.lock().unwrap().is_empty());
+    }
+
+    /// M4-F: a build writing under `target/` or a package install under
+    /// `node_modules/` never takes queue slots from real changes.
+    #[test]
+    fn builtin_excluded_directories_never_use_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["target/debug", "node_modules/pkg"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        let (obs, gate) = stalled(dir.path(), 4);
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("target/debug/o{i}")), "x").unwrap();
+            std::fs::write(dir.path().join(format!("node_modules/pkg/m{i}.js")), "x").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let stats = obs.stats.clone();
+        gate.release();
+        std::fs::write(dir.path().join("real.rs"), "x").unwrap();
+        let ev = wait_for(&gate.inner, |ev| !by_path(ev, "/real.rs").is_empty());
+        obs.stop();
+        assert_eq!(stats.overflowed.load(Ordering::Relaxed), 0);
+        // Recursive backends report the writes and the callback drops them
+        // as excluded. inotify never watches excluded directories, so on
+        // Linux the writes produce no notification at all.
+        if !cfg!(target_os = "linux") {
+            assert!(stats.excluded.load(Ordering::Relaxed) >= 300);
+        }
+        assert_eq!(by_path(&ev, "/real.rs").len(), 1);
+        assert!(ev.iter().all(|e| {
+            let p = e.path.as_deref().unwrap_or("").replace('\\', "/");
+            !p.contains("/target/") && !p.contains("/node_modules/")
+        }));
+    }
+
+    /// M4-F: attribute-only changes are dropped in the callback (the
+    /// observer never acted on them) and, where the OS reports them as
+    /// such (inotify), produce no observation.
+    #[cfg(unix)]
+    #[test]
+    fn attribute_changes_are_filtered_before_the_queue() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mode.sh");
+        std::fs::write(&f, "x").unwrap();
+        let (obs, sink, _root) = start(dir.path(), &ObserveConfig::default());
+        for i in 0..20 {
+            let mode = if i % 2 == 0 { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(dir.path().join("after.rs"), "x").unwrap();
+        let ev = wait_for(&sink, |ev| !by_path(ev, "/after.rs").is_empty());
+        let stats = obs.stats.clone();
+        obs.stop();
+        assert!(stats.filtered.load(Ordering::Relaxed) > 0);
+        // inotify reports a chmod as an attribute change only. FSEvents
+        // repeats a recently created file's sticky "created"/"modified"
+        // flags on later events, so on macOS a chmod of a new file can still
+        // be reported as a change (a documented limitation, as in M4).
+        if cfg!(target_os = "linux") {
+            assert!(by_path(&ev, "/mode.sh").is_empty(), "{ev:?}");
+        }
     }
 
     #[test]

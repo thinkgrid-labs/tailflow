@@ -461,6 +461,11 @@ export interface ObserveStatus {
     watched_dirs: number
     unwatched_dirs: number
     pending_paths: number
+    /** M4-F; absent from older daemons. */
+    notifications?: number
+    coalesced?: number
+    filtered?: number
+    queue_peak?: number
     git_root?: string
   }[]
   git_enabled: boolean
