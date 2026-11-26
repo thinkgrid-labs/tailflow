@@ -1082,13 +1082,21 @@ mod tests {
         std::fs::write(dir.path().join("old.rs"), "x").unwrap();
         let (obs, sink, _root) = start(dir.path(), &ObserveConfig::default());
         std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
-        let ev = wait_for(&sink, |e| !by_path(e, "/new.rs").is_empty() && !by_path(e, "/old.rs").is_empty());
+        let ev = wait_for(&sink, |e| {
+            !by_path(e, "/new.rs").is_empty() && !by_path(e, "/old.rs").is_empty()
+        });
         let new = by_path(&ev, "/new.rs");
         assert!(
-            new.iter().any(|e| matches!(e.event_type.as_str(), "file.renamed" | "file.created")),
+            new.iter()
+                .any(|e| matches!(e.event_type.as_str(), "file.renamed" | "file.created")),
             "{ev:?}"
         );
-        assert!(by_path(&ev, "/old.rs").iter().any(|e| e.event_type == "file.deleted"), "{ev:?}");
+        assert!(
+            by_path(&ev, "/old.rs")
+                .iter()
+                .any(|e| e.event_type == "file.deleted"),
+            "{ev:?}"
+        );
         obs.stop();
     }
 
