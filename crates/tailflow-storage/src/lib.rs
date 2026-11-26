@@ -837,6 +837,24 @@ impl Storage {
         self.inner.readers.with(|c| evidence::files(c, q))
     }
 
+    /// File-change events at exactly `path` in a time range from one source
+    /// (`fs_watcher` or `agent_hook`), through the path index. Blocking.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn events_at_path(
+        &self,
+        path: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        source_type: &str,
+        limit: usize,
+    ) -> Result<Vec<evidence::EvidenceRef>> {
+        self.inner
+            .readers
+            .with(|c| evidence::events_at_path(c, path, since, until, source_type, limit))
+    }
+
     /// Run `f` on a pooled read connection (for daemon-side read helpers
     /// that need several statements). Blocking.
     ///
