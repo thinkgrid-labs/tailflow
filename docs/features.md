@@ -294,6 +294,29 @@ change: a file watcher cannot see the writing process, and Git cannot tell
 an agent's edit from a person's. A match between a report and an
 observation is an association, never authorship.
 
+## Live activity, outcomes and related evidence (next release)
+
+**What it does.** The dashboard follows agent activity live through one
+authenticated stream of events already committed to history (it resumes
+after a disconnect and reports gaps instead of skipping them). Commands are
+classified as build, test, lint, typecheck, format or dependency work, with
+the outcome the agent reported. For any event, **Related evidence** lists
+other events in five tiers: shared operation ids, an independent
+observation of the same file, the same session, closeness in time, and one
+labelled heuristic.
+
+**What it proves.** Only what each tier says: a recorded link, an
+observation, shared context, or nearness in time. TailFlow does not observe
+processes, so a command's outcome is what the agent reported. No tier claims
+that one event caused another.
+
+## Local access control (next release)
+
+The daemon's API holds agent sessions, paths and commands, so it requires a
+credential: a per-run token for the CLI, MCP and scripts, and a one-time
+sign-in link for the browser. Pages on other localhost ports cannot read it.
+See [security](security.md).
+
 ## Feature boundaries
 
 TailFlow observes text emitted by local software. It does not collect metrics,
