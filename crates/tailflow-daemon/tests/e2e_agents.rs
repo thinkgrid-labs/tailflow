@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use tailflow_core::agent::{hook, spool::Spool, AgentKind};
 use tailflow_core::privacy::{CapturePolicy, PrivacyConfig};
 
+/// Fixed API token for the spawned daemons (`$TAILFLOW_TOKEN`).
+const TOKEN: &str = "e2e-test-token-0123456789abcdef0123456789";
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -26,7 +29,8 @@ fn get(port: u16, path: &str) -> Option<Value> {
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
     let mut buf = String::new();
@@ -62,6 +66,7 @@ fn daemon(data: &Path, port: u16, cwd: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_tailflow-daemon"))
         .args(["--agents", "--port", &port.to_string()])
         .env("TAILFLOW_DATA_DIR", data)
+        .env("TAILFLOW_TOKEN", TOKEN)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

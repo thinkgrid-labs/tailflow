@@ -1851,6 +1851,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "tailflow-core",
  "tokio",
 ]
 
@@ -1884,6 +1885,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "getrandom",
  "http-body-util",
  "mime_guess",
  "notify",

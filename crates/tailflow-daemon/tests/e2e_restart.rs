@@ -8,6 +8,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Fixed API token for the spawned daemons (`$TAILFLOW_TOKEN`).
+const TOKEN: &str = "e2e-test-token-0123456789abcdef0123456789";
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -21,7 +24,8 @@ fn get(port: u16, path: &str) -> Option<serde_json::Value> {
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
     let mut buf = String::new();
@@ -54,6 +58,10 @@ fn spawn(config: &Path, port: u16) -> Child {
         .arg(config)
         .arg("--port")
         .arg(port.to_string())
+        .env("TAILFLOW_TOKEN", TOKEN)
+        // The runtime file (and any agent spool) stay next to the test's
+        // database, never in the real per-user data directory.
+        .env("TAILFLOW_DATA_DIR", config.parent().unwrap().join("data"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -329,7 +337,8 @@ fn sigterm_stops_cleanly_while_an_sse_client_is_connected() {
     let mut sse = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         sse,
-        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n"
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {TOKEN}\r\nAccept: text/event-stream\r\n\r\n"
     )
     .unwrap();
     sse.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

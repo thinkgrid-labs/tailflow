@@ -1,5 +1,7 @@
 mod agent_ingest;
 mod api_v1;
+mod auth;
+mod dashboard_cli;
 mod routes;
 mod session_cli;
 mod state;
@@ -33,8 +35,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Port to listen on
-    #[arg(long, default_value = "7878")]
+    /// Port to listen on (for `dashboard` and `token`: the daemon to talk to)
+    #[arg(long, default_value = "7878", global = true)]
     port: u16,
 
     /// Tail all running Docker containers
@@ -109,6 +111,12 @@ enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Open the dashboard of a running daemon in the browser with a fresh
+    /// one-time sign-in link (valid 5 minutes, single use)
+    Dashboard(dashboard_cli::DashboardArgs),
+    /// Print the running daemon's API token, for `curl` and scripts:
+    /// `curl -H "Authorization: Bearer $(tailflow-daemon token)" …`
+    Token,
 }
 
 #[derive(Subcommand)]
@@ -242,6 +250,8 @@ async fn run() -> Result<()> {
         Some(Command::Agent {
             action: AgentAction::Ingest,
         }) => return session_cli::ingest_now(&storage_cfg, &privacy_cfg),
+        Some(Command::Dashboard(args)) => return dashboard_cli::open(cli.port, &args),
+        Some(Command::Token) => return dashboard_cli::print_token(cli.port),
         None => {}
     }
 
@@ -254,6 +264,10 @@ async fn run() -> Result<()> {
     let policy = Arc::new(
         CapturePolicy::from_config(&privacy_cfg).context("invalid [privacy] configuration")?,
     );
+
+    // Credentials are fixed before anything is served. An invalid
+    // $TAILFLOW_TOKEN is fatal rather than silently replaced.
+    let auth = Arc::new(auth::Auth::from_env().map_err(anyhow::Error::msg)?);
 
     let (tx, rx) = new_bus();
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
@@ -387,8 +401,10 @@ async fn run() -> Result<()> {
             run_key,
             shutdown: shutdown.clone(),
             agent_ingest: agent_status,
+            auth: auth.clone(),
         },
     );
+    let instance_id = shared.instance_id.clone();
 
     let mut source_tasks = Vec::new();
     for source in sources {
@@ -423,11 +439,65 @@ async fn run() -> Result<()> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr().unwrap_or(addr);
+    auth.set_port(addr.port());
+    // Browser sessions from a previous run on this port stay valid, so open
+    // dashboards reconnect after a restart instead of asking to sign in.
+    if let Some(path) = auth::session_file_for(addr.port()) {
+        auth.attach_session_store(path);
+    }
+    // Local clients (CLI, MCP, scripts) find the token here. Written only
+    // after the port is ours, so it never describes a daemon that lost the
+    // bind race.
+    let runtime_file = auth::runtime_file_for(addr.port());
+    let token_hint = match &runtime_file {
+        Some(path) => {
+            let info = auth::RuntimeInfo {
+                version: auth::RUNTIME_FILE_VERSION,
+                port: addr.port(),
+                pid: std::process::id(),
+                instance_id: instance_id.clone(),
+                url: format!("http://{addr}"),
+                token: auth.token().expose().to_string(),
+                started_at: chrono::Utc::now(),
+            };
+            match auth::write_runtime_file(path, &info) {
+                Ok(()) => {
+                    auth.set_runtime_file(path.clone());
+                    format!("token in {}", path.display())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tailflow-daemon: could not write the runtime file {} ({e}); \
+                         clients need ${}",
+                        path.display(),
+                        auth::TOKEN_ENV
+                    );
+                    format!("clients need ${}", auth::TOKEN_ENV)
+                }
+            }
+        }
+        None => format!("no data directory; clients need ${}", auth::TOKEN_ENV),
+    };
+    let sign_in = auth
+        .mint_code(auth::STARTUP_CODE_TTL)
+        .map(|(code, _)| format!("http://{addr}/auth/login/{code}"))
+        .map_err(anyhow::Error::msg)?;
     info!(%addr, "tailflow-daemon listening");
     eprintln!("TailFlow v{} · daemon", env!("CARGO_PKG_VERSION"));
-    eprintln!("  dashboard   http://{addr}");
+    eprintln!("  dashboard   {sign_in}");
+    eprintln!(
+        "              one-time link, valid {} min · later: tailflow-daemon dashboard{}",
+        auth::STARTUP_CODE_TTL.as_secs() / 60,
+        if addr.port() == 7878 {
+            String::new()
+        } else {
+            format!(" --port {}", addr.port())
+        }
+    );
     eprintln!("  SSE stream  http://{addr}/events");
     eprintln!("  agent API   http://{addr}/api/errors");
+    eprintln!("  access      {token_hint}");
     eprintln!("  history     {storage_line}");
     eprintln!("  privacy     capture = {}", policy.mode.as_str());
     eprintln!("  agents      {agents_line}");
@@ -443,6 +513,10 @@ async fn run() -> Result<()> {
         })
         .await?;
     shutdown.cancel();
+    if let Some(path) = &runtime_file {
+        auth::remove_runtime_file(path, &instance_id);
+    }
+    auth.persist();
     // Agent ingestion stops first: its in-flight pass flushes into a storage
     // that is still running, and unfinished claims go back to the spool.
     if let Some(h) = agent_handle {
