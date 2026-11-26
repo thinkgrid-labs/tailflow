@@ -54,3 +54,7 @@ npm/tailflow/*.tgz
 # Internal engineering reports (milestone audits, readiness, benchmarks).
 # Never committed or published.
 docs/internal/
+
+# Playwright output
+web/test-results/
+web/playwright-report/

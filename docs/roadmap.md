@@ -67,8 +67,13 @@ against the running application.
 - [x] M2 (on `dev`): opt-in Claude Code and Codex hooks; sessions, tool calls,
   command and file events in the existing schema with explicit provenance and
   coverage; `tailflow sessions`; `/api/v1/sessions`.
-- M3 (next): an agent-activity dashboard built on the v1 query and session APIs.
-- Later: filesystem-verified file changes, before/after diffs, more agents.
+- [x] M3 (on `dev`): agent observability dashboard — overview from index
+  aggregates, session explorer, activity search, multi-agent timeline with
+  runtime markers, files and commands views, virtualized live logs.
+- M4 (next): live agent-event streaming to the dashboard, filesystem-verified
+  file changes and before/after diffs, change-impact analysis that goes beyond
+  time proximity, more agents.
+- Later: request and trace correlation, resource usage per session.
 - A human-readable query language (`agent:claude type:file.modified since:24h`)
   compiling to the existing structured filters.
 

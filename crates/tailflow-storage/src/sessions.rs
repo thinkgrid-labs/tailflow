@@ -166,7 +166,34 @@ pub struct SessionQuery {
     pub statuses: Vec<String>,
     /// Sessions with activity at or after this time.
     pub since: Option<DateTime<Utc>>,
+    /// Sessions whose first event is before this time.
+    pub until: Option<DateTime<Utc>>,
+    /// Case-insensitive substring of the session id, project, working
+    /// directory or branch.
+    pub text: Option<String>,
+    /// Resume after this position: a `next_cursor` from a previous page.
+    pub cursor: Option<String>,
     pub limit: usize,
+}
+
+/// Longest accepted `text` filter.
+pub const MAX_TEXT_LEN: usize = 256;
+
+/// A listing position: `(last_event_at µs, session_key)`, rendered as
+/// `<µs>:<key>`. Keys contain `:` themselves, so only the first one splits.
+fn parse_cursor(c: &str) -> Result<(i64, String)> {
+    let (at, key) = c
+        .split_once(':')
+        .ok_or_else(|| invalid("invalid `cursor` (pass `next_cursor` back unchanged)"))?;
+    let at: i64 = at
+        .parse()
+        .map_err(|_| invalid("invalid `cursor` (pass `next_cursor` back unchanged)"))?;
+    if key.is_empty() || key.len() > tailflow_core::event::MAX_ID_LEN {
+        return Err(invalid(
+            "invalid `cursor` (pass `next_cursor` back unchanged)",
+        ));
+    }
+    Ok((at, key.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +218,10 @@ pub struct SessionCounts {
     pub file_events: u64,
     pub subagents: u64,
     pub turns: u64,
+    /// Distinct failed operations: failed tool calls, failed turns, and
+    /// failed commands whose tool call was not itself reported failed (Claude
+    /// Code reports a failing Bash call as both; it counts once here).
+    pub failed_operations: u64,
     /// Sum of reported token counts (Codex `PostModelRequest`). `None`
     /// when the agent reported none — not zero.
     pub tokens_total: Option<u64>,
@@ -252,6 +283,9 @@ pub struct SessionPage {
     pub sessions: Vec<SessionView>,
     /// Sessions whose events have all expired are not listed.
     pub evicted_through_seq: u64,
+    /// More sessions may follow: pass `next_cursor` back as `cursor`.
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 const COLUMNS: &str = "session_key, agent_name, project_id, working_directory, first_seq, last_seq,
@@ -325,12 +359,21 @@ fn u(v: i64) -> u64 {
 }
 
 fn status_of(r: &Row, now_us: i64) -> &'static str {
-    let ended_after_start = r
-        .ended
-        .is_some_and(|e| r.last_started.is_none_or(|s| e >= s));
+    derive_status(r.last_started, r.ended, r.last_at, now_us)
+}
+
+/// The one rule for a session's status, shared by listings and aggregates.
+/// Timestamps are microseconds since the epoch.
+pub(crate) fn derive_status(
+    last_started: Option<i64>,
+    ended: Option<i64>,
+    last_event_at: i64,
+    now_us: i64,
+) -> &'static str {
+    let ended_after_start = ended.is_some_and(|e| last_started.is_none_or(|s| e >= s));
     if ended_after_start {
         "ended"
-    } else if now_us.saturating_sub(r.last_at) <= ACTIVE_WINDOW_SECS * 1_000_000 {
+    } else if now_us.saturating_sub(last_event_at) <= ACTIVE_WINDOW_SECS * 1_000_000 {
         "active"
     } else {
         "unterminated"
@@ -366,8 +409,23 @@ fn session_gaps(c: &Connection, r: &Row, ended: bool, now_us: i64) -> Result<Vec
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Distinct failed operations of one session (see `stats::FAILURE_KEY`):
+/// three `events_type` ranges narrowed to the session's seq span (`+`
+/// keeps the planner off the per-session index), so the cost is
+/// O(failures in that span), not O(session events).
+fn failed_operations(c: &Connection, r: &Row) -> Result<i64> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT count(DISTINCT {}) FROM events
+         WHERE event_type IN {} AND +session_id = ?1 AND seq BETWEEN ?2 AND ?3",
+        crate::stats::FAILURE_KEY,
+        crate::stats::FAILURE_TYPES
+    ))?;
+    Ok(stmt.query_row(params![r.key, r.first_seq, r.last_seq], |x| x.get(0))?)
+}
+
 fn view(c: &Connection, r: Row, evicted: i64, now_us: i64) -> Result<SessionView> {
     let status = status_of(&r, now_us);
+    let failed_ops = failed_operations(c, &r)?;
     let start_observed = r.starts > 0;
     let end_observed = r.ends > 0 && status == "ended";
     let truncated = r.first_seq <= evicted;
@@ -456,6 +514,7 @@ fn view(c: &Connection, r: Row, evicted: i64, now_us: i64) -> Result<SessionView
             file_events: u(file_events),
             subagents: u(subagents),
             turns: u(turns),
+            failed_operations: u(failed_ops),
             tokens_total: r.tokens.map(u),
         },
         first_seq: u(r.first_seq),
@@ -497,6 +556,18 @@ pub fn list(c: &Connection, q: &SessionQuery) -> Result<SessionPage> {
             )));
         }
     }
+    if q.text
+        .as_ref()
+        .is_some_and(|t| t.trim().is_empty() || t.len() > MAX_TEXT_LEN)
+    {
+        return Err(invalid(format!("`q` must be 1..={MAX_TEXT_LEN} bytes")));
+    }
+    if let (Some(s), Some(u)) = (q.since, q.until) {
+        if s >= u {
+            return Err(invalid("`since` must be earlier than `until`"));
+        }
+    }
+    let cursor = q.cursor.as_deref().map(parse_cursor).transpose()?;
     let limit = match q.limit {
         0 => 50,
         n if n > MAX_LIMIT => return Err(invalid(format!("`limit` must be 1..={MAX_LIMIT}"))),
@@ -529,22 +600,52 @@ pub fn list(c: &Connection, q: &SessionQuery) -> Result<SessionPage> {
         args.push(since.timestamp_micros().into());
         sql.push_str(&format!(" AND last_event_at >= ?{}", args.len()));
     }
-    sql.push_str(" ORDER BY last_event_at DESC");
-    // Status is derived, so filter after reading; bound the scan.
+    if let Some(until) = q.until {
+        args.push(until.timestamp_micros().into());
+        sql.push_str(&format!(" AND first_event_at < ?{}", args.len()));
+    }
+    if let Some(text) = &q.text {
+        // SQLite's `lower()` folds ASCII only; fold the needle the same way.
+        args.push(text.trim().to_ascii_lowercase().into());
+        sql.push_str(&format!(
+            " AND instr(lower(session_key || ' ' || coalesce(project_id, '') || ' ' \
+             || coalesce(working_directory, '') || ' ' || coalesce(git_branch, '')), ?{}) > 0",
+            args.len()
+        ));
+    }
+    if let Some((at, key)) = &cursor {
+        args.push((*at).into());
+        let a = args.len();
+        args.push(key.clone().into());
+        let k = args.len();
+        sql.push_str(&format!(
+            " AND (last_event_at < ?{a} OR (last_event_at = ?{a} AND session_key < ?{k}))"
+        ));
+    }
+    sql.push_str(" ORDER BY last_event_at DESC, session_key DESC");
+    // Status is derived, so filter after reading; bound the scan. One extra
+    // row tells whether anything follows the scanned range.
     let scan = if q.statuses.is_empty() {
         limit
     } else {
         limit.saturating_mul(20).min(10_000)
     };
-    sql.push_str(&format!(" LIMIT {scan}"));
+    sql.push_str(&format!(" LIMIT {}", scan.saturating_add(1)));
     let now = Utc::now().timestamp_micros();
-    let rows: Vec<Row> = {
+    let mut rows: Vec<Row> = {
         let mut stmt = c.prepare(&sql)?;
         let it = stmt.query_map(rusqlite::params_from_iter(args.iter()), row)?;
         it.collect::<rusqlite::Result<_>>()?
     };
+    let more_rows = rows.len() > scan;
+    rows.truncate(scan);
+    let total_rows = rows.len();
     let mut sessions = Vec::new();
+    let mut last_examined: Option<(i64, String)> = None;
+    let mut examined = 0usize;
     for r in rows {
+        examined += 1;
+        last_examined = Some((r.last_at, r.key.clone()));
         if !q.statuses.is_empty() && !q.statuses.iter().any(|s| s == status_of(&r, now)) {
             continue;
         }
@@ -553,9 +654,16 @@ pub fn list(c: &Connection, q: &SessionQuery) -> Result<SessionPage> {
             break;
         }
     }
+    // More may follow when rows remain after the last one examined, either
+    // in this scan or beyond it.
+    let has_more = more_rows || examined < total_rows;
     Ok(SessionPage {
         sessions,
         evicted_through_seq: u(evicted),
+        has_more,
+        next_cursor: has_more
+            .then(|| last_examined.map(|(at, key)| format!("{at}:{key}")))
+            .flatten(),
     })
 }
 

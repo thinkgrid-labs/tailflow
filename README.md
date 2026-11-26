@@ -82,6 +82,7 @@ merged on `dev` and ships in the next version.
 | **Secret redaction** | Common credential formats are redacted before display and storage | Next release |
 | **Loss reporting** | Every history response says whether it is complete; dropped events are recorded, not hidden | Next release |
 | **Agent capture** | Opt-in Claude Code and Codex hooks record sessions, tool calls, commands and reported file edits; `tailflow sessions` / `tailflow session <id>` | Next release |
+| **Agent observability dashboard** | Overview, session explorer, searchable activity, a multi-agent timeline next to runtime errors, files and commands views, and a virtualized live log view — all local, read-only and honest about what was not observed ([guide](docs/dashboard.md)) | Next release |
 | **Lightweight Rust binaries** | Prebuilt binaries via npm or GitHub releases; no Rust toolchain or database server to install | Released |
 
 The [feature guide](docs/features.md) explains each capability and what its
@@ -157,10 +158,14 @@ configuration, Docker and file sources, custom ports, and troubleshooting.
 ## Dashboard preview
 
 <p align="center">
-  <img src="assets/screenshots/tailflow-dashboard.png" width="100%" alt="TailFlow web dashboard showing a live timeline from three demo services, web, api, and worker, with severity labels, grouped sources in the sidebar, repeated postgres connection errors, and a bearer token shown as [REDACTED:jwt].">
+  <img src="assets/screenshots/tailflow-overview.png" width="100%" alt="TailFlow dashboard overview: stat cards for active sessions, sessions, tool calls, commands, reported file changes, failed operations, events ingested and integrations; an activity histogram; a recent-failures list mixing agent command failures and runtime connection-refused errors; and Claude Code and Codex cards with their coverage limits.">
 </p>
 
-<sub>Captured from a local build of <code>dev</code> with synthetic demo services. The bearer token in the <code>api</code> stream was redacted automatically.</sub>
+<p align="center">
+  <img src="assets/screenshots/tailflow-timeline.png" width="100%" alt="TailFlow multi-agent timeline: Claude Code and Codex lanes with session bars over their observed spans, tool and command intervals, failure markers in red, point events as diamonds, and a runtime lane with error markers.">
+</p>
+
+<sub>Captured from a local build with the synthetic end-to-end fixture: two Claude Code and two Codex sessions, one session joined mid-way, failing tests, and a runtime source logging connection errors. Next release; see the <a href="docs/dashboard.md">dashboard guide</a>.</sub>
 
 ## Privacy and resource use
 
@@ -203,12 +208,12 @@ privacy, and exactly what each integration can and cannot see.
 **Implemented:** runtime collection across processes, Docker, files, and stdin;
 MCP and shell access; error grouping; server-side waits; dashboard and TUI;
 guided setup; and, on `dev`, durable SQLite history with retention, redaction,
-and loss reporting, plus opt-in Claude Code and Codex activity capture with
-session tracking.
+and loss reporting, opt-in Claude Code and Codex activity capture with
+session tracking, and an agent observability dashboard (sessions, activity
+search, multi-agent timeline, files and commands) on top of it.
 
 **Next:**
 
-- An agent activity view in the dashboard, built on the history and session APIs
 - A readable query language, such as `agent:claude type:file.modified since:24h`
 - “What is failing now that was not failing before?” comparisons against a baseline
 - Docker Compose–aware source discovery and container filters

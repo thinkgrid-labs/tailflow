@@ -4,7 +4,7 @@ use axum::{
         rejection::QueryRejection, DefaultBodyLimit, FromRequestParts, Query as AxumQuery, Request,
         State,
     },
-    http::{header, request::Parts, StatusCode, Uri},
+    http::{header, request::Parts, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -151,6 +151,9 @@ struct FilterParams {
     grep: Option<String>,
     /// Substring matched against `record.source`.
     source: Option<String>,
+    /// `/api/records` only: records with a ring seq above this. Lets a
+    /// reconnecting dashboard catch up without re-reading the whole ring.
+    after: Option<u64>,
 }
 
 impl FilterParams {
@@ -247,7 +250,12 @@ async fn records_handler(
     // Human-facing: no elision, no dedup — the dashboard renders raw lines.
     // Serialized straight from the shared ring entries: no per-request copy
     // of every retained payload.
-    Json(SharedRecords(state.store.snapshot(&params.into_filter())))
+    let after = params.after;
+    let mut records = state.store.snapshot(&params.into_filter());
+    if let Some(after) = after {
+        records.retain(|r| r.seq > after);
+    }
+    Json(SharedRecords(records))
 }
 
 /// Serializes shared ring entries exactly as `Vec<SeqRecord>` would.
@@ -283,6 +291,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             // `storage.loss_detected` before treating history as complete.
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
+            "instance_id": state.instance_id,
             "buffered": state.store.len(),
             "buffered_bytes": state.store.retained_bytes(),
             "cursor": state.store.cursor(),
@@ -649,7 +658,7 @@ async fn static_handler(uri: Uri) -> Response {
     // Default to index.html for the root
     let path = if raw.is_empty() { "index.html" } else { raw };
 
-    match WebAssets::get(path) {
+    let mut response = match WebAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
@@ -665,8 +674,29 @@ async fn static_handler(uri: Uri) -> Response {
             )
                 .into_response(),
         },
+    };
+    let headers = response.headers_mut();
+    for (name, value) in UI_SECURITY_HEADERS {
+        headers.insert(name, HeaderValue::from_static(value));
     }
+    response
 }
+
+/// Headers on every UI response. The dashboard renders untrusted text (log
+/// lines, agent metadata): the CSP admits only this origin's own scripts
+/// and styles, so an injection bug cannot run code or load anything remote,
+/// and the page cannot be framed by another site.
+const UI_SECURITY_HEADERS: [(header::HeaderName, &str); 4] = [
+    (
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+         connect-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'",
+    ),
+    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    (header::REFERRER_POLICY, "no-referrer"),
+    (header::X_FRAME_OPTIONS, "DENY"),
+];
 
 #[cfg(test)]
 mod tests {

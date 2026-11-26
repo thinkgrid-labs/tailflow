@@ -117,6 +117,9 @@ pub struct AppState {
     /// ever stopping.
     pub shutdown: CancellationToken,
     pub agent_ingest: crate::agent_ingest::SharedStatus,
+    /// Identifies this daemon process. The live ring's `seq` restarts with
+    /// every process, so a client compares this before resuming a cursor.
+    pub instance_id: String,
     sources: Mutex<HashMap<String, RuntimeSource>>,
     collectors: Arc<Mutex<HashMap<String, CollectorCounters>>>,
 }
@@ -231,6 +234,7 @@ impl AppState {
             ingest: Arc::new(IngestStats::default()),
             shutdown,
             agent_ingest,
+            instance_id: format!("{}-{}", std::process::id(), Utc::now().timestamp_micros()),
             sources: Mutex::new(HashMap::new()),
             collectors: Arc::new(Mutex::new(HashMap::new())),
         });

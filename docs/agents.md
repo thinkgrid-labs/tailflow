@@ -342,9 +342,15 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.3.3", "buffered": 125, "cursor": 125,
+{ "ok": true, "version": "0.3.3", "instance_id": "4821-1795612684232685",
+  "buffered": 125, "cursor": 125,
   "ingest_dropped": 0, "storage": { "state": "ok", "loss_detected": false } }
 ```
+
+`instance_id` identifies the daemon process: the ring's `seq` (and every
+cursor) restarts with each process, so a client that sees a different
+`instance_id` must discard its cursor. `GET /api/records?after=<seq>` returns
+the retained live records after a seq, for incremental catch-up.
 
 `ok` means the daemon is serving. `ingest_dropped` (also present on
 `/api/query`, `/api/errors`, `/api/wait`, and `/api/sources`) counts records the
