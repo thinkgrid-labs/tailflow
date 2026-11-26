@@ -306,7 +306,8 @@ API token (`Authorization: Bearer …`) or a dashboard session; see
 | `severity` | Minimum: `trace`, `debug`, `info`, `warn`, `error` |
 | `status` | `started`, `succeeded`, `failed`, `cancelled` |
 | `path` / `path_prefix` | Glob (`**` crosses `/`, `*` does not) or prefix |
-| `command` | Substring of `attributes.command` |
+| `program` | Exact program of agent command events (`cargo`, `npm`) |
+| `command` | **Deprecated** (removal planned for 0.5): substring of `attributes.command`, which agent command events do not set. Responses carry `Deprecation: true` and `X-TailFlow-Warning`; use `program` |
 | `q` | Full-text terms, all required; `term*` matches a prefix |
 | `since`, `until` | RFC 3339 or relative (`30s`, `5m`, `2h`, `7d`) |
 | `after` / `before` | Cursor: pass `next_cursor` back (`after` for `order=asc`, `before` for `desc`) |

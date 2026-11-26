@@ -7,7 +7,7 @@ The daemon serves a local dashboard at `http://127.0.0.1:7878` (or the port
 you pass with `--port`). Sign in once per browser with the one-time link the
 daemon prints at startup, or run `tailflow-daemon dashboard` to open the
 browser with a fresh link (see [security](security.md)). The session
-survives daemon restarts on the same port. It shows what your coding agents did, what your
+survives a daemon restart on the same port within 15 minutes. It shows what your coding agents did, what your
 running stack logged, and how the two line up in time. It talks only to the
 daemon that served it, through read-only endpoints, and loads nothing from
 the internet.
