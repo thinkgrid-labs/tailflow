@@ -64,6 +64,8 @@ pub struct Pipeline {
     pub agent_ingest: crate::agent_ingest::SharedStatus,
     /// API token, browser sessions and sign-in codes for this run.
     pub auth: Arc<crate::auth::Auth>,
+    /// Filesystem/Git observation status (`[observe]`).
+    pub observe: crate::observe::Shared,
 }
 
 /// Loss and throughput at the live ingestion point. These cover the ring,
@@ -122,6 +124,7 @@ pub struct AppState {
     /// Access control: every route except the static UI shell, `/health`
     /// and the sign-in link requires a credential (see `auth.rs`).
     pub auth: Arc<crate::auth::Auth>,
+    pub observe: crate::observe::Shared,
     /// Live feed of committed agent events (`/api/v1/stream/agent`);
     /// `None` without durable storage.
     pub agent_feed: Option<Arc<crate::agent_stream::AgentFeed>>,
@@ -214,6 +217,7 @@ impl AppState {
                 shutdown: CancellationToken::new(),
                 agent_ingest: crate::agent_ingest::disabled("memory-only state"),
                 auth: Arc::new(crate::auth::Auth::generate()),
+                observe: crate::observe::disabled("memory-only state"),
             },
         )
         .0
@@ -235,6 +239,7 @@ impl AppState {
             shutdown,
             agent_ingest,
             auth,
+            observe,
         } = pipeline;
         let agent_feed = storage
             .storage()
@@ -249,6 +254,7 @@ impl AppState {
             shutdown,
             agent_ingest,
             auth,
+            observe,
             instance_id: format!("{}-{}", std::process::id(), Utc::now().timestamp_micros()),
             sources: Mutex::new(HashMap::new()),
             collectors: Arc::new(Mutex::new(HashMap::new())),

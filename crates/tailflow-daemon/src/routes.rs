@@ -1641,6 +1641,10 @@ mod tests {
         "/api/v1/stats",
         "/api/v1/files",
         "/api/v1/auth/session",
+        "/api/v1/stream/agent",
+        "/api/v1/observe/status",
+        "/api/v1/evidence/files",
+        "/api/v1/sessions/claude-code:x/changes",
         "/api/v1/not-a-route",
         "/some/unknown/path",
     ];
