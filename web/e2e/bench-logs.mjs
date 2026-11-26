@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { chromium } from '@playwright/test'
+import { E2E_TOKEN, authHeaders } from './fixture.mjs'
 
 const [bin, loadgen, rateS = '200', secondsS = '20'] = process.argv.slice(2)
 const flag = n => process.argv.includes(`--${n}`)
@@ -34,11 +35,12 @@ const extra = big ? ' big=10:2000' : ''
 fs.writeFileSync(path.join(dir, 'tailflow.toml'),
   `[[sources.process]]\nlabel = "gen"\ncmd = "${loadgen} ${rate} ${genSecs}${extra}"\n\n[storage]\nenabled = false\n`)
 const daemon = spawn(bin, ['--config', path.join(dir, 'tailflow.toml'), '--port', String(port)],
-  { stdio: 'ignore', env: { ...process.env, RUST_LOG: 'error', TAILFLOW_DATA_DIR: path.join(dir, 'data') } })
+  { stdio: 'ignore', env: { ...process.env, RUST_LOG: 'error', TAILFLOW_DATA_DIR: path.join(dir, 'data'), TAILFLOW_TOKEN: E2E_TOKEN } })
 const base = `http://127.0.0.1:${port}`
-for (let i = 0; i < 300; i++) { try { if ((await fetch(`${base}/health`)).ok) break } catch {} await sleep(50) }
+// From M4 the API needs a credential (older daemons ignore the header).
+for (let i = 0; i < 300; i++) { try { if ((await fetch(`${base}/health`, { headers: authHeaders })).ok) break } catch {} await sleep(50) }
 for (let i = 0; i < 1200; i++) {
-  const h = await (await fetch(`${base}/health`)).json()
+  const h = await (await fetch(`${base}/health`, { headers: authHeaders })).json()
   if (h.buffered >= rows) break
   await sleep(100)
 }
@@ -56,6 +58,9 @@ const cdp = await page.context().newCDPSession(page)
 await cdp.send('Performance.enable')
 const metrics = async () => Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(m => [m.name, m.value]))
 
+// M4 daemons: sign the browser in with a one-time link (pre-M4: no auth).
+const link = await fetch(`${base}/api/v1/auth/login-links`, { method: 'POST', headers: authHeaders })
+if (link.ok) await page.goto(`${base}${(await link.json()).path}`)
 const t0 = Date.now()
 if (ui === 'legacy') {
   await page.goto(`${base}/`)
