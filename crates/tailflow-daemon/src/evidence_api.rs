@@ -161,6 +161,14 @@ fn snapshot_from_event(e: &StoredEvent) -> Option<(SnapshotRef, Snapshot)> {
         .get("git.changes_complete")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Format 2 lists a sorted prefix cut at `git.changes_listed_through`
+    // (paths withheld by privacy are left out of every snapshot alike).
+    // Older snapshots: treat an incomplete list as cut.
+    let cut = if a.get("git.list_format").and_then(Value::as_u64) >= Some(2) {
+        a.contains_key("git.changes_listed_through")
+    } else {
+        !complete
+    };
     let mut changes = Vec::new();
     for item in a
         .get("git.changes")
@@ -211,11 +219,12 @@ fn snapshot_from_event(e: &StoredEvent) -> Option<(SnapshotRef, Snapshot)> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         total_changes: usize::try_from(total).unwrap_or(usize::MAX),
-        truncated: !complete,
+        truncated: cut,
         changes,
         numstat_missing: a.get("git.numstat_missing").is_some(),
         counts: Counts::default(),
         took_ms: 0,
+        filters_disabled: Vec::new(),
     };
     Some((r, snap))
 }
@@ -288,14 +297,16 @@ fn compute_changes(storage: &Storage, id: &str) -> Result<Option<Value>, V1Error
                 storage,
                 snap_q(
                     Vec::new(),
-                    end.map(|e| e + chrono::Duration::seconds(5)),
+                    // A change-triggered snapshot follows the last write
+                    // after a quiet period and the minimum interval.
+                    end.map(|e| e + chrono::Duration::seconds(60)),
                     Order::Desc,
                 ),
             )?;
             if sv.status == "active" {
                 limitations.push("The session is still active; compared with the latest snapshot.");
             } else {
-                limitations.push("No snapshot was taken when the session ended; compared with the latest snapshot before its last event.");
+                limitations.push("No snapshot was taken when the session ended; compared with the latest snapshot up to 60 s after its last event, which may include later changes by others.");
             }
             latest.into_iter().next()
         }

@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +33,9 @@ const SNAPSHOT_ATTR_BYTES: usize = 11 * 1024;
 /// File changes must be quiet this long before a change-triggered snapshot.
 const GIT_QUIET: Duration = Duration::from_secs(2);
 const CLAIM_RETRY: Duration = Duration::from_secs(60);
+/// How often a running observer checks that its coverage claim is still
+/// open (another daemon closes it when it declares this run dead).
+const CLAIM_CHECK: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RootStatus {
@@ -110,19 +114,37 @@ enum GitMsg {
     Stop,
 }
 
+/// Messages queued for the Git thread. `Changed` is sent at most once per
+/// repository until the Git thread has taken it (a per-repository flag),
+/// so a burst of file changes cannot grow the queue.
+const GIT_QUEUE: usize = 1024;
+
+/// The Git nudge of one repository: the repository and its "a `Changed`
+/// is queued" flag.
+#[derive(Clone)]
+struct GitNudge {
+    repo: PathBuf,
+    queued: Arc<AtomicBool>,
+    tx: mpsc::SyncSender<GitMsg>,
+}
+
 /// Writes observations and loss to storage; nudges the Git thread.
 struct StorageSink {
     storage: Storage,
     coverage: Arc<Mutex<Option<i64>>>,
-    git_repo: Option<PathBuf>,
-    git_tx: Option<mpsc::Sender<GitMsg>>,
+    git: Option<GitNudge>,
 }
 
 impl observe::Sink for StorageSink {
     fn observed(&self, event: ObservabilityEvent) {
         let _counted_in_storage_health = self.storage.submit(event);
-        if let (Some(tx), Some(repo)) = (&self.git_tx, &self.git_repo) {
-            let _git_thread_may_be_gone = tx.send(GitMsg::Changed(repo.clone()));
+        if let Some(g) = &self.git {
+            if !g.queued.swap(true, Ordering::AcqRel)
+                && g.tx.try_send(GitMsg::Changed(g.repo.clone())).is_err()
+            {
+                // Queue full or the Git thread is gone: allow a later try.
+                g.queued.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -218,6 +240,8 @@ pub fn spawn(
 struct Running {
     observer: observe::Observer,
     coverage: Arc<Mutex<Option<i64>>>,
+    id: i64,
+    checked: Instant,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -254,15 +278,35 @@ fn supervise(
             })
             .collect();
     }
+    let mut flags: HashMap<PathBuf, Arc<AtomicBool>> = HashMap::new();
     let (git_tx, git_thread) = match &git_bin {
         Some(bin) => {
             let mut repos: Vec<PathBuf> = repo_of.iter().flatten().cloned().collect();
             repos.sort();
             repos.dedup();
-            let (tx, rx) = mpsc::channel::<GitMsg>();
+            // Each repository's snapshot lists only paths under the roots
+            // observed in it: a configured subdirectory does not expose the
+            // rest of the repository.
+            let scope: HashMap<PathBuf, Vec<Root>> = repos
+                .iter()
+                .map(|repo| {
+                    let rs = roots
+                        .iter()
+                        .zip(&repo_of)
+                        .filter(|(_, g)| g.as_deref() == Some(repo.as_path()))
+                        .map(|(r, _)| r.clone())
+                        .collect();
+                    (repo.clone(), rs)
+                })
+                .collect();
+            for repo in &repos {
+                flags.insert(repo.clone(), Arc::new(AtomicBool::new(false)));
+            }
+            let (tx, rx) = mpsc::sync_channel::<GitMsg>(GIT_QUEUE);
             let t = spawn_git(
                 bin.clone(),
-                repos.clone(),
+                scope,
+                flags.clone(),
                 &cfg,
                 storage.clone(),
                 status.clone(),
@@ -326,8 +370,14 @@ fn supervise(
             let sink = StorageSink {
                 storage: storage.clone(),
                 coverage: coverage.clone(),
-                git_repo: repo_of.get(i).cloned().flatten(),
-                git_tx: git_tx.clone(),
+                git: match (&git_tx, repo_of.get(i).cloned().flatten()) {
+                    (Some(tx), Some(repo)) => flags.get(&repo).map(|q| GitNudge {
+                        queued: q.clone(),
+                        repo,
+                        tx: tx.clone(),
+                    }),
+                    _ => None,
+                },
             };
             let opts = observe::Options {
                 coalesce: Duration::from_millis(cfg.coalesce_ms),
@@ -344,7 +394,9 @@ fn supervise(
                         .stats
                         .unwatched_dirs
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if let Err(e) = storage.coverage_update(id, w, u) {
+                    // Coverage starts once the watches are in place, not at
+                    // the claim (the directory walk may take a while).
+                    if let Err(e) = storage.coverage_ready(id, w, u) {
                         tracing::warn!(err = %e, "coverage update failed");
                     }
                     if u > 0 {
@@ -360,7 +412,12 @@ fn supervise(
                         r.detail = None;
                     });
                     if let Some(slot) = running.get_mut(i) {
-                        *slot = Some(Running { observer, coverage });
+                        *slot = Some(Running {
+                            observer,
+                            coverage,
+                            id,
+                            checked: Instant::now(),
+                        });
                     }
                 }
                 Err(e) => {
@@ -370,6 +427,34 @@ fn supervise(
                         r.detail = Some(format!("watcher could not start: {e}"));
                     });
                 }
+            }
+        }
+        // A claim closed by another daemon (it judged this run dead, for
+        // example after a long sleep): stop, then re-claim at once.
+        for (i, slot) in running.iter_mut().enumerate() {
+            let Some(run) = slot.as_mut() else { continue };
+            if run.checked.elapsed() < CLAIM_CHECK {
+                continue;
+            }
+            run.checked = Instant::now();
+            if !matches!(storage.coverage_is_open(run.id), Ok(false)) {
+                continue;
+            }
+            if let Some(run) = slot.take() {
+                run.observer.stop();
+                lock(&run.coverage).take();
+            }
+            eprintln!(
+                "tailflow-daemon: [observe] {}: observation claim was closed by another daemon; re-claiming",
+                roots.get(i).map_or_else(String::new, |r| r.display.display().to_string())
+            );
+            set_root(status, i, |r| {
+                r.state = "waiting";
+                r.detail =
+                    Some("observation claim was closed by another daemon; re-claiming".into());
+            });
+            if let Some(t) = next_try.get_mut(i) {
+                *t = Instant::now();
             }
         }
         // Session boundaries in observed repositories trigger snapshots.
@@ -431,7 +516,7 @@ fn session_boundaries(
     storage: &Storage,
     cursor: u64,
     repos: &[Option<PathBuf>],
-    tx: &mpsc::Sender<GitMsg>,
+    tx: &mpsc::SyncSender<GitMsg>,
 ) -> u64 {
     let q = EventQuery {
         event_types: vec!["agent.session.started".into(), "agent.session.ended".into()],
@@ -485,13 +570,16 @@ struct RepoState {
 
 fn spawn_git(
     bin: PathBuf,
-    repos: Vec<PathBuf>,
+    scope: HashMap<PathBuf, Vec<Root>>,
+    flags: HashMap<PathBuf, Arc<AtomicBool>>,
     cfg: &ObserveConfig,
     storage: Storage,
     status: Shared,
     rx: mpsc::Receiver<GitMsg>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let min_interval = Duration::from_secs(cfg.git_min_interval_secs);
+    let mut repos: Vec<PathBuf> = scope.keys().cloned().collect();
+    repos.sort();
     {
         let mut s = lock(&status);
         s.repos = repos
@@ -524,6 +612,9 @@ fn spawn_git(
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(GitMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Ok(GitMsg::Changed(repo)) => {
+                        if let Some(q) = flags.get(&repo) {
+                            q.store(false, Ordering::Release);
+                        }
                         if let Some(st) = state.get_mut(&repo) {
                             st.dirty_since.get_or_insert_with(Instant::now);
                             st.last_change = Some(Instant::now());
@@ -535,9 +626,11 @@ fn spawn_git(
                         session,
                     }) => {
                         if let Some(st) = state.get_mut(&repo) {
+                            let roots = scope.get(&repo).map_or(&[][..], Vec::as_slice);
                             take(
                                 &bin,
                                 &repo,
+                                roots,
                                 st,
                                 trigger,
                                 session.as_deref(),
@@ -565,7 +658,8 @@ fn spawn_git(
                     .collect();
                 for repo in due {
                     if let Some(st) = state.get_mut(&repo) {
-                        take(&bin, &repo, st, "fs_change", None, &storage, &status);
+                        let roots = scope.get(&repo).map_or(&[][..], Vec::as_slice);
+                        take(&bin, &repo, roots, st, "fs_change", None, &storage, &status);
                     }
                 }
             }
@@ -573,9 +667,11 @@ fn spawn_git(
         .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn take(
     bin: &Path,
     repo: &Path,
+    roots: &[Root],
     st: &mut RepoState,
     trigger: &'static str,
     session: Option<&str>,
@@ -608,6 +704,7 @@ fn take(
     }
     let event = snapshot_event(
         &snap,
+        roots,
         storage,
         trigger,
         session,
@@ -630,6 +727,7 @@ fn take(
 
 fn snapshot_event(
     snap: &git::Snapshot,
+    roots: &[Root],
     storage: &Storage,
     trigger: &str,
     session: Option<&str>,
@@ -649,11 +747,12 @@ fn snapshot_event(
     e.severity = tailflow_core::LogLevel::Info;
     e.session_id = session.map(str::to_string);
     let policy = storage.policy();
-    // Changed paths, bounded and held to the privacy boundaries.
-    let mut list = Vec::new();
-    let mut bytes = 0usize;
-    let mut withheld = 0u64;
-    for c in &snap.changes {
+    let in_scope = |p: &Path| {
+        roots
+            .iter()
+            .any(|r| p.starts_with(&r.display) || p.starts_with(&r.canonical))
+    };
+    let admitted = |p: &Path| {
         let mut probe = ObservabilityEvent::new(
             "probe",
             "file.modified",
@@ -662,13 +761,33 @@ fn snapshot_event(
             "git",
             Utc::now(),
         );
-        probe.path = Some(snap.worktree_root.join(&c.path).display().to_string());
-        if policy.admit(&probe).is_err() {
+        probe.path = Some(p.display().to_string());
+        policy.admit(&probe).is_ok()
+    };
+    // Changed paths under the observed roots, held to the privacy
+    // boundaries. The list is a prefix of the path-sorted changes: at the
+    // count or byte cap it stops (it never skips one path and lists a
+    // later one), so two snapshots can be compared up to the shorter
+    // prefix.
+    let mut list = Vec::new();
+    let mut bytes = 0usize;
+    let mut withheld = 0u64;
+    let mut outside = 0u64;
+    let mut cut = false;
+    for c in &snap.changes {
+        let abs = snap.worktree_root.join(&c.path);
+        if !in_scope(&abs) {
+            outside += 1;
+            continue;
+        }
+        let from_abs = c.from.as_ref().map(|f| snap.worktree_root.join(f));
+        if !admitted(&abs) || from_abs.as_deref().is_some_and(|f| !admitted(f)) {
             withheld += 1;
             continue;
         }
         if list.len() >= SNAPSHOT_ATTR_CHANGES {
-            continue;
+            cut = true;
+            break;
         }
         let mut item = json!({ "p": c.path, "s": c.status });
         if c.staged {
@@ -677,8 +796,12 @@ fn snapshot_event(
         if c.unstaged {
             item["y"] = Value::Bool(true);
         }
-        if let Some(f) = &c.from {
-            item["from"] = Value::from(f.clone());
+        // A rename from outside the observed roots keeps its status but
+        // not the source path.
+        if let (Some(f), Some(fa)) = (&c.from, &from_abs) {
+            if in_scope(fa) {
+                item["from"] = Value::from(f.clone());
+            }
         }
         if let Some(n) = c.size {
             item["size"] = Value::from(n);
@@ -693,12 +816,22 @@ fn snapshot_event(
             item["del"] = Value::from(n);
         }
         let len = item.to_string().len();
-        if bytes + len > SNAPSHOT_ATTR_BYTES {
-            continue;
+        if bytes.saturating_add(len) > SNAPSHOT_ATTR_BYTES {
+            cut = true;
+            break;
         }
-        bytes += len;
+        bytes = bytes.saturating_add(len);
         list.push(item);
     }
+    // Paths are known only up to this one when the list is cut here or
+    // the snapshot itself was truncated.
+    let listed_through = (cut || snap.truncated).then(|| {
+        list.last()
+            .and_then(|i| i.get("p"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
     let listed = list.len();
     let a = &mut e.attributes;
     a.insert("git.root".into(), Value::from(root.clone()));
@@ -718,10 +851,26 @@ fn snapshot_event(
         Value::from(snap.total_changes as u64),
     );
     a.insert("git.changes_listed".into(), Value::from(listed as u64));
+    a.insert("git.list_format".into(), Value::from(2u64));
     a.insert(
         "git.changes_complete".into(),
-        Value::Bool(!snap.truncated && listed as u64 + withheld == snap.total_changes as u64),
+        Value::Bool(listed_through.is_none() && withheld == 0),
     );
+    if let Some(p) = listed_through {
+        a.insert("git.changes_listed_through".into(), Value::from(p));
+    }
+    if outside > 0 {
+        a.insert(
+            "git.changes_outside_observed_roots".into(),
+            Value::from(outside),
+        );
+    }
+    if !snap.filters_disabled.is_empty() {
+        a.insert(
+            "git.filters_disabled".into(),
+            Value::from(snap.filters_disabled.clone()),
+        );
+    }
     if withheld > 0 {
         a.insert(
             "git.changes_withheld_by_privacy".into(),
@@ -815,4 +964,123 @@ fn head_transition(
     // Observed between two snapshots: who moved HEAD is unknown.
     a.insert("git.observed_between_snapshots".into(), Value::Bool(true));
     Some(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tailflow_core::config::StorageConfig;
+    use tailflow_core::privacy::{CapturePolicy, PrivacyConfig};
+    use tailflow_storage::OpenOptions;
+
+    fn storage(dir: &Path, privacy: &PrivacyConfig) -> Storage {
+        Storage::open(
+            &StorageConfig {
+                path: Some(dir.join("events.db")),
+                ..StorageConfig::default()
+            },
+            OpenOptions {
+                project_id: None,
+                version: "test".into(),
+                policy: Arc::new(CapturePolicy::from_config(privacy).unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
+    fn change(path: &str, from: Option<&str>) -> git::Change {
+        git::Change {
+            path: path.into(),
+            status: if from.is_some() {
+                "renamed"
+            } else {
+                "modified"
+            },
+            staged: false,
+            unstaged: true,
+            from: from.map(str::to_string),
+            size: None,
+            mtime_ns: None,
+            lines_added: None,
+            lines_deleted: None,
+        }
+    }
+
+    fn snap(root: &Path, changes: Vec<git::Change>) -> git::Snapshot {
+        git::Snapshot {
+            worktree_root: root.to_path_buf(),
+            head: None,
+            branch: None,
+            detached: false,
+            total_changes: changes.len(),
+            changes,
+            truncated: false,
+            numstat_missing: false,
+            counts: git::Counts::default(),
+            took_ms: 0,
+            filters_disabled: vec!["lfs".into()],
+        }
+    }
+
+    fn root(p: PathBuf) -> Root {
+        Root {
+            canonical: p.clone(),
+            display: p,
+        }
+    }
+
+    #[test]
+    fn snapshots_list_only_observed_roots_and_admitted_rename_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let privacy = PrivacyConfig {
+            excluded_file_globs: vec!["**/secret/**".into()],
+            ..PrivacyConfig::default()
+        };
+        let st = storage(dir.path(), &privacy);
+        let s = snap(
+            &repo,
+            vec![
+                change("app/a.rs", None),
+                change("app/b.rs", Some("secret/key.rs")),
+                change("app/c.rs", Some("other/c.rs")),
+                change("other/x.rs", None),
+            ],
+        );
+        let e = snapshot_event(&s, &[root(repo.join("app"))], &st, "startup", None, "id");
+        let a = &e.attributes;
+        let listed: Vec<&str> = a["git.changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["p"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, ["app/a.rs", "app/c.rs"], "{a:?}");
+        // A rename from outside the observed roots keeps no source path.
+        assert!(a["git.changes"][1].get("from").is_none(), "{a:?}");
+        assert_eq!(a["git.changes_withheld_by_privacy"], 1);
+        assert_eq!(a["git.changes_outside_observed_roots"], 1);
+        assert_eq!(a["git.filters_disabled"], serde_json::json!(["lfs"]));
+        assert!(a.get("git.changes_listed_through").is_none());
+        assert_eq!(a["git.list_format"], 2);
+    }
+
+    #[test]
+    fn a_capped_snapshot_lists_a_sorted_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let st = storage(dir.path(), &PrivacyConfig::default());
+        let changes: Vec<git::Change> = (0..SNAPSHOT_ATTR_CHANGES + 5)
+            .map(|i| change(&format!("f{i:05}.rs"), None))
+            .collect();
+        let s = snap(&repo, changes);
+        let e = snapshot_event(&s, &[root(repo.clone())], &st, "startup", None, "id");
+        let a = &e.attributes;
+        let list = a["git.changes"].as_array().unwrap();
+        assert_eq!(list.len(), SNAPSHOT_ATTR_CHANGES);
+        let last = format!("f{:05}.rs", SNAPSHOT_ATTR_CHANGES - 1);
+        assert_eq!(list.last().unwrap()["p"], last.as_str());
+        assert_eq!(a["git.changes_listed_through"], last.as_str());
+        assert_eq!(a["git.changes_complete"], false);
+    }
 }

@@ -23,6 +23,11 @@ pub const SCHEMA_VERSION: i32 = 4;
 /// How long a connection waits on a lock held by another connection or
 /// process before reporting `SQLITE_BUSY`.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a process waits for the write lock while a schema migration is
+/// pending. Another process may be applying the same migration (an index
+/// build over millions of rows takes seconds to minutes); failing after
+/// [`BUSY_TIMEOUT`] would turn a slow upgrade into a failed start.
+pub const MIGRATION_BUSY_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct Migration {
     pub version: i32,
@@ -377,8 +382,23 @@ fn create_private_file(path: &Path) -> std::io::Result<()> {
 /// apply the same migration.
 pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<i32> {
     let mut current: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if migrations.iter().all(|m| m.version <= current) {
+        return Ok(current);
+    }
+    conn.busy_timeout(MIGRATION_BUSY_TIMEOUT)?;
+    let result = migrate_pending(conn, migrations, &mut current);
+    // Back to the normal wait on every exit path.
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    result.map(|()| current)
+}
+
+fn migrate_pending(
+    conn: &mut Connection,
+    migrations: &[Migration],
+    current: &mut i32,
+) -> Result<()> {
     for m in migrations {
-        if m.version <= current {
+        if m.version <= *current {
             continue;
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -386,7 +406,7 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
         if now >= m.version {
             // Another process applied it while we waited for the lock.
             tx.commit()?;
-            current = now;
+            *current = now;
             continue;
         }
         // Index builds scan the whole table once; on a multi-gigabyte
@@ -428,9 +448,9 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
                 started.elapsed().as_secs_f64()
             );
         }
-        current = m.version;
+        *current = m.version;
     }
-    Ok(current)
+    Ok(())
 }
 
 /// A connection for queries. Writes are refused at the SQLite level.

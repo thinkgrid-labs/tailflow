@@ -907,6 +907,62 @@ impl Drop for FunctionGuard<'_> {
     }
 }
 
+/// Events of one session in a time range whose operation ids link them to
+/// an operation: the same operation, its children, its parent, or its
+/// siblings (`operation_id` / `parent_operation_id` equal to `op` or
+/// `parent`). Matched in SQL through the session index, under the query
+/// time budget. Returns at most `limit` events (ascending time) and the
+/// number that matched.
+///
+/// # Errors
+/// SQLite failure or the time budget ([`StorageError::QueryTimeout`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn operation_links(
+    conn: &mut Connection,
+    session: &str,
+    op: Option<&str>,
+    parent: Option<&str>,
+    exclude_seq: u64,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: usize,
+) -> Result<(Vec<StoredEvent>, u64)> {
+    if op.is_none() && parent.is_none() {
+        return Ok((Vec::new(), 0));
+    }
+    let deadline = Instant::now() + QUERY_TIME_BUDGET;
+    let guarded = ProgressGuard::install(conn, deadline)?;
+    let filter = "FROM events INDEXED BY events_session
+         WHERE session_id = ?1 AND ts BETWEEN ?2 AND ?3 AND seq != ?4
+           AND (operation_id IN (?5, ?6) OR parent_operation_id IN (?5, ?6))";
+    let exclude = i64::try_from(exclude_seq).unwrap_or(i64::MAX);
+    let since = since.timestamp_micros();
+    let until = until.timestamp_micros();
+    let total: i64 = guarded.query_row(
+        &format!("SELECT count(*) {filter}"),
+        rusqlite::params![session, since, until, exclude, op, parent],
+        |r| r.get(0),
+    )?;
+    let mut stmt = guarded.prepare(&format!(
+        "SELECT {} {filter} ORDER BY ts, seq LIMIT ?7",
+        columns(false)
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            session,
+            since,
+            until,
+            exclude,
+            op,
+            parent,
+            i64::try_from(limit).unwrap_or(i64::MAX)
+        ],
+        row_to_event,
+    )?;
+    let events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((events, u64::try_from(total).unwrap_or(0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

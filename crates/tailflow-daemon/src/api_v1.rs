@@ -333,10 +333,20 @@ impl EventParams {
     }
 }
 
+/// Deprecation notice for `command=` (M4-H): it matches `attributes.command`,
+/// which no current collector sets (agent command lines live in `payload`,
+/// only in `redacted`/`full` capture). Kept so existing scripts do not break;
+/// removed in 0.5. Never widened to search payloads.
+const COMMAND_DEPRECATION: &str =
+    "`command=` matches attributes.command, which no current collector \
+     sets, so it returns no agent commands; use `program=` (agent command events) instead. \
+     It will be removed in 0.5";
+
 async fn list_events(
     State(state): State<Arc<AppState>>,
     V1Query(params): V1Query,
-) -> Result<Json<tailflow_storage::EventPage>, V1Error> {
+) -> Result<Response, V1Error> {
+    let deprecated_command = params.command.is_some();
     let q = params.into_query()?;
     let storage = storage_of(&state)?.clone();
     // Serialized straight into the response body: no intermediate `Value`
@@ -346,7 +356,16 @@ async fn list_events(
     // query latency under ingestion. History trails live ingestion by at
     // most `batch_max_delay_ms`; the live endpoints are not batched.
     let page = blocking(move || storage.query(&q).map_err(V1Error::from)).await?;
-    Ok(Json(page))
+    let mut response = Json(page).into_response();
+    if deprecated_command {
+        let h = response.headers_mut();
+        h.insert("deprecation", axum::http::HeaderValue::from_static("true"));
+        h.insert(
+            "x-tailflow-warning",
+            axum::http::HeaderValue::from_static(COMMAND_DEPRECATION),
+        );
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1903,6 +1922,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(report.deleted > 0);
+        // A cursor this database never issued (from a replaced database):
+        // reset to the newest seq, not silence.
+        let (_, s3) = StreamReader::open(&h, "/api/v1/stream/agent?after=999999999", &[]).await;
+        let frames = s3.unwrap().until("ready", WAIT).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.event == "reset" && f.data.contains("cursor_ahead")),
+            "{frames:?}"
+        );
         let (_, s2) = StreamReader::open(&h, "/api/v1/stream/agent?after=1", &[]).await;
         let frames = s2.unwrap().until("ready", WAIT).await;
         assert!(
@@ -1984,6 +2013,52 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_command_filter_is_deprecated_not_widened() {
+        let h = harness(PrivacyConfig::default(), true);
+        agent_events(&h, "s-dep", &[bash("d1", "cargo test", "pre")]);
+        h.flush().await;
+        let auth = format!("Bearer {}", h.state.auth.token().expose());
+        let response = router(h.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events?command=cargo")
+                    .header(header::AUTHORIZATION, auth.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["deprecation"], "true");
+        assert!(response.headers()["x-tailflow-warning"]
+            .to_str()
+            .unwrap()
+            .contains("program="));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["events"].as_array().unwrap().is_empty(),
+            "still never matches payloads"
+        );
+        let (_, p) = h.get("/api/v1/events?program=cargo").await;
+        assert!(
+            !p["events"].as_array().unwrap().is_empty(),
+            "program= is the supported filter"
+        );
+        let response = router(h.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events?program=cargo")
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.headers().get("deprecation").is_none());
     }
 
     // ── command outcomes and correlation (M4-E, M4-F) ─────────────────────────
@@ -2187,6 +2262,22 @@ mod tests {
                 .iter()
                 .any(|i| i["explanation"].as_str().unwrap().contains("not confirmed")),
             "heuristic names the file: {t5}"
+        );
+        // Each item once, in its strongest tier: the heuristic match is not
+        // also listed as merely nearby.
+        let t5_seqs: Vec<u64> = t5["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["seq"].as_u64())
+            .collect();
+        assert!(
+            tier(&r, 4)["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| !t5_seqs.contains(&i["seq"].as_u64().unwrap())),
+            "{r}"
         );
 
         let (status, _) = h.get("/api/v1/events/999999/related").await;

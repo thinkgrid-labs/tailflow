@@ -69,6 +69,10 @@ const LIVE_MIN_INTERVAL_MS = 1_000
  * resync (reconnect, gap, reset) reloads it too. Without a live stream
  * (connecting, refused, older daemon) `pollMs` polling continues as the
  * fallback.
+ *
+ * A refresh (poll, live event, `reload`) never aborts a request already in
+ * flight for the same deps: it marks it stale, and one more load runs when
+ * it finishes. A query slower than the refresh rate still completes.
  */
 export function useAsync<T>(
   load: (signal: AbortSignal) => Promise<T>,
@@ -82,23 +86,58 @@ export function useAsync<T>(
   const key = JSON.stringify(deps)
   const [state, setState] = useState<{ key: string; data: T | null; error: unknown; loading: boolean }>(
     { key, data: null, error: null, loading: true })
-  const [tick, setTick] = useState(0)
   const visible = usePageVisible()
   const loadRef = useRef(load)
   loadRef.current = load
+  const keyRef = useRef(key)
+  keyRef.current = key
+  const inflight = useRef<{ key: string; ctrl: AbortController; stale: boolean } | null>(null)
+  const loaded = useRef<string | null>(null)
 
-  useEffect(() => {
-    if (!visible && tick > 0) return
+  const start = useCallback((k: string) => {
     const ctrl = new AbortController()
-    setState(s => (s.key === key ? { ...s, loading: true } : { key, data: null, error: null, loading: true }))
+    const run = { key: k, ctrl, stale: false }
+    inflight.current = run
+    setState(s => (s.key === k ? { ...s, loading: true } : { key: k, data: null, error: null, loading: true }))
     loadRef.current(ctrl.signal)
-      .then(data => { if (!ctrl.signal.aborted) setState({ key, data, error: null, loading: false }) })
+      .then(data => {
+        if (ctrl.signal.aborted) return
+        loaded.current = k
+        setState({ key: k, data, error: null, loading: false })
+      })
       .catch(error => {
         if (ctrl.signal.aborted || (error as Error)?.name === 'AbortError') return
-        setState(s => ({ key, data: s.key === key ? s.data : null, error, loading: false }))
+        setState(s => ({ key: k, data: s.key === k ? s.data : null, error, loading: false }))
       })
-    return () => ctrl.abort()
-  }, [key, tick, visible])
+      .finally(() => {
+        if (inflight.current !== run) return
+        inflight.current = null
+        // Refreshed while loading: load once more with the same deps.
+        if (run.stale && !ctrl.signal.aborted && keyRef.current === k) start(k)
+      })
+  }, [])
+
+  const refresh = useCallback((evenHidden: boolean) => {
+    const cur = inflight.current
+    if (cur && cur.key === keyRef.current) {
+      cur.stale = true
+      return
+    }
+    if (!evenHidden && document.visibilityState === 'hidden') return
+    start(keyRef.current)
+  }, [start])
+
+  // Deps changed (or the page became visible): abort and load.
+  useEffect(() => {
+    if (!visible && loaded.current === key) return
+    inflight.current?.ctrl.abort()
+    inflight.current = null
+    start(key)
+    return () => {
+      inflight.current?.ctrl.abort()
+      inflight.current = null
+    }
+  }, [key, visible, start])
 
   const streamStatus = useAgentStreamStatus(live !== undefined)
   const streaming = live !== undefined && streamStatus === 'live'
@@ -107,9 +146,9 @@ export function useAsync<T>(
 
   useEffect(() => {
     if (!pollMs || !visible || streaming) return
-    const t = setInterval(() => setTick(n => n + 1), pollMs)
+    const t = setInterval(() => refresh(false), pollMs)
     return () => clearInterval(t)
-  }, [pollMs, visible, streaming])
+  }, [pollMs, visible, streaming, refresh])
 
   useEffect(() => {
     if (!liveRef.current) return
@@ -118,7 +157,7 @@ export function useAsync<T>(
     const fire = () => {
       timer = null
       last = performance.now()
-      if (document.visibilityState !== 'hidden') setTick(n => n + 1)
+      refresh(false)
     }
     const schedule = () => {
       if (timer !== null) return
@@ -132,9 +171,9 @@ export function useAsync<T>(
       off()
       if (timer !== null) clearTimeout(timer)
     }
-  }, [key, liveMinMs])
+  }, [key, liveMinMs, refresh])
 
-  const reload = useCallback(() => setTick(n => n + 1), [])
+  const reload = useCallback(() => refresh(true), [refresh])
   const current = state.key === key
   return {
     data: current ? state.data : null,
