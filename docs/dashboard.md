@@ -167,6 +167,23 @@ With `[observe]` (or `--observe`) set, three views use independent evidence
 
 Nothing in these views says who made a change; a match is an association.
 
+## Outcomes and related evidence
+
+- **Commands → Tests, builds & checks** classifies commands (build, test,
+  lint, type check, format, dependencies), shows the outcome only as the
+  agent reported it, and lists runtime errors during or shortly after each
+  one as nearby. Counts per kind link to filtered views.
+- **Session → Tools, files & failures** starts with the session's tests,
+  builds and checks.
+- **The event inspector** shows **Related evidence** in five tiers (direct
+  identifiers, independent observation, shared context, temporal
+  proximity, inference), each item with its reason.
+- **Event lists** mark filesystem and Git observations with **on disk**
+  and **git** instead of an agent name.
+- Timeline, Session details, Files, Commands, Integrations and Settings
+  load on first visit (separate script chunks from the same origin), so
+  the first page loads less code.
+
 ## API used by the dashboard
 
 All `GET` and read-only. The dashboard uses the same public endpoints that

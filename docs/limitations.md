@@ -203,6 +203,12 @@ matrix. In short:
 - TailFlow runs `git status` and `git diff --numstat` read-only. Clean filters configured by the user (for example Git LFS) still run, as they would for the user's own `git status`.
 - `.gitignore` support is a subset (no `[[:class:]]`), and ignore files created after the observer started apply from the next start.
 
+## Outcomes and correlation boundaries
+
+- A command's outcome is what the agent reported. TailFlow does not run, trace or observe agent processes, so `verified_exit_status` never appears for them. Codex reports an outcome only when its tool response carries an exit code.
+- Classification uses the program, a vocabulary subcommand and a pattern-matched script name. Commands recorded before this release, wrappers TailFlow does not know, and custom script names are `unknown` or `other`.
+- "Nearby" runtime errors are close in time only. The one inference rule (an error message naming a changed file) is a heuristic and is labelled as such.
+
 ## Dashboard boundaries
 
 See the [dashboard guide](dashboard.md) for how each view reads its data.

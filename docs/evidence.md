@@ -144,6 +144,54 @@ response also lists:
 - whether HEAD moved, since committed work no longer shows as a change;
 - every limitation that applies.
 
+## Command outcomes
+
+**Commands → Tests, builds & checks**, **Session → Tools, files &
+failures**, and `GET /api/v1/outcomes` classify each command an agent
+reported by what it was for: build, test, lint, type check, format,
+dependencies, other, or unclassified. Each classification comes with the
+rule that decided it (`cargo test`, package script `test:unit`, `tsc` is a
+typecheck tool).
+
+In the default capture mode TailFlow does not store command lines. To tell
+`cargo test` from `cargo build` it records a command's *intent* instead:
+- the program that does the work (`cd web && npm test` → `npm`);
+- its subcommand, only if it is in that tool's fixed vocabulary;
+- a package-script name, only if it matches a fixed pattern (`test`,
+  `build:prod`, `lint:fix` …).
+
+An unknown word is recorded as "not recorded", never as the word itself.
+
+Outcomes are only what the agent reported:
+
+| Outcome | Meaning |
+|---|---|
+| `reported_success` | The agent reported completion (for Claude Code a failing exit fires a separate failure hook). |
+| `reported_failure` | The agent reported a failure, with its exit code when given (Claude Code: parsed from the error text). |
+| `interrupted` | The agent reported an interruption. |
+| `outcome_unknown` | No outcome was reported (Codex without an exit code, a command still running, a missing hook). |
+| `verified_exit_status` | Reserved for exits TailFlow observes itself. It never observes agents' commands, so it never appears for them. |
+
+Runtime errors from a command's start to 30 seconds after its end are
+listed as **nearby**: close in time, with no recorded relationship.
+TailFlow does not parse command output or build logs.
+
+## Related evidence
+
+The event inspector (and `GET /api/v1/events/{seq}/related`) lists events
+related to the selected one in five tiers, strongest first. Each item says
+why it is listed:
+
+| Tier | Linked by |
+|---|---|
+| 1. Direct identifiers | Operation or session ids the source reported (a tool call and its command) |
+| 2. Independent observation | The same file change reported by an agent and seen by the file watcher within ± 5 s |
+| 3. Shared context | The same session, close in time |
+| 4. Temporal proximity | Runtime errors and warnings (or agent activity around a log line) within ± 30 s, with no recorded relationship |
+| 5. Inference | One stated heuristic: a runtime error after a file change whose message contains the file's name. Possibly related, not confirmed |
+
+None of these is a claim that one event caused another.
+
 ## Limitations
 
 - A watcher is not a forensic record. The OS can coalesce or drop
