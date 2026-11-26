@@ -389,11 +389,27 @@ impl Auth {
             .unwrap_or_default();
         lock(&self.sessions).extend(loaded);
         let _already_set = self.session_file.set(path);
+        // Rewrites the store at once, dropping anything stale left on disk.
         self.persist();
     }
 
     /// Write live sessions to the session store, if one is attached.
+    ///
+    /// Not flushed to stable storage: losing this write in an OS crash
+    /// can only lose sessions (browsers sign in again), never restore one.
+    /// Writes that *remove* sessions use [`Auth::persist_removal`].
     pub fn persist(&self) {
+        self.persist_with(Durability::Unsynced);
+    }
+
+    /// Like [`Auth::persist`], but flushed to stable storage before it
+    /// returns, so a revoked or signed-out session cannot be restored from
+    /// an older store after a power loss.
+    fn persist_removal(&self) {
+        self.persist_with(Durability::Synced);
+    }
+
+    fn persist_with(&self, durability: Durability) {
         let Some(path) = self.session_file.get() else {
             return;
         };
@@ -412,7 +428,7 @@ impl Auth {
         };
         let result = serde_json::to_vec(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            .and_then(|body| write_private(path, &body));
+            .and_then(|body| write_private(path, &body, durability));
         if let Err(e) = result {
             tracing::warn!(err = %e, "could not persist browser sessions");
         }
@@ -427,7 +443,7 @@ impl Auth {
             s.clear();
             n
         };
-        self.persist();
+        self.persist_removal();
         n
     }
 
@@ -530,7 +546,7 @@ impl Auth {
             sessions.len() != before
         };
         if ended {
-            self.persist();
+            self.persist_removal();
         }
         ended
     }
@@ -703,12 +719,26 @@ pub fn session_file_for(port: u16) -> Option<PathBuf> {
 pub fn write_runtime_file(path: &Path, info: &RuntimeInfo) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(info)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_private(path, &body)
+    // Not flushed to stable storage: the file is rewritten at every start, a
+    // process crash keeps it (page cache), and an OS crash also ends the
+    // daemon whose token it holds. A torn file is refused as malformed by
+    // clients (fails closed).
+    write_private(path, &body, Durability::Unsynced)
+}
+
+/// Whether [`write_private`] flushes the file to stable storage before the
+/// rename. On macOS a flush is `F_FULLFSYNC` (about 20 ms on an internal
+/// SSD), which M4 paid twice at startup and once at shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    Synced,
+    Unsynced,
 }
 
 /// Atomically replace `path` with `body`, owner-only (`0600` in a `0700`
-/// directory on Unix).
-fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+/// directory on Unix). Readers see the old file or the new one, never a
+/// partial write; only `Synced` survives a power loss.
+fn write_private(path: &Path, body: &[u8], durability: Durability) -> std::io::Result<()> {
     use std::sync::atomic::AtomicU64 as Counter;
     static NEXT: Counter = Counter::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -750,7 +780,13 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
             ));
         }
     }
-    let written = std::io::Write::write_all(&mut f, body).and_then(|()| f.sync_all());
+    let written = std::io::Write::write_all(&mut f, body).and_then(|()| {
+        if durability == Durability::Synced {
+            f.sync_all()
+        } else {
+            Ok(())
+        }
+    });
     drop(f);
     if let Err(e) = written {
         let _cleanup = std::fs::remove_file(&tmp);
@@ -758,7 +794,17 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _cleanup = std::fs::remove_file(&tmp);
-    })
+    })?;
+    // A synced write must also make the rename durable, or a power loss
+    // could bring back the previous file (for a revocation: the revoked
+    // session).
+    #[cfg(unix)]
+    if durability == Durability::Synced {
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::warn!(err = %e, dir = %dir.display(), "could not flush the directory");
+        }
+    }
+    Ok(())
 }
 
 /// Read a runtime file, bounded in size.
@@ -1086,7 +1132,12 @@ mod tests {
         let shared = dir.path().join("run");
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = write_private(&shared.join("daemon-1.json"), b"secret").unwrap_err();
+        let err = write_private(
+            &shared.join("daemon-1.json"),
+            b"secret",
+            Durability::Unsynced,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(
             std::fs::read_dir(&shared).unwrap().next().is_none(),
