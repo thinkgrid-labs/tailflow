@@ -1358,7 +1358,13 @@ mod tests {
 
         let (status, f) = h.get("/api/v1/files?agent=claude").await;
         assert_eq!(status, StatusCode::OK, "{f}");
-        assert_eq!(f["files"][0]["path"], "/work/app/src/main.rs");
+        // Agent paths are stored in the platform's native form (`\work\…`
+        // on Windows), so compare with what the adapter itself produces.
+        let expected = tailflow_core::agent::normalize_path("/work/app/src/main.rs", None)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(f["files"][0]["path"], expected.as_str());
         assert_eq!(f["files"][0]["provenance"], "agent_reported");
 
         for bad in [
