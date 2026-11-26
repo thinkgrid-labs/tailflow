@@ -5,7 +5,7 @@ import { useAsync, navigate } from '../lib/hooks.ts'
 import { href, toRecord, withParams } from '../lib/router.ts'
 import { count, duration, between, shortPath, shortId } from '../lib/format.ts'
 import { attrString, exitCode } from '../lib/events.ts'
-import type { StoredEvent, EventPage } from '../lib/types.ts'
+import type { StoredEvent, EventPage, CommandOutcome, OutcomesPage } from '../lib/types.ts'
 import { Agent, Badge, Callout, Card, CopyButton, Empty, ErrorState, Loading, RANGES, Segmented, Time } from '../components/ui'
 import { Inspector } from '../components/Inspector'
 import { Icon } from '../components/icons'
@@ -52,6 +52,22 @@ function outcome(r: CommandRow): { label: string; tone: 'ok' | 'error' | 'warn' 
 }
 
 export function Commands({ params }: { params: URLSearchParams }) {
+  // Separate components keep each view's hooks in a stable order.
+  return toRecord(params).view === 'outcomes' ? <Outcomes params={params} /> : <AllCommands params={params} />
+}
+
+function CommandsView({ params, view }: { params: URLSearchParams; view: 'all' | 'outcomes' }) {
+  return (
+    <div class="toolbar">
+      <Segmented label="Commands view" value={view} onChange={v => navigate(href('commands', withParams(params, { view: v === 'all' ? null : v, event: null })), true)} options={[
+        { value: 'all', label: 'All commands' },
+        { value: 'outcomes', label: 'Tests, builds & checks' },
+      ]} />
+    </div>
+  )
+}
+
+function AllCommands({ params }: { params: URLSearchParams }) {
   const p = toRecord(params)
   const since = p.since ?? '24h'
   const selected = p.event ? Number(p.event) : null
@@ -93,6 +109,7 @@ export function Commands({ params }: { params: URLSearchParams }) {
         </div>
         <CopyButton text={location.href} label="Copy filter URL" />
       </div>
+      <CommandsView params={params} view="all" />
       <form class="toolbar" onSubmit={e => {
         e.preventDefault()
         const v = (new FormData(e.currentTarget as HTMLFormElement).get('program') as string).trim()
@@ -154,6 +171,117 @@ export function Commands({ params }: { params: URLSearchParams }) {
       </div>
       {olderLoaded && <button class="btn sm ghost" style={{ alignSelf: 'flex-start' }} onClick={() => { setExtra({ key, events: [], page: null }); first.reload() }}><Icon name="refresh" size="sm" />Back to newest</button>}
       {first.data && <p class="note">{count(rows.length)} command{rows.length === 1 ? '' : 's'} loaded. A command whose start and end fall on different pages appears once each until both are loaded.</p>}
+    </div>
+  )
+}
+
+const CATEGORY_LABEL: Record<CommandOutcome['category'], string> = {
+  test: 'Test', build: 'Build', lint: 'Lint', typecheck: 'Type check', format: 'Format', deps: 'Dependencies', other: 'Other', unknown: 'Unclassified',
+}
+
+export const OUTCOME_INFO: Record<CommandOutcome['outcome'], { label: string; tone: 'ok' | 'error' | 'warn' | 'muted' }> = {
+  reported_success: { label: 'Reported success', tone: 'ok' },
+  reported_failure: { label: 'Reported failure', tone: 'error' },
+  interrupted: { label: 'Interrupted', tone: 'warn' },
+  outcome_unknown: { label: 'Outcome unknown', tone: 'muted' },
+  verified_exit_status: { label: 'Verified exit', tone: 'ok' },
+}
+
+const CATEGORIES = ['test', 'build', 'lint', 'typecheck', 'format', 'deps'] as const
+
+/** Command operations classified by purpose, with the outcome only as reported. */
+export function OutcomeTable({ items, onSelect, showSession = true }: { items: CommandOutcome[]; onSelect?: (seq: number) => void; showSession?: boolean }) {
+  return (
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr>
+          <th>Started</th><th>Kind</th><th>Command</th><th>Outcome</th><th class="num">Duration</th>
+          <th class="hide-sm" title="Runtime errors from the start to 30 s after the end: close in time only">Nearby errors</th>
+          {showSession && <th class="hide-sm">Session</th>}
+        </tr></thead>
+        <tbody>
+          {items.map(i => {
+            const o = OUTCOME_INFO[i.outcome]
+            const seq = i.end_seq ?? i.start_seq
+            const cmd = [i.program, i.script ? `run ${i.script}` : i.subcommand].filter(Boolean).join(' ')
+            return (
+              <tr key={`${i.session_id}|${i.operation_id}|${seq}`} class={onSelect ? 'clickable' : undefined} tabIndex={onSelect ? 0 : undefined}
+                onClick={() => seq !== null && onSelect?.(seq)} onKeyDown={ev => { if (ev.key === 'Enter' && seq !== null) onSelect?.(seq) }}>
+                <td class="dim"><Time at={i.started_at ?? i.ended_at} /></td>
+                <td><Badge tone="outline" title={i.category_rule}>{CATEGORY_LABEL[i.category]}</Badge></td>
+                <td class="mono">{cmd || '?'}{i.compound && <Badge tone="outline" title="Part of a compound command (&& ; |)">+</Badge>}</td>
+                <td><Badge tone={o.tone} title={i.evidence}>{i.exit_code !== null && i.outcome === 'reported_failure' ? `${o.label} (exit ${i.exit_code})` : o.label}</Badge></td>
+                <td class="num">{i.duration_ms !== null ? duration(i.duration_ms) : <span class="dim" title="Not reported">—</span>}</td>
+                <td class="hide-sm dim" title={i.nearby_errors.map(n => n.message ?? '').join('\n')}>
+                  {i.nearby_errors_total > 0 ? `${count(i.nearby_errors_total)} nearby${i.nearby_errors.some(n => n.same_project) ? ' (same project)' : ''}` : '—'}
+                </td>
+                {showSession && <td class="hide-sm"><a href={href('session', {}, i.session_id ?? '')} onClick={ev => ev.stopPropagation()} class="mono">{shortId(i.session_id)}</a></td>}
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function Outcomes({ params }: { params: URLSearchParams }) {
+  const p = toRecord(params)
+  const since = p.since ?? '24h'
+  const selected = p.event ? Number(p.event) : null
+  const set = (c: Record<string, string | number | null>) => navigate(href('commands', withParams(params, c)), true)
+  const data = useAsync<OutcomesPage>(s => api.outcomes({
+    since: since === 'all' ? '30d' : since, agent: p.agent, session: p.session, category: p.category, outcome: p.outcome, limit: 300,
+  }, s), [since, p.agent, p.session, p.category, p.outcome], 30_000,
+  e => e.event_type.startsWith('command.') || e.event_type === 'runtime.error')
+  const counts = data.data?.counts ?? {}
+  return (
+    <div class="page" style={{ maxWidth: 'none' }}>
+      <div class="page-head">
+        <div>
+          <h2>Commands</h2>
+          <p>Commands classified by what they were for, with the outcome <strong>only as the agent reported it</strong>. TailFlow does not run or watch these processes, so nothing here is a verified exit status. Runtime errors are listed when they occurred during or shortly after a command: close in time, not shown to be related.</p>
+        </div>
+        <CopyButton text={location.href} label="Copy filter URL" />
+      </div>
+      <CommandsView params={params} view="outcomes" />
+      <div class="toolbar">
+        <select class="select" aria-label="Kind" value={p.category ?? ''} onChange={e => set({ category: (e.target as HTMLSelectElement).value || null })}>
+          <option value="">Every kind</option>
+          {[...CATEGORIES, 'other', 'unknown'].map(c => <option key={c} value={c}>{CATEGORY_LABEL[c as CommandOutcome['category']]}</option>)}
+        </select>
+        <select class="select" aria-label="Outcome" value={p.outcome ?? ''} onChange={e => set({ outcome: (e.target as HTMLSelectElement).value || null })}>
+          <option value="">Every outcome</option>
+          {(['reported_success', 'reported_failure', 'interrupted', 'outcome_unknown'] as const).map(o => <option key={o} value={o}>{OUTCOME_INFO[o].label}</option>)}
+        </select>
+        <Segmented label="Time range" value={since} options={RANGES} onChange={v => set({ since: v === '24h' ? null : v })} />
+      </div>
+      {data.data && (
+        <div class="grid stats">
+          {CATEGORIES.map(c => {
+            const by = counts[c] ?? {}
+            const total = Object.values(by).reduce((a, b) => a + b, 0)
+            const failed = by.reported_failure ?? 0
+            return (
+              <a key={c} class={`card stat${failed ? ' error' : ''}`} href={href('commands', withParams(params, { view: 'outcomes', category: c, outcome: null }))}>
+                <span class="label">{CATEGORY_LABEL[c]}</span>
+                <span class="value">{count(total)}</span>
+                <span class="foot">{failed ? `${failed} reported failing` : total ? `${by.reported_success ?? 0} reported passing` : ' '}</span>
+              </a>
+            )
+          })}
+        </div>
+      )}
+      <div class={selected !== null ? 'with-inspector' : ''}>
+        <Card flush>
+          {data.error ? <ErrorState error={data.error} onRetry={data.reload} />
+            : !data.data ? <Loading rows={6} />
+            : data.data.items.length === 0 ? <Empty icon="commands" title="No matching commands" />
+            : <OutcomeTable items={data.data.items} onSelect={seq => set({ event: seq })} />}
+        </Card>
+        {selected !== null && <Inspector seq={selected} onClose={() => set({ event: null })} onSelect={seq => set({ event: seq })} />}
+      </div>
+      {data.data?.truncated && <p class="note">More commands exist in this range than were classified; narrow the range.</p>}
     </div>
   )
 }

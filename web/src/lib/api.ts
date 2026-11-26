@@ -4,7 +4,7 @@
 import { isRefusal, markSignedOut } from './auth.ts'
 import type {
   AgentsStatus, Collector, EventPage, FilesPage, Health, SessionDetail,
-  SessionPage, Stats, StorageStatus, StoredEvent, FileEvidencePage, SessionChanges, ObserveStatus,
+  SessionPage, Stats, StorageStatus, StoredEvent, FileEvidencePage, SessionChanges, ObserveStatus, RelatedPage, OutcomesPage,
 } from './types.ts'
 
 export class ApiError extends Error {
@@ -68,6 +68,8 @@ export const api = {
   sessionChanges: (id: string, s?: AbortSignal) =>
     getJSON<SessionChanges>(`/api/v1/sessions/${encodeURIComponent(id)}/changes`, {}, s),
   observe: (s?: AbortSignal) => getJSON<ObserveStatus>('/api/v1/observe/status', {}, s),
+  related: (seq: number, s?: AbortSignal) => getJSON<RelatedPage>(`/api/v1/events/${seq}/related`, {}, s),
+  outcomes: (p: Params, s?: AbortSignal) => getJSON<OutcomesPage>('/api/v1/outcomes', p, s),
   privacy: (s?: AbortSignal) =>
     getJSON<{ capture_mode: string; capture_enabled: boolean; redaction_active: boolean; redaction_rules: string[]; guarantee: string }>('/api/v1/privacy', {}, s),
 }

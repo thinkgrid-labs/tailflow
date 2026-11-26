@@ -6,6 +6,7 @@ import { between, count, dateTime, duration, projectName, relativeTo } from '../
 import { ACTIVITY_NAME, COMPLETENESS_REASON, COVERAGE_REASON, GAP_REASON, HISTORY_TEXT, LEVEL_TEXT } from '../lib/events.ts'
 import type { SessionChanges, SessionDetail, StoredEvent } from '../lib/types.ts'
 import { CHANGE_EVIDENCE, CHANGE_KIND } from '../lib/evidence.ts'
+import { OutcomeTable } from './Commands'
 import {
   Agent, Badge, Callout, Card, CopyButton, Empty, ErrorState, HistoryBadge, Loading, Segmented, SessionStatusBadge, Stat,
 } from '../components/ui'
@@ -196,8 +197,17 @@ function SessionEvents({ id, selected, onSelect, onClose }: { id: string; select
 
 function Summary({ d }: { d: SessionDetail }) {
   const sampled = d.coverage.reasons.includes('summary_sampled_newest_events')
+  const outcomes = useAsync(s => api.outcomes({ session: d.session_id, since: '30d', limit: 100 }, s), [d.session_id], 30_000,
+    e => e.session_id === d.session_id && e.event_type.startsWith('command.'))
+  const checks = (outcomes.data?.items ?? []).filter(i => ['test', 'build', 'lint', 'typecheck', 'format'].includes(i.category))
   return (
     <>
+      <Card title="Tests, builds & checks" sub="Classified from the command; outcome only as the agent reported it" flush>
+        {outcomes.error ? <ErrorState error={outcomes.error} onRetry={outcomes.reload} />
+          : !outcomes.data ? <Loading rows={2} />
+          : checks.length === 0 ? <Empty icon="commands" title="No test, build or check commands reported" />
+          : <OutcomeTable items={checks} showSession={false} />}
+      </Card>
       {sampled && <Callout tone="info">This session is very large: these summaries cover its newest 50,000 events.</Callout>}
       <div class="grid two">
         <Card title="Tools" sub="Finished calls by tool" flush>

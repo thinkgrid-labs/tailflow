@@ -432,3 +432,7 @@ table.table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .signin-actions { margin-top: var(--sp-3); }
 ul.plain { list-style: none; padding: 0; margin: var(--sp-1) 0 0; display: grid; gap: 2px; font-size: var(--fs-sm); }
 ul.plain li { overflow-wrap: anywhere; }
+
+.tier { margin: var(--sp-2) 0; }
+.tier-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: 2px; }
+.tier-why { margin: 0 0 4px var(--sp-2); }
