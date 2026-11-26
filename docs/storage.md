@@ -27,8 +27,14 @@ expired reports `retention_truncated`. New gap reasons for agent capture:
 `agent_spool_overflow`, `agent_input_rejected`, `agent_spool_corrupt`.
 
 **Schema v2** (this release) adds `agent_sessions` and drops the unused
-`events_ts` index. The upgrade runs in one transaction on first open. A build
-that only knows schema v1 refuses a v2 database and runs memory-only; it never
+`events_ts` index. **Schema v3** adds `events_agent_activity`, a partial index
+over agent events only (`agent_name IS NOT NULL`), so the dashboard's overview
+and per-file aggregates over days of history are index-only. Runtime log rows
+are not in it. Building it scans the table once on first open: about 25 s for
+a 2-million-event database on a heavily loaded test machine (seconds on an
+idle one); each agent event then adds one index entry (≈ 75 bytes). Each
+upgrade runs in one transaction on first open. A build that only knows an
+older schema refuses the newer database and runs memory-only; it never
 modifies it.
 
 Every event carries a `provenance` value saying how it was obtained:
@@ -229,7 +235,7 @@ curl -s localhost:7878/api/v1/storage/status
 curl -s localhost:7878/api/v1/collectors/status
 ```
 
-The dashboard's **diagnostics** button shows the same information.
+The dashboard's **Integrations** page shows the same information.
 
 ## Clearing history
 

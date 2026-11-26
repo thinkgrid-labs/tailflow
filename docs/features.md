@@ -193,7 +193,7 @@ underlying evidence should not.
 |---|---|
 | MCP tools | Agent reasoning and bounded verification loops |
 | `tailflow-logs` | Shell-only agents, scripts, and quick one-shot checks |
-| Web dashboard | Browsing sources and following a development session |
+| Web dashboard | Investigating agent sessions, searching history, comparing agents on a timeline, following live logs ([guide](dashboard.md)) |
 | `tailflow` TUI | Terminal-first live inspection without running the daemon |
 | HTTP API and SSE | Custom local clients and integrations |
 
@@ -203,6 +203,7 @@ underlying evidence should not.
 |---|---:|---:|---:|---:|
 | Source lifecycle and counts | Yes | Yes | Yes | Logs only |
 | Deduplicated error groups | Yes | Yes | No | No |
+| Agent sessions, activity search, timeline | API | Sessions only | Yes (next release) | No |
 | Exact filtered records | Yes | Yes | Yes | Yes |
 | Server-side event waiting | Yes | Yes | No | Live stream |
 | Cursor-based incremental reads | Yes | Yes | Internal | No |

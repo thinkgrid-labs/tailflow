@@ -17,6 +17,10 @@ Milestone M2: agent capture and session tracking. With opt-in hooks, TailFlow
 records what Claude Code and Codex report doing — sessions, tool calls, shell
 commands, the files their tools read or edit — and says what it cannot see.
 
+Milestone M3: agent observability dashboard. The local web UI becomes an
+investigation tool for agent activity and the runtime around it, without
+claiming more than the hooks reported.
+
 ### Added
 
 - **Durable local history.** `tailflow-daemon` records runtime logs and
@@ -83,8 +87,41 @@ commands, the files their tools read or edit — and says what it cannot see.
   `tailflow-daemon agent ingest` drains the spool once.
 - Gap reasons `agent_spool_overflow`, `agent_input_rejected`,
   `agent_spool_corrupt`; `health.events_dropped.agent`.
+- **Agent observability dashboard** ([guide](docs/dashboard.md)): Overview
+  (index-backed counts, histogram, per-agent status and coverage limits,
+  recent sessions and failures), Sessions (search, filters, cursor
+  pagination, detail with git boundaries, coverage and events), Activity
+  search (FTS + structured filters, `key:value` syntax, filter chips,
+  copyable URLs, event inspector), multi-agent Timeline (agent lanes and a
+  runtime lane; zoom, pan, brush), Errors, Files, Commands, Integrations and
+  Settings (dark / light / system theme, local / UTC time). Keyboard
+  navigable, responsive down to phone width.
+- **Read-only aggregate endpoints** for the dashboard:
+  `GET /api/v1/stats` (sessions by status, tool calls, commands, distinct
+  failed operations, reported file activity, runtime errors and an event
+  histogram, from indexes, under the 3 s query budget) and
+  `GET /api/v1/files` (agent-reported file operations grouped by path,
+  `multi_agent=true` for paths more than one agent touched).
+- `GET /api/v1/sessions`: `until`, `q` (substring of id, project, directory,
+  branch), and cursor pagination (`cursor` → `has_more`, `next_cursor`).
+  Session counts gain `failed_operations`.
+- `GET /api/v1/events?program=` filters agent command events by program.
+- `GET /api/v1/agents/status` reports each integration's installation state
+  (`configured`, `incomplete`, `not_installed`, `unknown`) by reading the
+  install record and the agent's config read-only.
+- `GET /api/records?after=<seq>` and `instance_id` in `/health`, so live
+  clients catch up incrementally and detect a daemon restart.
 
 ### Changed
+
+- **The live log view is virtualized.** Only on-screen rows are rendered
+  (variable height, expanded JSON, wrapping or horizontal scrolling), the
+  view stays put while paused or scrolled up, and a reconnect catches up
+  once from where the stream broke instead of re-reading the whole buffer.
+  A background tab no longer accumulates unbounded pending records.
+  Measured with 5,000 lines held while streaming 1,000 lines/s (headless
+  Chrome): DOM nodes 25,039 → 467, main thread ~99 % → ~19 %, frame p95
+  167–300 ms → 17 ms.
 
 - **Live output is redacted by default.** Redaction runs once at ingestion, so
   the dashboard, SSE, `/api/records`, `/api/query`, `/api/errors`, MCP, and the
@@ -120,6 +157,10 @@ commands, the files their tools read or edit — and says what it cannot see.
 - **Storage schema v2**: adds the `agent_sessions` table and drops the
   never-used `events_ts` index (5–8 % fewer WAL bytes per event). Migrates in
   one transaction; schema-v1 builds refuse a v2 file without modifying it.
+- **Storage schema v3**: a partial covering index over agent events
+  (`events_agent_activity`) for the dashboard aggregates. Runtime rows are not
+  indexed; the first open after upgrading builds it once (≈ 25 s for 2 M
+  events on a heavily loaded machine).
 - **Storage maintenance yields to ingestion**: retention stops early while the
   storage queue is over a quarter full, and the full-text compaction is
   postponed (or interrupted past half full) and retried; after 60 s of
@@ -186,6 +227,12 @@ commands, the files their tools read or edit — and says what it cannot see.
   1.51.6, `rustix` 1.1.6 and `anyhow` 1.0.103 (unsoundness advisories).
   `cargo audit` reports no vulnerabilities.
 
+- The embedded UI is served with a strict Content Security Policy
+  (`script-src 'self'`, no inline script, `frame-ancestors 'none'`),
+  `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+- Web dev dependencies: `vite` 6.4.6 and `source-map-js` 1.2.2 (override)
+  resolve the dev-server advisories reported by `npm audit`; the shipped
+  bundle was not affected.
 - Agent capture adds **no network listener and no HTTP write endpoint**: hook
   processes hand events to the daemon through an owner-only spool directory.
   Redaction and collection boundaries run in the hook before anything reaches

@@ -12,6 +12,7 @@ Use this page to find the shortest path to the information you need.
 | Learn the MCP tools | [TailFlow for agents](agents.md#mcp-tools) |
 | Use TailFlow from a shell or script | [TailFlow for agents: shell client](agents.md#shell-client) |
 | Call the HTTP API | [TailFlow for agents: HTTP API](agents.md#http-api) |
+| Use the web dashboard and read what it shows | [Dashboard](dashboard.md) |
 | Keep history, set retention, or control what is recorded | [Durable history](storage.md) |
 | Understand the internals | [Architecture](architecture.md) |
 | Evaluate production or automation use | [Limitations](limitations.md) |
@@ -40,6 +41,12 @@ Reference for the four MCP tools, reliable agent workflow patterns, the
 Recording Claude Code and Codex sessions, tool calls, commands and file edits
 through opt-in hooks: setup, verification, exactly what each integration can
 and cannot see, privacy, loss behavior, and uninstalling.
+
+### [Dashboard](dashboard.md)
+
+The local web dashboard: overview, sessions, activity search, the multi-agent
+timeline, files, commands and live logs; how to read agent-reported data,
+coverage and loss; keyboard use, cost and security.
 
 ### [Durable history, retention, and privacy](storage.md)
 

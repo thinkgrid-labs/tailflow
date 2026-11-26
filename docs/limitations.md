@@ -187,6 +187,35 @@ matrix. In short:
 - Agent events are ingested only into the default per-user database; a daemon
   with a custom `[storage] path` / `--db` does not ingest them.
 
+## Dashboard boundaries
+
+See the [dashboard guide](dashboard.md) for how each view reads its data.
+
+- Agent activity is not streamed live: agent pages refresh from durable
+  history every 10–30 seconds while visible, and history trails ingestion by
+  up to the storage batch delay (500 ms by default).
+- The live log view keeps the newest 5,000 lines and renders only the rows on
+  screen. Browser find-in-page and drag-selection cover only rendered rows;
+  use the filter box, **Copy lines**, or Activity search instead.
+- A timeline window draws at most 3,000 agent events and 500 runtime markers
+  and says when a window holds more. Activity and session lists load pages of
+  200–500 and stop after 5,000 (Activity) or 20,000 (one session) rows in the
+  browser; narrow the filters to see older events.
+- Result counts in Activity are "loaded so far", not a total: counting every
+  match of an arbitrary filter would mean scanning history.
+- Overview counts come from indexes and are exact for retained history. When
+  the range reaches back before retention, or overlaps recorded loss, the page
+  says the numbers are lower bounds.
+- The Integrations page reports hooks recorded by `tailflow agent install`.
+  Hooks added to an agent config by hand are not detected there;
+  `tailflow agent status` checks the default config paths.
+- Nearby runtime events in the inspector are matched by time (±60 s) only.
+  The dashboard does not infer causation.
+- The live view keeps up with 1,000 lines/s in testing. Far beyond that (tens
+  of thousands of lines/s), parsing the stream saturates the browser tab; the
+  daemon reports the lines it dropped for that tab; durable history, when
+  enabled, still records them.
+
 ## Non-goals
 
 TailFlow is not currently intended to replace:

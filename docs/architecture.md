@@ -80,13 +80,25 @@ for the event model and privacy policy and is used only by the daemon.
 Runs configured sources, tracks their lifecycle, retains a bounded in-memory
 ring, and serves:
 
-- the embedded Preact dashboard;
-- JSON query endpoints;
+- the embedded Preact dashboard (served with a strict Content Security
+  Policy);
+- JSON query endpoints, including read-only aggregates for the dashboard
+  (`/api/v1/stats`, `/api/v1/files`);
 - an SSE stream for the browser; and
 - long-polling for event-driven agent workflows.
 
 The server binds to loopback and validates the Host header. It is a local API,
 not a remotely exposed service.
+
+### Dashboard (`web/`)
+
+A Preact single-page app with hash routing and no other runtime dependency.
+Pages read the public read-only API; nothing in the browser filters a full
+dataset. The live log view keeps the newest 5,000 ring records and renders
+only the visible rows (a variable-height virtual list). Agent views poll
+durable history while visible. Pure logic (`web/src/lib/`) has Node unit tests
+(`npm test`); `web/e2e/` runs Playwright against a real daemon fed through the
+real agent hook adapters.
 
 ### `tailflow-agent`
 
@@ -225,7 +237,7 @@ tailflow/
 │   ├── tailflow-storage/   SQLite event store, retention, queries
 │   ├── tailflow-daemon/    HTTP/SSE server and embedded web UI
 │   └── tailflow-agent/     MCP and shell clients
-├── web/                    Preact dashboard
+├── web/                    Preact dashboard (src/lib pure logic, src/pages, e2e/)
 ├── npm/
 │   ├── tailflow/           public launcher package
 │   └── platforms/          OS/architecture binary packages
@@ -257,6 +269,9 @@ tailflow/
 - Keep agent rendering separate from HTTP response types so JSON and compact
   text remain available from the same operation.
 - Build the web dashboard before compiling a release daemon so `rust-embed`
-  receives production assets.
+  receives production assets. Debug builds read `web/dist` from disk, so UI
+  changes need only `npm run build`.
+- Dashboard data must come from bounded, indexed endpoints. Add an aggregate
+  endpoint rather than counting pages of events in the browser.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow.
