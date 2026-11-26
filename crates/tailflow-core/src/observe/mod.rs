@@ -206,7 +206,10 @@ impl Root {
         }
         // A project inside the data directory is refused; the data
         // directory inside a project is excluded by the observer's rules.
-        if let Some(d) = data_dir.and_then(|d| std::fs::canonicalize(d).ok()) {
+        // Both sides in the same (non-verbatim) form, or `starts_with`
+        // never matches on Windows.
+        if let Some(d) = data_dir.and_then(|d| std::fs::canonicalize(d).ok().map(simplify_verbatim))
+        {
             if canonical.starts_with(&d) {
                 return Err(RootError::DataDirectory(display));
             }
