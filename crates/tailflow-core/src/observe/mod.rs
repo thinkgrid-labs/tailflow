@@ -83,6 +83,15 @@ pub const MAX_TOTAL_IGNORE_RULES: usize = 20_000;
 /// A path is reported at most this long after its first notification even
 /// if notifications keep arriving (a file written continuously).
 const MAX_HOLD: Duration = Duration::from_secs(2);
+/// Loss (queue overflow, rescans) is reported to the sink at most this
+/// often, and within this long of being detected.
+const LOSS_REPORT_EVERY: Duration = Duration::from_secs(1);
+/// After the last notification of a burst the observer checks once more,
+/// this much later, for overflow the OS callback counted after the queue
+/// had already drained (the drop and its count are not one atomic step).
+const LOSS_SETTLE: Duration = Duration::from_secs(1);
+/// Notifications handled per wakeup before deadlines are looked at again.
+const DRAIN_BATCH: usize = 1_024;
 
 /// `[observe]` in `tailflow.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -415,6 +424,9 @@ pub struct Stats {
     pub first_overflow_us: std::sync::atomic::AtomicI64,
     /// Nested ignore files not applied because of the rule budget.
     pub ignore_files_skipped: AtomicU64,
+    /// Times the observer thread woke up (a notification batch or a
+    /// deadline). Idle observation should leave this flat.
+    pub loop_wakeups: AtomicU64,
 }
 
 pub struct Options {
@@ -532,6 +544,7 @@ impl Observer {
                     overflow_reported: 0,
                     rescans_pending: 0,
                     loss_first: None,
+                    next_flush: None,
                 };
                 state.run(&rx);
             })
@@ -651,33 +664,85 @@ struct Loop<S: Sink> {
     overflow_reported: u64,
     rescans_pending: u64,
     loss_first: Option<DateTime<Utc>>,
+    /// When the next flush pass is due (`None`: nothing pending).
+    next_flush: Option<Instant>,
 }
 
 impl<S: Sink> Loop<S> {
+    /// The observer thread. Event-driven: with nothing pending it blocks
+    /// until the OS reports a change or [`Observer::stop`] is called, so an
+    /// idle observed project costs no wakeups. It wakes on a timer only
+    /// while there is work with a deadline:
+    /// - a pending path's coalescing deadline (quiet time, or
+    ///   [`MAX_HOLD`]), checked no more often than every coalesce/4;
+    /// - unreported loss, reported at most every [`LOSS_REPORT_EVERY`];
+    /// - once, [`LOSS_SETTLE`] after the last notification, to catch a
+    ///   queue overflow the callback counted just after the queue drained.
     fn run(&mut self, rx: &mpsc::Receiver<Msg>) {
-        let tick = (self.opts.coalesce / 2).max(Duration::from_millis(10));
-        let mut last_loss_flush = Instant::now();
+        let granule =
+            (self.opts.coalesce / 4).clamp(Duration::from_millis(5), Duration::from_millis(50));
+        let mut last_loss_flush: Option<Instant> = None;
+        let mut settle_at: Option<Instant> = None;
         loop {
-            match rx.recv_timeout(tick) {
-                Ok(Msg::Fs(ev)) => self.on_event(ev),
-                Ok(Msg::Rescan) => {
-                    self.stats.rescans.fetch_add(1, Ordering::Relaxed);
-                    self.rescans_pending = self.rescans_pending.saturating_add(1);
-                    self.loss_first.get_or_insert_with(Utc::now);
+            let loss_due = self
+                .loss_pending()
+                .then(|| last_loss_flush.map_or_else(Instant::now, |t| t + LOSS_REPORT_EVERY));
+            let deadline = [self.next_flush, settle_at, loss_due]
+                .into_iter()
+                .flatten()
+                .min();
+            let got = match deadline {
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+            };
+            self.stats.loop_wakeups.fetch_add(1, Ordering::Relaxed);
+            let mut next = match got {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => Some(Msg::Stop),
+            };
+            // Drain what is already queued before looking at deadlines: one
+            // flush pass per batch, not per notification.
+            let mut handled = 0usize;
+            while let Some(msg) = next.take() {
+                match msg {
+                    Msg::Fs(ev) => self.on_event(ev),
+                    Msg::Rescan => {
+                        self.stats.rescans.fetch_add(1, Ordering::Relaxed);
+                        self.rescans_pending = self.rescans_pending.saturating_add(1);
+                        self.loss_first.get_or_insert_with(Utc::now);
+                    }
+                    Msg::Stop => {
+                        self.flush(true, granule);
+                        self.flush_loss();
+                        return;
+                    }
                 }
-                Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => {
-                    self.flush(true);
-                    self.flush_loss();
-                    return;
+                handled += 1;
+                if handled < DRAIN_BATCH {
+                    next = rx.try_recv().ok();
                 }
-                Err(RecvTimeoutError::Timeout) => {}
             }
-            self.flush(false);
-            if last_loss_flush.elapsed() >= Duration::from_secs(1) {
+            let now = Instant::now();
+            if handled > 0 {
+                settle_at = Some(now + LOSS_SETTLE);
+            } else if settle_at.is_some_and(|t| now >= t) {
+                settle_at = None;
+            }
+            if self.next_flush.is_some_and(|t| now >= t) {
+                self.flush(false, granule);
+            }
+            if self.loss_pending() && last_loss_flush.is_none_or(|t| now >= t + LOSS_REPORT_EVERY) {
                 self.flush_loss();
-                last_loss_flush = Instant::now();
+                last_loss_flush = Some(now);
             }
         }
+    }
+
+    /// Overflow or rescans not yet reported to the sink.
+    fn loss_pending(&self) -> bool {
+        self.rescans_pending > 0
+            || self.stats.overflowed.load(Ordering::Relaxed) > self.overflow_reported
     }
 
     fn flush_loss(&mut self) {
@@ -902,37 +967,52 @@ impl<S: Sink> Loop<S> {
             self.order.push_back(path.to_path_buf());
         }
         let now = Instant::now();
+        let quiet = self.opts.coalesce;
         let entry = self.pending.entry(path.to_path_buf()).or_default();
-        entry.first.get_or_insert(now);
+        let first = *entry.first.get_or_insert(now);
         entry.first_at.get_or_insert_with(Utc::now);
         entry.last = Some(now);
         entry.count = entry.count.saturating_add(1);
         f(entry);
+        // This path is due no earlier than this. `next_flush` may end up
+        // earlier than the true earliest deadline (a later notification
+        // postponed it); that costs one flush pass that finds the exact one.
+        let due = (now + quiet).min(first + MAX_HOLD);
+        self.next_flush = Some(self.next_flush.map_or(due, |t| t.min(due)));
         self.stats
             .pending_paths
             .store(self.pending.len() as u64, Ordering::Relaxed);
     }
 
-    /// Report paths whose notifications have settled.
-    fn flush(&mut self, all: bool) {
+    /// Report paths whose notifications have settled (all of them when
+    /// `all`), and schedule the next pass at the earliest remaining
+    /// deadline, at least `granule` from now so a stream of distinct paths
+    /// costs a bounded number of passes rather than one per path.
+    fn flush(&mut self, all: bool, granule: Duration) {
         let now = Instant::now();
         let quiet = self.opts.coalesce;
         let mut keep = VecDeque::with_capacity(self.order.len());
+        let mut earliest: Option<Instant> = None;
         while let Some(path) = self.order.pop_front() {
-            let ready = all
-                || self.pending.get(&path).is_some_and(|p| {
-                    p.last.is_some_and(|l| now.duration_since(l) >= quiet)
-                        || p.first.is_some_and(|f| now.duration_since(f) >= MAX_HOLD)
-                });
+            let due = self.pending.get(&path).map(|p| {
+                let by_quiet = p.last.map(|l| l + quiet);
+                let by_hold = p.first.map(|f| f + MAX_HOLD);
+                [by_quiet, by_hold].into_iter().flatten().min()
+            });
+            let ready = all || due.flatten().is_none_or(|d| now >= d);
             if ready {
                 if let Some(p) = self.pending.remove(&path) {
                     self.emit(&path, p);
                 }
             } else {
+                if let Some(d) = due.flatten() {
+                    earliest = Some(earliest.map_or(d, |e| e.min(d)));
+                }
                 keep.push_back(path);
             }
         }
         self.order = keep;
+        self.next_flush = earliest.map(|e| e.max(now + granule));
         self.stats
             .pending_paths
             .store(self.pending.len() as u64, Ordering::Relaxed);
@@ -1477,5 +1557,32 @@ mod tests {
             !by_path(&ev, "/late.rs").is_empty(),
             "flushed on stop: {ev:?}"
         );
+    }
+
+    /// M4-F: an observed project with no file activity costs no periodic
+    /// wakeups (M4 woke every coalesce/2, 10/s per root), a change costs a
+    /// bounded few, and stop is immediate.
+    #[test]
+    fn an_idle_observer_sleeps_until_a_change_or_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (obs, sink, _root) = start(dir.path(), &ObserveConfig::default());
+        // Startup notifications (if any) settle: coalescing + loss re-check.
+        std::thread::sleep(Duration::from_millis(1_500));
+        let wakeups = || obs.stats.loop_wakeups.load(Ordering::Relaxed);
+        let before = wakeups();
+        std::thread::sleep(Duration::from_secs(2));
+        let idle = wakeups() - before;
+        // A late OS notification alone accounts for 3 (it, its deadline,
+        // the loss re-check); M4 measured 40 here.
+        assert!(idle <= 3, "idle wakeups in 2 s: {idle}");
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        let ev = wait_for(&sink, |ev| !by_path(ev, "/a.rs").is_empty());
+        assert_eq!(by_path(&ev, "/a.rs").len(), 1, "{ev:?}");
+        std::thread::sleep(Duration::from_millis(1_500));
+        let busy = wakeups() - before;
+        assert!(busy <= 15, "wakeups for one change: {busy}");
+        let t = Instant::now();
+        obs.stop();
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 }

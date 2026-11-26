@@ -68,6 +68,9 @@ pub struct CommitInfo {
     /// Events other than runtime log lines (`runtime.*`): agent, file,
     /// command, git and system events, including loss markers.
     pub inserted_non_runtime: u64,
+    /// `agent.session.started` / `agent.session.ended` events (they trigger
+    /// Git snapshots of observed repositories).
+    pub inserted_session_boundaries: u64,
 }
 
 impl Shared {
@@ -147,6 +150,7 @@ struct Outcome {
     /// Inserted events that are not runtime log lines (agent, file,
     /// command, git, system). Commit hooks use it to ignore log-only commits.
     inserted_non_runtime: u64,
+    inserted_session_boundaries: u64,
     duplicates: u64,
 }
 
@@ -319,6 +323,7 @@ impl Writer {
                         let info = CommitInfo {
                             inserted: outcome.inserted,
                             inserted_non_runtime: outcome.inserted_non_runtime,
+                            inserted_session_boundaries: outcome.inserted_session_boundaries,
                         };
                         for hook in hooks {
                             hook(&info);
@@ -370,6 +375,7 @@ impl Writer {
             let (mut last_seq, mut floor) = newest(c)?;
             let mut inserted = 0u64;
             let mut inserted_non_runtime = 0u64;
+            let mut inserted_session_boundaries = 0u64;
             let mut duplicates = 0u64;
             for (reason, loss) in losses {
                 record_gap(
@@ -397,6 +403,12 @@ impl Writer {
                         if !event.event_type.starts_with("runtime.") {
                             inserted_non_runtime += 1;
                         }
+                        if matches!(
+                            event.event_type.as_str(),
+                            "agent.session.started" | "agent.session.ended"
+                        ) {
+                            inserted_session_boundaries += 1;
+                        }
                     }
                     None => duplicates += 1,
                 }
@@ -416,6 +428,7 @@ impl Writer {
             Ok(Outcome {
                 inserted,
                 inserted_non_runtime,
+                inserted_session_boundaries,
                 duplicates,
             })
         })
