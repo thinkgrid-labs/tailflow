@@ -48,6 +48,16 @@ payload_retention_days = 7
 full_text_search = true
 synchronous = "normal"                # "full" fsyncs every commit
 
+# ── Verified changes (opt-in) ─────────────────────────────────────────────────
+# Watch these project directories and take read-only Git snapshots, to
+# compare what agents report with what changed on disk. Never reads file
+# contents. See docs/evidence.md.
+
+# [observe]
+# paths = ["."]                     # relative to this file
+# exclude = ["fixtures/**"]         # in addition to .gitignore and built-ins
+# git = true
+
 # ── Privacy ───────────────────────────────────────────────────────────────────
 # Redaction runs before anything is displayed or stored. It is heuristic: it
 # catches common credential formats, not every secret.

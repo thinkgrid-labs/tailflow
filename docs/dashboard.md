@@ -149,6 +149,24 @@ The dashboard is meant to be left open all day.
   ([security](security.md)). Sign out in **Settings → Access**.
 - The daemon serves plain HTTP on loopback. Do not expose it to a network.
 
+## Verified changes and Git evidence
+
+With `[observe]` (or `--observe`) set, three views use independent evidence
+([evidence](evidence.md)):
+
+- **Files → Verified on disk** lists each agent-reported change with its
+  evidence status, plus unreported observed changes, with counts per status,
+  the observation window, observed roots, and a warning when the watcher lost
+  notifications.
+- **Session → Git changes** compares the worktree before and after the
+  session, gives each changed path its evidence (reported by this session,
+  by another, by several, or unreported), lists pre-existing changes
+  separately, and names other sessions active in the repository.
+- **Integrations → File & Git observation** shows each observed directory's
+  state, backend, counts, loss and coverage, and each repository's snapshots.
+
+Nothing in these views says who made a change; a match is an association.
+
 ## API used by the dashboard
 
 All `GET` and read-only. The dashboard uses the same public endpoints that

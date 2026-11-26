@@ -136,6 +136,21 @@ Only these paths work without a credential:
 Everything else needs a credential, including paths that don't exist. A new
 endpoint can't ship unauthenticated by accident.
 
+## File observation and Git
+
+Observation runs only for directories you list. It refuses the filesystem
+root, your home directory, and TailFlow's own data directory. It never
+reads file contents, and it never follows symlinks out of a project. Git is
+run read-only, with a 10-second timeout:
+- `--no-optional-locks`;
+- `core.fsmonitor` off, so a hook configured in the repository is not
+  executed;
+- no external diff and no textconv;
+- inherited `GIT_DIR`/`GIT_WORK_TREE` removed.
+
+Commit ids are validated before they are passed to Git. See
+[evidence](evidence.md).
+
 ## Outside the threat model
 
 - **Processes running as your own OS user.** They can read the runtime file

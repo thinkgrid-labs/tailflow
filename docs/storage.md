@@ -37,6 +37,16 @@ upgrade runs in one transaction on first open. A build that only knows an
 older schema refuses the newer database and runs memory-only; it never
 modifies it.
 
+**Schema v4** (M4) adds `fs_coverage` (which directories were observed, when,
+by which daemon run, and whether coverage was partial) and two partial
+indexes, `events_path_ts` (filesystem observations and agent hook events
+that carry a path) and `events_fs_ts` (observations by time), for file
+evidence queries. Runtime log rows are in neither, so log ingestion is
+unaffected. On a database over 100,000 events the daemon prints a line
+before and after building them. New gap reasons: `fs_observer_overflow`
+(exact count) and `fs_watcher_rescan` (a lower bound). See
+[evidence](evidence.md).
+
 Every event carries a `provenance` value saying how it was obtained:
 `agent_reported`, `filesystem_observed`, `runtime_observed`, or
 `system_observed`. Relationship fields (`session_id`, `parent_operation_id`) are

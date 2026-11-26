@@ -279,6 +279,21 @@ It does not prove that a file changed on disk, and it cannot see what the
 agent did through the shell beyond the command line itself. Every session says
 whether its history is `complete`, `partial` or `unknown`, and why.
 
+## Verified changes and Git evidence (next release)
+
+**What it does.** For the project directories you list in `[observe]` (or with
+`--observe`), TailFlow watches the filesystem and takes bounded, read-only
+Git snapshots. Each agent-reported file change is then compared with what was
+observed: reported + observed, reported but not seen, unverified, observed
+but unreported, or ambiguous. A session's Git changes are split from
+changes that existed before it began. See [evidence](evidence.md).
+
+**What it proves.** That a path changed on disk at a time, and how the
+worktree differed from `HEAD` at two moments. It does not prove who made a
+change: a file watcher cannot see the writing process, and Git cannot tell
+an agent's edit from a person's. A match between a report and an
+observation is an association, never authorship.
+
 ## Feature boundaries
 
 TailFlow observes text emitted by local software. It does not collect metrics,

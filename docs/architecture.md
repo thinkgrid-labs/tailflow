@@ -92,6 +92,24 @@ credential on every data endpoint: a per-run API token for CLI and MCP
 clients, or a browser session created by a one-time sign-in link
 ([security](security.md)). It is a local API, not a remotely exposed service.
 
+### Filesystem and Git observation (`tailflow-core::observe`, daemon `observe.rs`)
+
+Opt-in, for directories listed in `[observe]`. One observer thread per
+directory reads notify events (FSEvents recursive on macOS, inotify per
+directory on Linux, ReadDirectoryChangesW recursive on Windows) through a
+bounded queue. It filters built-in, `.gitignore` and configured exclusions,
+coalesces bursts per path, and submits `file.*` events with provenance
+`filesystem_observed`. Queue overflow and OS rescans become loss gaps. A
+directory is observed by one daemon at a time (a claim in `fs_coverage`).
+
+A Git thread snapshots each repository containing an observed directory:
+startup, agent session boundaries, and settled changes. It runs `git status`
+and `git diff --numstat` read-only and with a timeout, and records
+`git.snapshot` plus HEAD transitions. Evidence queries
+(`tailflow-storage::evidence`, `/api/v1/evidence/files`,
+`/api/v1/sessions/{id}/changes`) compare reported and observed changes
+through indexed, bounded lookups.
+
 ### Dashboard (`web/`)
 
 A Preact single-page app with hash routing and no other runtime dependency.

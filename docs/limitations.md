@@ -13,7 +13,8 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 | Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
 | Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
 | Redaction | Heuristic credential patterns | Not every secret is detected |
-| Agent activity | Opt-in Claude Code and Codex hooks (next release) | Only what the agent's hooks report; shell side effects, Claude Code tokens and agent versions are not seen; file events are not verified on disk |
+| Agent activity | Opt-in Claude Code and Codex hooks (next release) | Only what the agent's hooks report; shell side effects, Claude Code tokens and agent versions are not seen |
+| File and Git evidence | Opt-in `[observe]` directories (next release) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
@@ -191,6 +192,16 @@ matrix. In short:
   profile quiet for non-interactive shells.
 - Agent events are ingested only into the default per-user database; a daemon
   with a custom `[storage] path` / `--db` does not ingest them.
+
+## File and Git evidence boundaries
+
+- Only directories listed in `[observe]` (or `--observe`) are watched, and only while a daemon runs. A change made while nothing was observing it is **unverified**, not absent.
+- A file watcher records that a path changed, not which process changed it. A **reported + observed** match is an association within a time window (± 5 s by default), not authorship.
+- The OS may coalesce or drop notifications. Drops the OS reports (`fs_watcher_rescan`) and TailFlow's own queue overflows (`fs_observer_overflow`) are recorded as loss; drops the OS does not report cannot be detected.
+- On Linux at most `max_directories` directories per root are watched (inotify uses one watch per directory); beyond that coverage is reported as partial and reports there are **unverified**.
+- Git snapshots list at most 150 changed paths in the event (the total is always recorded); a session comparison beyond that is marked incomplete. Snapshots happen at startup, at session boundaries (seen within about a second) and after changes settle (at most every 30 s by default): changes between snapshots are seen only as their net effect.
+- TailFlow runs `git status` and `git diff --numstat` read-only. Clean filters configured by the user (for example Git LFS) still run, as they would for the user's own `git status`.
+- `.gitignore` support is a subset (no `[[:class:]]`), and ignore files created after the observer started apply from the next start.
 
 ## Dashboard boundaries
 

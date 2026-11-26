@@ -140,6 +140,34 @@ API security.
   - The dashboard replaces 10–30 s polling with targeted, coalesced reloads,
     and adds an **Agents** stream pill in the top bar.
 
+- **Verified file changes (M4-C).** Opt-in `[observe] paths` / `--observe
+  DIR` watches selected project directories. It records `file.*`
+  observations (provenance `filesystem_observed`, no contents) and
+  compares them with agent-reported changes: `matched_observation`,
+  `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`.
+  - Built-in, `.gitignore`, editor temporary file and configured
+    exclusions apply; symlinks are not followed.
+  - On Linux there is a directory watch budget, and coverage beyond it is
+    reported as partial.
+  - Coverage is recorded per directory and run, and one daemon observes a
+    directory at a time.
+  - New loss reasons: `fs_observer_overflow` and `fs_watcher_rescan`.
+  - `GET /api/v1/observe/status` and `GET /api/v1/evidence/files`;
+    **Files → Verified on disk**; **Integrations → File & Git observation**.
+- **Git change evidence (M4-D).** Read-only, bounded `git status` and
+  `git diff --numstat` snapshots of observed repositories, taken at
+  startup, at agent session boundaries and after changes settle. They
+  produce `git.snapshot`, `git.commit`, `git.checkout` and `git.head.moved`
+  events.
+  - `GET /api/v1/sessions/{id}/changes` compares a session's worktree
+    before and after. It gives each changed path its reported/unreported
+    evidence, never credits pre-existing changes, and lists concurrent
+    sessions and limitations.
+  - **Session → Git changes**.
+- Schema v4: `fs_coverage` and the partial indexes `events_path_ts` and
+  `events_fs_ts`. A large database prints progress around the one-time
+  upgrade.
+
 ### Changed
 
 - **Breaking: the HTTP API requires a credential.** `tailflow-mcp` and
