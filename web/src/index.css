@@ -430,3 +430,5 @@ table.table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .signin-cmd { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
 .signin-cmd code { flex: 1; font-family: var(--font-mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .signin-actions { margin-top: var(--sp-3); }
+ul.plain { list-style: none; padding: 0; margin: var(--sp-1) 0 0; display: grid; gap: 2px; font-size: var(--fs-sm); }
+ul.plain li { overflow-wrap: anywhere; }

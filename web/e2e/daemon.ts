@@ -41,14 +41,16 @@ export interface Daemon {
 /** `script` is a /bin/sh program whose stdout becomes the `app` source. */
 /** `agents`: record coding-agent hooks from this daemon's private spool
  *  (implies storage). */
-export async function startDaemon(script: string, opts: { port?: number; dir?: string; storage?: boolean; agents?: boolean } = {}): Promise<Daemon> {
+export async function startDaemon(script: string, opts: { port?: number; dir?: string; storage?: boolean; agents?: boolean; observe?: string } = {}): Promise<Daemon> {
   const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'tf-e2e-d-'))
   const port = opts.port ?? await freePort()
   const sh = path.join(dir, 'app.sh')
   fs.writeFileSync(sh, script)
   const cfg = path.join(dir, 'tailflow.toml')
-  fs.writeFileSync(cfg, `[[sources.process]]\nlabel = "app"\ncmd = "sh ${sh}"\n\n[storage]\nenabled = ${opts.storage || opts.agents ? 'true' : 'false'}\n`)
-  const proc = spawn(path.join(binDir(), 'tailflow-daemon'), ['--config', cfg, '--port', String(port), opts.agents ? '--agents' : '--no-agents'], {
+  fs.writeFileSync(cfg, `[[sources.process]]\nlabel = "app"\ncmd = "sh ${sh}"\n\n[storage]\nenabled = ${opts.storage || opts.agents || opts.observe ? 'true' : 'false'}\n`)
+  const args = ['--config', cfg, '--port', String(port), opts.agents ? '--agents' : '--no-agents']
+  if (opts.observe) args.push('--observe', opts.observe)
+  const proc = spawn(path.join(binDir(), 'tailflow-daemon'), args, {
     env: { ...process.env, TAILFLOW_DATA_DIR: path.join(dir, 'data'), TAILFLOW_TOKEN: E2E_TOKEN, RUST_LOG: 'warn' },
     stdio: 'ignore',
   })
@@ -67,7 +69,7 @@ export async function startDaemon(script: string, opts: { port?: number; dir?: s
     }),
     restart: async () => {
       await d.stop()
-      return startDaemon(script, { port, dir, storage: opts.storage, agents: opts.agents })
+      return startDaemon(script, { port, dir, storage: opts.storage, agents: opts.agents, observe: opts.observe })
     },
     signIn: async (page: Page) => {
       const res = await page.goto(await signInUrl(base))

@@ -4,7 +4,7 @@
 import { isRefusal, markSignedOut } from './auth.ts'
 import type {
   AgentsStatus, Collector, EventPage, FilesPage, Health, SessionDetail,
-  SessionPage, Stats, StorageStatus, StoredEvent,
+  SessionPage, Stats, StorageStatus, StoredEvent, FileEvidencePage, SessionChanges, ObserveStatus,
 } from './types.ts'
 
 export class ApiError extends Error {
@@ -64,6 +64,10 @@ export const api = {
   storage: (s?: AbortSignal) => getJSON<StorageStatus>('/api/v1/storage/status', {}, s),
   collectors: (s?: AbortSignal) =>
     getJSON<{ collectors?: Collector[] }>('/api/v1/collectors/status', {}, s),
+  fileEvidence: (p: Params, s?: AbortSignal) => getJSON<FileEvidencePage>('/api/v1/evidence/files', p, s),
+  sessionChanges: (id: string, s?: AbortSignal) =>
+    getJSON<SessionChanges>(`/api/v1/sessions/${encodeURIComponent(id)}/changes`, {}, s),
+  observe: (s?: AbortSignal) => getJSON<ObserveStatus>('/api/v1/observe/status', {}, s),
   privacy: (s?: AbortSignal) =>
     getJSON<{ capture_mode: string; capture_enabled: boolean; redaction_active: boolean; redaction_rules: string[]; guarantee: string }>('/api/v1/privacy', {}, s),
 }

@@ -359,3 +359,114 @@ export interface Health {
   cursor: number
   ingest_dropped: number
 }
+
+// ── M4: file evidence, Git changes, observation status ───────────────────────
+
+export type EvidenceStatus = 'matched_observation' | 'reported_only' | 'unverified' | 'filesystem_observed' | 'ambiguous'
+
+export interface EvidenceRef {
+  seq: number
+  at: string
+  event_type: string
+  session_id?: string | null
+  agent_name?: string | null
+}
+
+export interface FileEvidence {
+  path: string
+  at: string
+  status: EvidenceStatus
+  explanation: string
+  reported: EvidenceRef[]
+  observed: EvidenceRef[]
+}
+
+export interface CoverageView {
+  root: string
+  started_at: string
+  stopped_at: string | null
+  backend: string
+  watched_dirs: number
+  unwatched_dirs: number
+}
+
+export interface FileEvidencePage {
+  items: FileEvidence[]
+  counts: Record<EvidenceStatus, number>
+  window_ms: number
+  coverage: CoverageView[]
+  loss: { reason: string; count: number | null; first_at: string; last_at: string }[]
+  truncated: boolean
+}
+
+export interface GitChange {
+  path: string
+  status: string
+  staged: boolean
+  unstaged: boolean
+  from?: string
+  size?: number
+  lines_added?: number
+  lines_deleted?: number
+}
+
+export interface SnapshotRef {
+  seq: number
+  at: string
+  trigger: string | null
+  head: string | null
+  branch: string | null
+  changes_total: number
+  complete: boolean
+}
+
+export type ChangeEvidence = 'reported_by_this_session' | 'reported_by_other_sessions' | 'reported_by_several_sessions' | 'unreported'
+
+export interface SessionChanges {
+  session_id: string
+  available: boolean
+  reason?: string
+  repository?: string
+  baseline?: SnapshotRef
+  after?: SnapshotRef
+  head_moved?: boolean
+  complete?: boolean
+  changes?: {
+    path: string
+    kind: 'appeared' | 'changed' | 'cleared'
+    before?: GitChange
+    after?: GitChange
+    evidence: ChangeEvidence
+    reported_by_this_session: boolean
+    other_sessions: string[]
+    observations: number
+  }[]
+  pre_existing?: string[]
+  concurrent_sessions?: { session_id: string; agent: string; status: string }[]
+  limitations?: string[]
+}
+
+export interface ObserveStatus {
+  enabled: boolean
+  disabled_reason?: string
+  roots: {
+    root: string
+    state: string
+    backend?: string
+    detail?: string
+    observations: number
+    excluded: number
+    overflowed: number
+    rescans: number
+    watched_dirs: number
+    unwatched_dirs: number
+    pending_paths: number
+    git_root?: string
+  }[]
+  git_enabled: boolean
+  git_binary?: string
+  repos: { worktree_root: string; snapshots: number; last_snapshot_at?: string; last_took_ms?: number; last_error?: string; head?: string; branch?: string }[]
+  errors: string[]
+  coalesce_ms: number
+  git_min_interval_secs: number
+}

@@ -242,6 +242,8 @@ export const GAP_REASON: Record<string, string> = {
   agent_spool_overflow: 'Agent spool was full; hook calls were counted and dropped',
   agent_input_rejected: 'Hook input was rejected (malformed or oversized)',
   agent_spool_corrupt: 'A spool file could not be read',
+  fs_observer_overflow: 'Filesystem observations were dropped (observer queue full)',
+  fs_watcher_rescan: 'The OS file watcher lost notifications; changes may be missing',
 }
 
 export const COMPLETENESS_REASON: Record<string, string> = {
