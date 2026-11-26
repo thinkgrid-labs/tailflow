@@ -803,7 +803,13 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         std::fs::write(d.path().join(".gitattributes"), "*.rs filter=evil\n").unwrap();
         std::fs::write(d.path().join("a.rs"), "changed\n").unwrap();
         let s = snapshot(&git, d.path(), DEFAULT_TIMEOUT).unwrap();
-        assert_eq!(s.filters_disabled, vec!["evil".to_string()]);
+        // Filters from the user's global config (git-lfs on CI runners)
+        // are disabled too.
+        assert!(
+            s.filters_disabled.iter().any(|f| f == "evil"),
+            "{:?}",
+            s.filters_disabled
+        );
         assert!(!marker.exists(), "the clean filter must not run");
     }
 

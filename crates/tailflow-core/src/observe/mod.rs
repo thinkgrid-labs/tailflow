@@ -1167,16 +1167,25 @@ mod tests {
         assert_eq!(first[0].attributes["fs.size"], 1);
         // A burst of writes is one observation.
         std::thread::sleep(Duration::from_millis(300));
+        let burst = Instant::now();
         for i in 0..50 {
             std::fs::write(&f, format!("{i}")).unwrap();
         }
+        let took = burst.elapsed();
         let ev = wait_for(&sink, |e| by_path(e, "/a.rs").len() >= 2);
         std::thread::sleep(Duration::from_millis(500));
         let ev2 = sink.events.lock().unwrap().clone();
         let writes = by_path(&ev2, "/a.rs").len() - 1;
+        // A burst within one quiet period is one observation (allow a
+        // split at the edges). A loaded runner can stretch 50 writes over
+        // seconds: then at most one observation per quiet period.
+        let coalesce = ObserveConfig::default().coalesce_ms;
+        let periods =
+            usize::try_from(took.as_millis() / u128::from(coalesce)).unwrap_or(usize::MAX);
+        let bound = periods.saturating_add(3).min(49);
         assert!(
-            (1..=3).contains(&writes),
-            "burst coalesced: {writes} ({ev:?})"
+            (1..=bound).contains(&writes),
+            "burst coalesced: {writes} observations for 50 writes in {took:?} ({ev:?})"
         );
         // Contents never recorded.
         let text = serde_json::to_string(&ev2).unwrap();
