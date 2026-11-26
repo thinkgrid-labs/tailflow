@@ -28,7 +28,7 @@ export function EventRow({ e, selected, onSelect }: { e: StoredEvent; selected: 
   const { settings } = useSettings()
   const text = summary(e)
   return (
-    <div class="act-row" role="button" tabIndex={0} aria-selected={selected} data-seq={e.seq}
+    <div class="act-row" role="button" tabIndex={0} aria-current={selected ? 'true' : undefined} data-seq={e.seq}
       onClick={() => onSelect(e.seq)}
       onKeyDown={ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onSelect(e.seq) } }}>
       <span class="t" title={e.timestamp}>{clock(e.timestamp, settings.tz)}</span>

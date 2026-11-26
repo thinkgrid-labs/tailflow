@@ -27,7 +27,9 @@ async function attackerServer(html: string) {
     res.end(html)
   })
   await new Promise<void>(r => server.listen(port, '127.0.0.1', () => r()))
-  return { port, cookies, close: () => new Promise<void>(r => server.close(() => r())) }
+  // Browsers keep loopback connections alive (WebKit for ~30 s): drop them,
+  // or close() waits for them.
+  return { port, cookies, close: () => new Promise<void>(r => { server.close(() => r()); server.closeAllConnections() }) }
 }
 
 /** Every read a page can attempt against the daemon, run inside the page. */

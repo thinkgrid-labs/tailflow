@@ -194,7 +194,8 @@ export function VirtualList<T>(p: Props<T>) {
           {rows}
         </div>
       </div>
-      {p.footer}
+      {/* Inside role=list, so the footer ("load more") is a list item too. */}
+      {p.footer && <div role="listitem">{p.footer}</div>}
     </div>
   )
 }

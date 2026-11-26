@@ -143,7 +143,7 @@ function AllCommands({ params }: { params: URLSearchParams }) {
                       const line = r.start?.payload ?? r.end?.payload
                       const seq = (r.end ?? r.start)!.seq
                       return (
-                        <tr key={r.key} class="clickable" tabIndex={0} aria-selected={selected === seq}
+                        <tr key={r.key} class="clickable" tabIndex={0} aria-current={selected === seq ? 'true' : undefined}
                           onClick={() => set({ event: seq })} onKeyDown={ev => { if (ev.key === 'Enter') set({ event: seq }) }}>
                           <td class="dim">{r.start ? <Time at={r.start.timestamp} /> : <span title="Start not captured">— <Time at={e.timestamp} /></span>}</td>
                           <td class="mono">{attrString(e, 'command.program') ?? '?'}{e.attributes?.['command.compound'] === true && <Badge tone="outline" title="Several commands joined with && ; | — the program is the first one">+</Badge>}</td>

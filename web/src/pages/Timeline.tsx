@@ -173,6 +173,7 @@ function Chart({ data, loading, t0, t1, selected, onView, onCommit, onSelect, on
   const box = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(900)
   const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null)
+  const [announce, setAnnounce] = useState('')
   const drag = useRef<{ x: number; t0: number; t1: number; brush: boolean; moved: boolean } | null>(null)
   const [brush, setBrush] = useState<[number, number] | null>(null)
 
@@ -270,6 +271,23 @@ function Chart({ data, loading, t0, t1, selected, onView, onCommit, onSelect, on
     else if (e.key === '-' || e.key === '_') { const [a, b] = zoom(t0, t1, 2, (t0 + t1) / 2); onCommit(a, b) }
     else if (e.key === 'ArrowLeft') onCommit(t0 - span / 4, t1 - span / 4)
     else if (e.key === 'ArrowRight') onCommit(t0 + span / 4, t1 + span / 4)
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+      // Step through the visible items in time order; each opens in the
+      // Inspector and is announced.
+      const order = [
+        ...visibleItems.map(i => ({ seq: i.seq, start: i.start, text: `${i.label}${i.failed ? ', failed' : ''}` })),
+        ...visibleRuntime.map(i => ({ seq: i.seq, start: i.start, text: `${i.failed ? 'Runtime error' : 'Runtime warning'}: ${i.label.slice(0, 120)}` })),
+      ].sort((a, b) => a.start - b.start || a.seq - b.seq)
+      if (order.length === 0) { setAnnounce('No items in this window'); e.preventDefault(); return }
+      const at = order.findIndex(o => o.seq === selected)
+      const next = e.key === 'Home' ? 0
+        : e.key === 'End' ? order.length - 1
+        : at < 0 ? (e.key === 'ArrowDown' ? 0 : order.length - 1)
+        : Math.min(order.length - 1, Math.max(0, at + (e.key === 'ArrowDown' ? 1 : -1)))
+      const o = order[next]
+      onSelect(o.seq)
+      setAnnounce(`${next + 1} of ${order.length}: ${o.text}, ${clock(new Date(o.start).toISOString(), settings.tz, true)}`)
+    }
     else return
     e.preventDefault()
   }
@@ -289,9 +307,10 @@ function Chart({ data, loading, t0, t1, selected, onView, onCommit, onSelect, on
 
   return (
     <div class="tl" ref={box} tabIndex={0} role="group" aria-roledescription="timeline"
-      aria-label={`Timeline from ${dateTime(new Date(t0).toISOString(), settings.tz)} to ${dateTime(new Date(t1).toISOString(), settings.tz)}. ${visibleItems.length} agent operations, ${visibleRuntime.length} runtime markers. Use plus and minus to zoom, arrow keys to pan.`}
+      aria-label={`Timeline from ${dateTime(new Date(t0).toISOString(), settings.tz)} to ${dateTime(new Date(t1).toISOString(), settings.tz)}. ${visibleItems.length} agent operations, ${visibleRuntime.length} runtime markers. Use plus and minus to zoom, left and right arrows to pan, up and down arrows to step through items.`}
       onKeyDown={onKey} onWheel={onWheel}>
       {loading && <div class="loading-bar" aria-hidden="true" />}
+      <div class="sr-only" aria-live="polite">{announce}</div>
       <svg height={height} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerLeave={() => setTip(null)}>
         <g class="axis">
           {ticks.map(t => (

@@ -9,6 +9,10 @@ const BURST = `i=0
 while [ $i -lt 6000 ]; do
   echo "INFO request $i ok"
   if [ $((i % 500)) -eq 0 ]; then echo '{"level":"error","msg":"json line","n":'$i',"nested":{"a":[1,2,3]}}'; fi
+  # Paced in blocks of 500: an instantaneous 6,000-line burst can outrun
+  # the bounded live bus on a 2-vCPU runner (lines are then dropped and
+  # counted, by design), and these tests need a full 5,000-line ring.
+  if [ $((i % 500)) -eq 499 ]; then sleep 0.05; fi
   i=$((i+1))
 done
 while true; do echo "INFO tick"; sleep 1; done
