@@ -61,6 +61,18 @@ def make_tree(root, dirs, files_per_dir, repo=True):
         git(root, "-c", "user.email=b@b", "-c", "user.name=b", "commit", "-qm", "init")
 
 
+class Projects:
+    """A temporary directory for observed projects, outside the daemon's
+    TAILFLOW_DATA_DIR (the daemon refuses to observe its own data)."""
+
+    def __enter__(self):
+        self._t = tempfile.TemporaryDirectory(prefix="tf-m4-proj-")
+        return self._t.name
+
+    def __exit__(self, *a):
+        self._t.cleanup()
+
+
 def observe_config(workdir, roots, extra=""):
     cfg = rb.write_config(workdir, cmd="sleep 86400")
     with open(cfg, "a") as f:
@@ -96,10 +108,10 @@ def sc_idle(binary, seconds):
 
 
 def sc_idle_observe(binary, n, seconds):
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, Projects() as pd:
         roots = []
         for i in range(n):
-            r = os.path.join(d, f"proj{i}")
+            r = os.path.join(pd, f"proj{i}")
             make_tree(r, 200, 10)
             roots.append(r)
         cfg = observe_config(d, roots)
@@ -120,8 +132,8 @@ def sc_idle_observe(binary, n, seconds):
 
 
 def sc_monorepo(binary, seconds):
-    with tempfile.TemporaryDirectory() as d:
-        r = os.path.join(d, "mono")
+    with tempfile.TemporaryDirectory() as d, Projects() as pd:
+        r = os.path.join(pd, "mono")
         t = time.time()
         make_tree(r, 20_000, 3, repo=True)
         build_s = round(time.time() - t, 1)
@@ -145,8 +157,8 @@ def sc_monorepo(binary, seconds):
 
 
 def sc_burst(binary):
-    with tempfile.TemporaryDirectory() as d:
-        r = os.path.join(d, "proj")
+    with tempfile.TemporaryDirectory() as d, Projects() as pd:
+        r = os.path.join(pd, "proj")
         make_tree(r, 50, 2)
         cfg = observe_config(d, [r], "git_min_interval_secs = 5\n")
         p, port, _ = rb.start(binary, [], d, cfg)
@@ -177,8 +189,8 @@ def sc_burst(binary):
 
 
 def sc_git_activity(binary, seconds=30, rate=20):
-    with tempfile.TemporaryDirectory() as d:
-        r = os.path.join(d, "proj")
+    with tempfile.TemporaryDirectory() as d, Projects() as pd:
+        r = os.path.join(pd, "proj")
         make_tree(r, 200, 10)
         cfg = observe_config(d, [r], "git_min_interval_secs = 5\n")
         p, port, _ = rb.start(binary, [], d, cfg)
