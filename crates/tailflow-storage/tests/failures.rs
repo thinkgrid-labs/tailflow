@@ -591,3 +591,53 @@ fn review_r18_empty_range_does_not_report_unrelated_old_gaps() {
         p.completeness
     );
 }
+
+#[test]
+fn fault_observation_claims_follow_their_run() {
+    use tailflow_storage::CoverageClaim;
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let a = open(&path);
+    let b = open(&path);
+    let CoverageClaim::Claimed(id_a) = a.coverage_started("/work/app", "test", 0, 0).unwrap()
+    else {
+        panic!("the first claim succeeds");
+    };
+    // A second live daemon may not observe the same root twice.
+    assert!(matches!(
+        b.coverage_started("/work/app", "test", 0, 0).unwrap(),
+        CoverageClaim::HeldBy { .. }
+    ));
+    a.coverage_ready(id_a, 3, 0).unwrap();
+    assert!(a.coverage_is_open(id_a).unwrap());
+    // Shutdown closes every claim of the run, even one whose observer did
+    // not stop in time; the other daemon can then take the root.
+    a.coverage_close_run().unwrap();
+    assert!(!a.coverage_is_open(id_a).unwrap());
+    let CoverageClaim::Claimed(id_b) = b.coverage_started("/work/app", "test", 0, 0).unwrap()
+    else {
+        panic!("a closed claim frees the root");
+    };
+    // `b` stops heartbeating (killed, or asleep for minutes): the next
+    // daemon to open declares it dead and closes its claim, which `b`'s
+    // periodic check then sees.
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "UPDATE runs SET heartbeat_at = (strftime('%s','now') - 600) * 1000000
+             WHERE id = (SELECT run_id FROM fs_coverage WHERE id = ?1)",
+            [id_b],
+        )
+        .unwrap();
+    }
+    let c = open(&path);
+    assert_eq!(c.recovered_runs().len(), 1);
+    assert!(
+        !b.coverage_is_open(id_b).unwrap(),
+        "a dead run's claim is closed"
+    );
+    assert!(matches!(
+        c.coverage_started("/work/app", "test", 0, 0).unwrap(),
+        CoverageClaim::Claimed(_)
+    ));
+}
