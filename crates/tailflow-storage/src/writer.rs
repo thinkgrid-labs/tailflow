@@ -52,6 +52,22 @@ pub(crate) struct Shared {
     pub last_retention: Mutex<Option<(DateTime<Utc>, RetentionReport)>>,
     /// Result of the background integrity check after an unclean exit.
     pub integrity: Mutex<Option<(DateTime<Utc>, Vec<String>)>>,
+    /// Called on the writer thread after every commit that inserted rows
+    /// (see `Storage::on_commit`).
+    pub commit_hooks: Mutex<Vec<CommitHook>>,
+}
+
+/// A callback run after a commit. Must be cheap and must not block.
+pub(crate) type CommitHook = Arc<dyn Fn(&CommitInfo) + Send + Sync>;
+
+/// What one commit inserted (duplicates excluded).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CommitInfo {
+    pub inserted: u64,
+    /// Events other than runtime log lines (`runtime.*`): agent, file,
+    /// command, git and system events, including loss markers.
+    pub inserted_non_runtime: u64,
 }
 
 impl Shared {
@@ -128,6 +144,9 @@ pub(crate) struct Writer {
 
 struct Outcome {
     inserted: u64,
+    /// Inserted events that are not runtime log lines (agent, file,
+    /// command, git, system). Commit hooks use it to ignore log-only commits.
+    inserted_non_runtime: u64,
     duplicates: u64,
 }
 
@@ -289,6 +308,22 @@ impl Writer {
                     h.set_state(WriterState::Ok);
                     self.shared.inflight_loss.store(0, Ordering::SeqCst);
                     batch.clear();
+                    if outcome.inserted > 0 {
+                        // Clone the list so no hook runs under the lock.
+                        let hooks = self
+                            .shared
+                            .commit_hooks
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        let info = CommitInfo {
+                            inserted: outcome.inserted,
+                            inserted_non_runtime: outcome.inserted_non_runtime,
+                        };
+                        for hook in hooks {
+                            hook(&info);
+                        }
+                    }
                     return;
                 }
                 Err(e) => {
@@ -334,6 +369,7 @@ impl Writer {
             // share the file, and this read happens under the write lock.
             let (mut last_seq, mut floor) = newest(c)?;
             let mut inserted = 0u64;
+            let mut inserted_non_runtime = 0u64;
             let mut duplicates = 0u64;
             for (reason, loss) in losses {
                 record_gap(
@@ -350,6 +386,7 @@ impl Writer {
                 if let Some(seq) = insert_event(c, &marker, &mut floor, run_id, fts)? {
                     last_seq = seq;
                     inserted += 1;
+                    inserted_non_runtime += 1;
                 }
             }
             for event in batch {
@@ -357,6 +394,9 @@ impl Writer {
                     Some(seq) => {
                         last_seq = seq;
                         inserted += 1;
+                        if !event.event_type.starts_with("runtime.") {
+                            inserted_non_runtime += 1;
+                        }
                     }
                     None => duplicates += 1,
                 }
@@ -375,6 +415,7 @@ impl Writer {
             )?;
             Ok(Outcome {
                 inserted,
+                inserted_non_runtime,
                 duplicates,
             })
         })

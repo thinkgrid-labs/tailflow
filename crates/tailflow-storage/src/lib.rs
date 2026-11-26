@@ -27,6 +27,7 @@ pub use error::{Result, StorageError};
 pub use health::{HealthSnapshot, LossReason, WriterState};
 pub use query::{EventPage, EventQuery, Order, StoredEvent};
 pub use retention::{RetentionPolicy, RetentionReport};
+pub use writer::CommitInfo;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -638,6 +639,44 @@ impl Storage {
         let h = &self.inner.shared.health;
         h.received.fetch_add(n, Ordering::Relaxed);
         h.excluded.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Run `hook` on the writer thread after every commit that inserted
+    /// events. It only says "something was committed": readers find out
+    /// what by querying with a seq cursor. Commits made by *other*
+    /// processes sharing the database do not call it; poll
+    /// [`Storage::newest_seq`] for those. The hook must be cheap and must
+    /// not block (it delays the next commit).
+    pub fn on_commit(&self, hook: impl Fn(&CommitInfo) + Send + Sync + 'static) {
+        self.inner
+            .shared
+            .commit_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::new(hook));
+    }
+
+    /// The newest committed seq by any writer (0 when empty). One index
+    /// lookup. Blocking.
+    ///
+    /// Commits are serialized by SQLite's write lock and `seq` is assigned
+    /// under it, so committed seqs only grow: once a reader has seen seq
+    /// `n`, no commit by any process can later add a seq below `n`. A
+    /// `seq > cursor` tail therefore never misses a committed event.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub fn newest_seq(&self) -> Result<u64> {
+        self.inner.readers.with(|c| {
+            let seq: Option<i64> = c
+                .query_row(
+                    "SELECT seq FROM events ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(seq.and_then(|s| u64::try_from(s).ok()).unwrap_or(0))
+        })
     }
 
     /// Agent sessions, most recent first. Blocking.
