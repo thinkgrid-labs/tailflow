@@ -15,16 +15,26 @@ TailFlow works best when:
 - the daemon and the application run on the same machine.
 
 The prebuilt npm packages support macOS ARM64/x64, Linux ARM64/x64, and Windows
-x64. Building from source requires Rust 1.88 or newer.
+x64. Building from source requires Rust 1.89 or newer.
 
 ## Install TailFlow
 
 ### npm
 
 ```bash
-npm install -g tailflow
-tailflow --version
+npm install -g tailflow@next
+tailflow --version   # tailflow 0.4.0-rc.1
 ```
+
+v0.4.0 is available as a release candidate, v0.4.0-rc.1. It is an experimental
+prerelease on the npm `next` tag: see the
+[release notes](releases/v0.4.0-rc.1.md) for what is not validated yet.
+`npm install -g tailflow@0.4.0-rc.1` pins it. `npm install -g tailflow`
+installs the stable v0.3.3, which has none of the features marked v0.4.0 in
+these docs. Before you switch back to it, remove any agent hooks with
+`tailflow agent uninstall claude` (or `codex`; add `--scope` if you installed
+with one). v0.3.3 cannot run the hooks and refuses them with status 2, which
+the agent treats as "block" for every tool call.
 
 The package installs:
 
@@ -59,13 +69,21 @@ needed. Choose a destination on your `PATH` that you have permission to write.
 
 ### Build from source
 
+Building from source needs Rust 1.89+ and Node.js 20+. Build the dashboard
+first: the daemon embeds `web/dist` at build time, and without it the
+dashboard pages are missing.
+
 ```bash
-git clone https://github.com/thinkgrid-labs/tailflow.git
+git clone --branch main https://github.com/thinkgrid-labs/tailflow.git
 cd tailflow
-cargo install --path crates/tailflow-tui
-cargo install --path crates/tailflow-daemon
-cargo install --path crates/tailflow-agent
+(cd web && npm ci && npm run build)
+cargo install --locked --path crates/tailflow-tui      # tailflow
+cargo install --locked --path crates/tailflow-daemon   # tailflow-daemon
+cargo install --locked --path crates/tailflow-agent    # tailflow-mcp, tailflow-logs
 ```
+
+Install agent hooks from these installed binaries (in `~/.cargo/bin`), not
+from a `target/` directory: hooks stop working when their binary moves.
 
 ## Initialize a project
 
@@ -212,6 +230,18 @@ See [`tailflow.example.toml`](../tailflow.example.toml) for a copyable template.
 | `[[sources.process]]` | `cmd` | Yes | Command passed to the platform shell |
 | `[[sources.process]]` | `restart` | No | `never`, `on-failure`, or `always`; default `never` |
 | `[[sources.process]]` | `restart_delay_ms` | No | Initial backoff; default 1,000 ms, doubling to a 30-second cap |
+| `[storage]` | `enabled` | No | Durable SQLite history; default `true` |
+| `[storage]` | `retention_days` | No | `1`–`36500` or `"unlimited"`; default `30` |
+| `[storage]` | `max_size_mb` | No | Size cap, always enforced; default `2048` |
+| `[storage]` | `path` | No | Database file; default in the user data directory |
+| `[privacy]` | `capture` | No | `metadata` (default), `redacted`, or `full` |
+| `[observe]` | `paths` | No | Project directories to observe for file and Git evidence (v0.4.0); default none |
+
+The `[storage]`, `[privacy]` and `[observe]` sections accept more settings; see
+[durable history, retention, and privacy](storage.md) and
+[evidence](evidence.md#turn-it-on). Unknown keys in those three sections are
+errors, so a typo cannot silently change retention, redaction or what is
+observed. `[storage]`, `[privacy]` and `[observe]` apply from v0.4.0.
 
 ## Start and verify the daemon
 
@@ -221,8 +251,9 @@ Run this from the project root:
 tailflow-daemon
 ```
 
-You should see the local addresses for the dashboard, SSE stream, and agent API.
-In a second terminal, verify the daemon and sources:
+You should see the local addresses for the dashboard, SSE stream, and agent API
+(from v0.4.0, also a one-time dashboard sign-in link and where the API token
+is). In a second terminal, verify the daemon and sources:
 
 ```bash
 tailflow-logs status
@@ -230,8 +261,14 @@ tailflow-logs sources
 tailflow-logs errors --since 5m
 ```
 
-The daemon keeps the newest 5,000 records by default. Change that with
-`tailflow-daemon --buffer N`.
+`status` only checks that a daemon answers; `sources` also proves that this
+client may read it (v0.4.0).
+
+The daemon keeps the newest 5,000 records by default (at most 16 MiB of log
+text). Change that with `tailflow-daemon --buffer N` and `--buffer-mb M`.
+
+Stop the daemon with Ctrl+C (or `SIGTERM`). It stops the processes it
+started and, from v0.4.0, removes its API token file.
 
 ### Add sources without a config file
 
@@ -295,6 +332,38 @@ configured services even when they have not printed a log line yet.
 See [TailFlow for agents](agents.md) for the four tools and recommended
 verification workflows.
 
+### Record what the agent does (opt-in, v0.4.0)
+
+MCP lets the agent read your stack's output. To also record the agent's own
+sessions, tool calls, commands and file edits, install TailFlow's hooks:
+
+```bash
+tailflow agent install claude    # or: codex
+tailflow agent status
+# … use the agent …
+tailflow sessions
+tailflow agent uninstall claude  # removes only TailFlow's hooks; history stays
+```
+
+Install keeps your other settings and other tools' hooks, saves a
+`.tailflow-backup` copy first, and can be re-run safely.
+
+See [agent capture](agent-capture.md) for coverage, privacy and uninstalling.
+
+### Verify what changed on disk (opt-in, v0.4.0)
+
+Agent hooks report what the agent *says* it did. To compare that with what
+actually changed in your project, observe it:
+
+```bash
+tailflow-daemon --observe .        # or [observe] paths = ["."] in tailflow.toml
+```
+
+**Files → Verified on disk** then marks each reported change as reported and
+observed, reported but not seen, unverified, or observed but unreported, and
+**Session → Git changes** separates a session's worktree changes from
+changes that were already there. See [evidence](evidence.md).
+
 ## Use TailFlow without MCP
 
 An agent with shell access can use the same capabilities:
@@ -314,10 +383,13 @@ Add `--json` to receive the daemon response directly. The exit codes are:
 | `1` | Invalid request or another request error |
 | `2` | `wait` timed out without a match |
 | `3` | No daemon is reachable |
+| `4` | The daemon refused the credential (v0.4.0) |
 
 ## Human views
 
-Open <http://127.0.0.1:7878> while the daemon is running, or start the TUI:
+Open the one-time sign-in link the daemon prints at startup, or run
+`tailflow-daemon dashboard` to open the dashboard with a fresh link (see
+[security](security.md)). Or start the TUI:
 
 ```bash
 tailflow
@@ -345,6 +417,15 @@ same `TAILFLOW_URL` in the MCP client configuration. Confirm with:
 tailflow-logs --url http://127.0.0.1:7878 status
 ```
 
+### `401` / "refused access" / exit code 4
+
+From v0.4.0 the API requires a credential. `tailflow-mcp` and
+`tailflow-logs` read the token from the daemon's runtime file automatically
+when they run as the same user (and the same `TAILFLOW_DATA_DIR`). In a
+container, as another user, or over a port forward, set
+`TAILFLOW_TOKEN=$(tailflow-daemon token)`. A dashboard tab that shows **Sign
+in to this daemon** needs `tailflow-daemon dashboard`.
+
 ### Docker discovery fails
 
 Confirm Docker is running and that the current account can access its local
@@ -365,13 +446,38 @@ error line.
 
 ### Expected older logs are missing
 
-The buffer is memory-only and bounded. Increase `--buffer` for a longer horizon.
-History is not retained across daemon restarts. Cursor-aware responses explicitly
-report when an incremental request has fallen behind the buffer.
+The MCP tools and `/api/query` read the bounded in-memory buffer of the current
+daemon run; increase `--buffer` for a longer live horizon. Older and
+pre-restart history is in the durable store:
+
+```bash
+curl -s -H "Authorization: Bearer $(tailflow-daemon token)" \
+  '127.0.0.1:7878/api/v1/events?since=2h&order=desc'
+tailflow-daemon storage status
+```
+
+If `completeness.complete` is `false`, events were lost (the `gaps` list says
+why). If `retention_truncated` is `true`, the range reaches past the retention
+window.
+
+### The daemon says durable history is unavailable
+
+The database could not be opened — commonly a file that is not a TailFlow
+database, a schema from a newer TailFlow, or an unwritable directory. The
+daemon leaves the file untouched and runs memory-only. Point `--db` at a new
+path, or move the file aside after inspecting it with
+`tailflow-daemon storage check`.
+
+### Secrets appear as `[REDACTED:…]`
+
+Redaction is on by default for every interface. Set `capture = "full"` under
+`[privacy]` to see verbatim output, or disable one rule with
+`disabled_rules = ["rule_name"]`.
 
 ## Next steps
 
 - Understand the capability model in [Features](features.md).
 - Learn reliable agent workflows in [TailFlow for agents](agents.md).
 - Review the [limitations](limitations.md) before automating decisions.
+- Configure history and privacy in [Durable history](storage.md).
 - Read the [architecture](architecture.md) if you want to contribute.

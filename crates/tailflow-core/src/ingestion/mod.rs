@@ -1,5 +1,6 @@
 pub mod docker;
 pub mod file;
+pub mod lines;
 pub mod process;
 pub mod stdin;
 
@@ -12,6 +13,13 @@ use tokio_util::sync::CancellationToken;
 pub trait Source: Send + 'static {
     /// Name shown in the UI (e.g. container name, file path, "stdin").
     fn name(&self) -> &str;
+
+    /// Collector family recorded as `source_type` on persisted events:
+    /// `process`, `file`, `docker`, or `stdin`. Defaults to `runtime` so
+    /// existing implementations keep compiling.
+    fn kind(&self) -> &'static str {
+        "runtime"
+    }
 
     /// Spawn the ingestion loop and push records onto `tx`.
     /// The implementation must stop when `shutdown` is cancelled or when the

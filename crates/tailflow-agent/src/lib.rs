@@ -12,4 +12,5 @@
 pub mod client;
 pub mod mcp;
 pub mod ops;
+pub mod paths;
 pub mod render;

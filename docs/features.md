@@ -193,7 +193,7 @@ underlying evidence should not.
 |---|---|
 | MCP tools | Agent reasoning and bounded verification loops |
 | `tailflow-logs` | Shell-only agents, scripts, and quick one-shot checks |
-| Web dashboard | Browsing sources and following a development session |
+| Web dashboard | Investigating agent sessions, searching history, comparing agents on a timeline, following live logs ([guide](dashboard.md)) |
 | `tailflow` TUI | Terminal-first live inspection without running the daemon |
 | HTTP API and SSE | Custom local clients and integrations |
 
@@ -203,6 +203,7 @@ underlying evidence should not.
 |---|---:|---:|---:|---:|
 | Source lifecycle and counts | Yes | Yes | Yes | Logs only |
 | Deduplicated error groups | Yes | Yes | No | No |
+| Agent sessions, activity search, timeline (v0.4.0) | API | Sessions only | Yes | No |
 | Exact filtered records | Yes | Yes | Yes | Yes |
 | Server-side event waiting | Yes | Yes | No | Live stream |
 | Cursor-based incremental reads | Yes | Yes | Internal | No |
@@ -238,11 +239,96 @@ underlying evidence should not.
 3. TailFlow reconciles the new container ID and begins following its output.
 4. Verify the new startup event rather than assuming replacement implies health.
 
+## 7. Keep history that survives restarts (v0.4.0)
+
+### Problem
+
+An agent that restarts the daemon, or comes back the next morning, loses every
+log line held only in memory — and cannot tell a quiet night from a crash.
+
+### Capability
+
+- Local SQLite history of runtime logs and collector lifecycle, 30 days and
+  2 GB by default, queryable through `/api/v1/events` by type, source, severity,
+  time, path, and full text.
+- Persistent cursors that keep increasing across restarts.
+- Redaction of common credential formats before display or storage, with
+  `metadata`, `redacted`, and `full` capture modes.
+- A `completeness` verdict on every history response, driven by recorded gaps
+  (bus lag, queue overflow, write failures, unclean shutdowns, deletions).
+- Storage and collector health in `/api/v1/storage/status`,
+  `/api/v1/collectors/status`, and the dashboard diagnostics panel.
+
+### What this proves
+
+That an event was received and committed — or, when `complete` is `false`,
+exactly that the record is known to be incomplete. History does not prove what
+happened while no daemon was running. See [durable history](storage.md).
+
+## Agent capture (v0.4.0)
+
+**What it does.** `tailflow agent install claude|codex` adds observe-only hooks
+to the agent's configuration. Each hook call becomes normalized events
+(`agent.session.*`, `agent.tool.*`, `command.*`, `file.*`, subagents, turns),
+grouped into sessions with lifecycle status and coverage. Inspect them with
+`tailflow sessions` / `tailflow session <id>` or `GET /api/v1/sessions`.
+
+**What it proves.** That the agent's hook reported the activity. A tool
+failure with an exit code, a file the Write tool created, a subagent that ran.
+On its own it does not prove that a file changed on disk (that needs
+[file observation](evidence.md)), and the hooks cannot see what the agent did
+through the shell beyond the command line itself. Every session says
+whether its history is `complete`, `partial` or `unknown`, and why.
+
+## Verified changes and Git evidence (v0.4.0)
+
+**What it does.** For the project directories you list in `[observe]` (or with
+`--observe`), TailFlow watches the filesystem and takes bounded, read-only
+Git snapshots. Each agent-reported file change is then compared with what was
+observed: reported + observed, reported but not seen, unverified, observed
+but unreported, or ambiguous. A session's Git changes are split from
+changes that existed before it began. See [evidence](evidence.md).
+
+**What it proves.** That a path changed on disk at a time, and how the
+worktree differed from `HEAD` at two moments. It does not prove who made a
+change: a file watcher cannot see the writing process, and Git cannot tell
+an agent's edit from a person's. A match between a report and an
+observation is an association, never authorship.
+
+## Live activity, outcomes and related evidence (v0.4.0)
+
+**What it does.** The dashboard follows agent activity live through one
+authenticated stream of events already committed to history: each update
+re-runs the page's bounded query, and after a disconnect the stream catches up
+from history (or, if it is too far behind, tells the page to reload). Loss
+recorded in history still shows on each page as incomplete coverage. Commands are
+classified as build, test, lint, typecheck, format or dependency work, with
+the outcome the agent reported. For any event, **Related evidence** lists
+other events in five tiers: shared operation ids, an independent
+observation of the same file, the same session, closeness in time, and one
+labelled heuristic.
+
+**What it proves.** Only what each tier says: a recorded link, an
+observation, shared context, or nearness in time. TailFlow does not observe
+processes, so a command's outcome is what the agent reported. No tier claims
+that one event caused another.
+
+## Local access control (v0.4.0)
+
+The daemon's API holds agent sessions, paths and commands, so it requires a
+credential: a per-run token for the CLI, MCP and scripts, and a one-time
+sign-in link for the browser. Pages on other localhost ports cannot read it.
+See [security](security.md).
+
 ## Feature boundaries
 
 TailFlow observes text emitted by local software. It does not collect metrics,
-traces, profiles, internal application state, or durable production history.
-Classification and grouping are heuristics, and all retained evidence is bounded.
+traces, profiles, internal application state, or production history.
+Coding-agent activity is recorded only through the opt-in Claude Code and Codex
+hooks, and only as far as those hooks report it (see
+[agent capture](agent-capture.md)).
+Classification, grouping, and redaction are heuristics, and all retained
+evidence is bounded.
 
 Read [limitations and operational boundaries](limitations.md) for the complete
 security, retention, platform, and inference model.

@@ -1,10 +1,10 @@
-use super::Source;
+use super::{lines::BoundedLines, Source};
 use crate::{config::RestartPolicy, LogLevel, LogRecord, LogSender};
 use anyhow::Result;
 use chrono::Utc;
 use std::{process::ExitStatus, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::BufReader,
     process::{Child, Command},
 };
 use tokio_util::sync::CancellationToken;
@@ -63,8 +63,18 @@ impl ProcessSource {
         let tx_out = tx.clone();
         let label_out = self.label.clone();
         let stdout_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Bounded and lossy: a huge line or a non-UTF-8 byte must not
+            // stop capture (see `ingestion::lines`).
+            let mut lines = BoundedLines::new(BufReader::new(stdout));
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(label = %label_out, err = %e, "stdout read failed");
+                        break;
+                    }
+                };
                 let record = LogRecord {
                     timestamp: Utc::now(),
                     source: label_out.clone(),
@@ -80,8 +90,18 @@ impl ProcessSource {
         let tx_err = tx.clone();
         let label_err = self.label.clone();
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Bounded and lossy: a huge line or a non-UTF-8 byte must not
+            // stop capture (see `ingestion::lines`).
+            let mut lines = BoundedLines::new(BufReader::new(stderr));
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(label = %label_err, err = %e, "stderr read failed");
+                        break;
+                    }
+                };
                 let record = LogRecord {
                     timestamp: Utc::now(),
                     source: label_err.clone(),
@@ -114,6 +134,10 @@ impl ProcessSource {
 
 #[async_trait::async_trait]
 impl Source for ProcessSource {
+    fn kind(&self) -> &'static str {
+        "process"
+    }
+
     fn name(&self) -> &str {
         &self.label
     }

@@ -1,41 +1,103 @@
 name: Release
 
-# Triggers on version tags: git tag v0.2.0 && git push --tags
+# Triggers on version tags. Land the version-bump commit first
+# (node scripts/bump-version.js <version>), then: git tag v<version> && git push origin v<version>
+#
+#   v0.4.0        stable      npm dist-tag `latest`; GitHub release marked latest
+#   v0.4.0-rc.1   prerelease  npm dist-tag `next`;   GitHub release marked prerelease
+#                 (also -beta.N and -alpha.N; anything else is refused)
+#
+# The channel comes from the version alone (scripts/release/release-plan.js,
+# tested by scripts/release/release-plan.test.js). A prerelease can never be
+# published as `latest`.
 on:
   push:
     tags: ['v[0-9]*']
 
+# Every job gets a read-only token unless it asks for more.
+permissions:
+  contents: read
+
+# One release run per tag; a second push of the same tag waits, never races.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a release does not change compiler between the quality gate
+  # and the build, or between a release candidate and the stable release.
+  RUST_TOOLCHAIN: 1.100.0
+  # Node 24.22.3 bundles npm 11.19.1 (trusted publishing needs npm >= 11.5.1).
+  NODE_VERSION: 24.22.3
 
 jobs:
-  # ── Step 0: quality gate (fmt + clippy + tests) ────────────────────────────
+  # ── Step 0: release plan (version, channel, dist-tag) ─────────────────────
+  # Fails before anything is built unless the tag is a supported version and
+  # Cargo.toml, Cargo.lock and every npm manifest already carry it.
+  plan:
+    name: Release plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      dist_tag: ${{ steps.plan.outputs.dist_tag }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      make_latest: ${{ steps.plan.outputs.make_latest }}
+      notes_path: ${{ steps.plan.outputs.notes_path }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # Releases are cut from main (CONTRIBUTING.md); a tag on a dev or
+      # feature commit is refused.
+      - name: Tag is on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main. Merge to main first, then tag the merge commit."
+            exit 1
+          }
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Release tooling tests
+        run: node --test scripts/release/release-plan.test.js
+      - name: Plan
+        id: plan
+        run: node scripts/release/release-plan.js plan --tag "$GITHUB_REF_NAME"
+
+  # ── Step 1: quality gate (fmt + clippy + tests) ────────────────────────────
   # Replicates ci.yml checks so a tag pushed without a green CI still gets
   # validated before any artifact is published.
   quality:
     name: Quality gate
-    runs-on: ubuntu-latest
+    needs: plan
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Create web/dist placeholder
         run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        run: cargo test --all --locked
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
           cache: npm
@@ -44,15 +106,17 @@ jobs:
       - name: Web type-check
         run: cd web && npx tsc --noEmit
 
-  # ── Step 1: build the web UI once, share as artifact ──────────────────────
+  # ── Step 2: build the web UI once, share as artifact ──────────────────────
   build-web:
     name: Build web UI
     needs: quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
           cache: npm
@@ -61,13 +125,14 @@ jobs:
       - name: Install and build
         run: cd web && npm ci && npm run build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: web-dist
           path: web/dist/
-          retention-days: 1
+          retention-days: 7   # long enough to re-run failed jobs
 
-  # ── Step 2: compile Rust binaries for each platform ───────────────────────
+  # ── Step 3: compile Rust binaries for each platform ───────────────────────
+  # No build cache: release binaries are compiled from a clean target dir.
   build-binaries:
     name: Build (${{ matrix.platform }})
     needs: build-web
@@ -79,53 +144,68 @@ jobs:
             os: macos-14           # GitHub's ARM macOS runner
             target: aarch64-apple-darwin
             cross: false
+            runnable: true
 
           - platform: darwin-x64
             os: macos-14           # Cross-compile x64 from ARM runner (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
+            runnable: false        # Rosetta is not guaranteed on the runner
 
           - platform: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             cross: false
+            runnable: true
 
           - platform: linux-arm64
             os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             cross: true            # use `cross` for ARM cross-compile
+            runnable: false
 
           - platform: win32-x64
-            os: windows-latest
+            # What windows-latest resolved to on 2026-11-27 (CI run 45940792181).
+            os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             cross: false
+            runnable: true
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Restore the built web UI so rust-embed can embed it
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: web-dist
           path: web/dist/
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      # For the version check below; not every runner image is guaranteed Node.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          key: ${{ matrix.target }}
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
 
+      # cross is pinned to a commit and its build image to a digest; both
+      # otherwise follow cross-rs `main`. The image is the one `main` served on
+      # 2026-11-27 (Ubuntu 24.04 base; the binary needs glibc >= 2.39, as
+      # v0.3.3's linux-arm64 binary already did).
       - name: Install cross (Linux ARM only)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross --rev a9301e91f72bba3850460512685f6b16062015ff
 
       - name: Build (native)
         if: "!matrix.cross"
         run: >
-          cargo build --release
+          cargo build --release --locked
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
@@ -133,12 +213,21 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
+        env:
+          CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_IMAGE: ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:236220a11de176071bcd8d34f3e29eb57bef4de47e936c2469da1a71084d908b
         run: >
-          cross build --release
+          cross build --release --locked
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
           -p tailflow-agent
+
+      # The binaries must report the tag's version (they read it from
+      # Cargo.toml at compile time). Checked where the runner can execute them.
+      - name: Binaries report the release version
+        if: matrix.runnable
+        shell: bash
+        run: node scripts/release/release-plan.js binaries --tag "$GITHUB_REF_NAME" --bin-dir "target/${{ matrix.target }}/release"
 
       # Stage into npm/platforms/<platform>/bin/ so the publish job can find them
       - name: Stage binaries (Unix)
@@ -169,11 +258,11 @@ jobs:
           cp target/${{ matrix.target }}/release/tailflow-logs.exe \
              npm/platforms/${{ matrix.platform }}/bin/tailflow-logs.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-${{ matrix.platform }}
           path: npm/platforms/${{ matrix.platform }}/bin/
-          retention-days: 1
+          retention-days: 7   # long enough to re-run failed jobs
 
       - name: Create tarball (Unix — attached to the GitHub Release)
         if: runner.os != 'Windows'
@@ -181,56 +270,70 @@ jobs:
           cd npm/platforms/${{ matrix.platform }}/bin
           tar -czf tailflow-${{ matrix.platform }}.tar.gz tailflow tailflow-daemon tailflow-mcp tailflow-logs
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: runner.os != 'Windows'
         with:
           name: tarball-${{ matrix.platform }}
           path: npm/platforms/${{ matrix.platform }}/bin/tailflow-${{ matrix.platform }}.tar.gz
-          retention-days: 1
+          retention-days: 7   # long enough to re-run failed jobs
 
-  # ── Step 3: publish all npm packages ──────────────────────────────────────
+  # ── Step 4: publish all npm packages ──────────────────────────────────────
+  # scripts/release/release-plan.js publish:
+  #   - re-runs the plan checks and refuses incomplete staged binaries;
+  #   - publishes the five platform packages, then the main package, each with
+  #     an explicit `--tag <dist_tag>` (`next` for a prerelease, `latest` for
+  #     a stable release) and `--provenance`;
+  #   - skips a version already on the registry, so a failed run can be
+  #     re-run without republishing;
+  #   - publishes the main package only once every platform package it pins
+  #     is on the registry;
+  #   - afterwards checks that every package's dist-tag points at the version
+  #     and, for a prerelease, that `latest` did not move.
   publish-npm:
-    name: Publish to npm
-    needs: build-binaries
-    runs-on: ubuntu-latest
+    name: Publish to npm (${{ needs.plan.outputs.dist_tag }})
+    needs: [plan, build-binaries]
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write   # needed to create a GitHub Release
-      id-token: write   # npm trusted publishing (short-lived OIDC credential)
+      contents: read
+      id-token: write   # npm trusted publishing (short-lived OIDC credential) and provenance
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # npm trusted publishing requires Node >=22.14 and npm >=11.5.1.
-          node-version: '24'
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Use a trusted-publishing capable npm CLI
-        run: npm install --global npm@latest
+      - name: npm version
+        run: |
+          npm --version
+          node -e "const [a,b,c]=process.argv[1].split('.').map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error('npm >= 11.5.1 is required for trusted publishing'); process.exit(1) }" "$(npm --version)"
 
       # Download each platform's binaries into the right directory
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: platform-darwin-arm64
           path: npm/platforms/darwin-arm64/bin/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: platform-darwin-x64
           path: npm/platforms/darwin-x64/bin/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: platform-linux-x64
           path: npm/platforms/linux-x64/bin/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: platform-linux-arm64
           path: npm/platforms/linux-arm64/bin/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: platform-win32-x64
           path: npm/platforms/win32-x64/bin/
@@ -243,76 +346,80 @@ jobs:
                -o -name 'tailflow-mcp' -o -name 'tailflow-logs' \) \
             -exec chmod +x {} +
 
-      # Sync version from git tag → all package.json files
-      - name: Bump version from tag
+      - name: Staged binaries are complete
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          node scripts/bump-version.js "$VERSION"
+          node scripts/release/release-plan.js binaries
+          node scripts/release/release-plan.js binaries --tag "$GITHUB_REF_NAME" --bin-dir npm/platforms/linux-x64/bin
 
-      # Publish platform packages first (main package depends on them).
-      #
-      # Idempotent by version: npm refuses to republish a version, so a run that
-      # failed partway through would otherwise be unretryable — the platforms
-      # that succeeded would abort the retry before reaching the ones that did
-      # not, leaving the release permanently half-published.
       # OIDC is preferred automatically when each package trusts
       # thinkgrid-labs/tailflow's release.yml. NODE_AUTH_TOKEN remains only as
       # a migration fallback for package settings not switched over yet.
-      - name: Publish platform packages
+      - name: Publish packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
-            pkg="@thinkgrid/tailflow-$platform"
-            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
-              echo "$pkg@$VERSION is already published — skipping"
-              continue
-            fi
-            echo "Publishing $pkg@$VERSION …"
-            ( cd "npm/platforms/$platform" && npm publish --access public --provenance )
-          done
+        run: node scripts/release/release-plan.js publish --tag "$GITHUB_REF_NAME" --provenance
 
-      - name: Publish main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if npm view "tailflow@$VERSION" version >/dev/null 2>&1; then
-            echo "tailflow@$VERSION is already published — skipping"
-            exit 0
-          fi
-          ( cd npm/tailflow && npm publish --access public --provenance )
+  # ── Step 5: GitHub Release ────────────────────────────────────────────────
+  # Separate job so only this one holds `contents: write`. Re-runnable: an
+  # existing release for the tag is updated, not duplicated.
+  github-release:
+    name: GitHub Release
+    needs: [plan, publish-npm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      # Download tarballs so they can be attached to the GitHub Release
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tarball-darwin-arm64
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tarball-darwin-x64
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tarball-linux-x64
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tarball-linux-arm64
           path: dist/
-
-      # Create a GitHub Release with the tag as the title
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          name: platform-win32-x64
+          path: dist/
+
+      # One checksum file for every binary attached to the release, so a
+      # download can be verified (`sha256sum -c SHA256SUMS`).
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz *.exe > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 8
+
+      # The body is docs/releases/<tag>.md when it exists (required for a
+      # prerelease), followed by GitHub's generated notes.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          body_path: ${{ needs.plan.outputs.notes_path }}
           generate_release_notes: true
+          prerelease: ${{ needs.plan.outputs.prerelease }}
+          make_latest: ${{ needs.plan.outputs.make_latest }}
+          fail_on_unmatched_files: true
           files: |
             dist/tailflow-darwin-arm64.tar.gz
             dist/tailflow-darwin-x64.tar.gz
             dist/tailflow-linux-arm64.tar.gz
             dist/tailflow-linux-x64.tar.gz
-            npm/platforms/win32-x64/bin/tailflow.exe
-            npm/platforms/win32-x64/bin/tailflow-daemon.exe
-            npm/platforms/win32-x64/bin/tailflow-mcp.exe
-            npm/platforms/win32-x64/bin/tailflow-logs.exe
+            dist/tailflow.exe
+            dist/tailflow-daemon.exe
+            dist/tailflow-mcp.exe
+            dist/tailflow-logs.exe
+            dist/SHA256SUMS

@@ -7,7 +7,402 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
-## [Unreleased]
+## [0.4.0-rc.1] - 2026-11-27
+
+**Prerelease.** The first v0.4.0 release candidate, published on npm under
+`next` (`npm install -g tailflow@next`); `latest` stays on 0.3.3. It is
+experimental and for early testing. A 24-hour Linux endurance run,
+quiet-host benchmarks and real agent sessions on Windows have not been done.
+See the [release notes](docs/releases/v0.4.0-rc.1.md).
+
+- **Durable history.** TailFlow keeps a local, private, queryable history and
+  states explicitly when that history is incomplete.
+- **Agent capture and session tracking.** With opt-in hooks, TailFlow records
+  what Claude Code and Codex report doing — sessions, tool calls, shell
+  commands, the files their tools read or edit — and says what it cannot see.
+- **Agent observability dashboard.** The local web UI becomes an
+  investigation tool for agent activity and the runtime around it, without
+  claiming more than the hooks reported.
+- **Evidence and security.** Opt-in file and Git evidence, reported command
+  outcomes, graded related evidence, and an authenticated local API.
+
+### Added
+
+- **Durable local history.** `tailflow-daemon` records runtime logs and
+  collector lifecycle in a local SQLite database (WAL, bundled SQLite 3.54,
+  FTS5) in the user data directory. Defaults: 30-day retention, 2 GB size cap,
+  7-day retention for optional payload bodies. New `tailflow-storage` crate.
+- **Versioned event model** (`ObservabilityEvent`, schema v1) with provenance
+  (`agent_reported`, `filesystem_observed`, `runtime_observed`,
+  `system_observed`), an event-type catalog covering runtime, agent, file,
+  command, git, and system events, strict validation, and replay-safe
+  deduplication for producers with stable ids. Agent, file, command, and git
+  collectors are **not** part of this release; the types are schema only.
+- **`/api/v1` read API:** `events` (filters by type or family, source, session,
+  agent, project, severity, status, path glob or prefix, command, full text,
+  and time; seq cursors in both directions), `events/{seq}` (`404` vs `410`
+  expired), `storage/status`, `storage/retention`, `collectors/status`,
+  `schema`, and `privacy`. Unknown parameters are `400`s.
+- **Completeness on every history response:** recorded gaps for ingestion-bus
+  lag, storage-queue overflow, failed commits, unclean shutdowns (unknown
+  count), and deleted sessions, plus retention horizons. Responses are never
+  marked complete after detected loss in the scanned range.
+- **Privacy controls:** `[privacy]` capture modes `metadata` (default),
+  `redacted`, and `full`; built-in redaction of common credential formats with
+  multi-line private-key handling; custom rules and rule exclusions; event-type,
+  agent, path-glob, and project-directory collection boundaries.
+- **`tailflow-daemon storage path|status|check|purge`.** Purge (all, before a
+  time, or one session) requires `--yes` and is safe while a daemon runs.
+- `--no-storage` and `--db PATH` daemon flags; `[storage]` and `[privacy]`
+  config sections (strict: unknown keys are errors).
+- Dashboard **diagnostics** panel and a banner when the live view missed
+  records.
+- `Source::kind()` (default method) so persisted events record their collector
+  family.
+
+- **Agent capture (M2).** `tailflow agent install|uninstall|status|list` for
+  Claude Code and Codex. Installs observe-only hooks into the agent's own
+  configuration (Claude Code `settings.json` at user, project or local scope;
+  Codex `hooks.json`, events chosen by the detected Codex version),
+  idempotently, preserving every other setting and hook, with a backup and an
+  atomic write. Uninstall removes only TailFlow's handlers.
+- **Hook bridge** `tailflow agent hook <agent>`: reads the hook input (bounded
+  to 8 MiB), normalizes it, applies the per-user agent capture policy
+  (`<data dir>/agents/config.toml`, same keys as `[privacy]`) and writes an
+  owner-only spool record. Prints nothing, always exits 0, never touches the
+  database or network; ~15 ms per call, nearly all process start.
+- **Normalized agent events**: `agent.session.*`, `agent.tool.*`,
+  `command.*`, `file.read|created|modified|deleted|renamed` (agent-reported,
+  never claimed as verified on disk), and new types `agent.subagent.started`,
+  `agent.subagent.stopped`, `agent.prompt.submitted` (character count only),
+  `agent.turn.completed`, `agent.turn.failed`, `agent.model.completed` (Codex
+  token counts). Source ids are namespaced (`claude-code:<id>`); ids derived
+  from tool-call identity deduplicate replays and duplicate registrations.
+- **Sessions**: `tailflow sessions`, `tailflow session <id> [--events]` (work
+  without a running daemon), `GET /api/v1/sessions`,
+  `GET /api/v1/sessions/{id}`, `GET /api/v1/agents/status`. Each session has a
+  derived status (`active`, `ended`, `unterminated`), lifecycle coverage,
+  recorded loss, retention truncation, the integration's capability limits,
+  and tool / command / failure / file summaries. Git branch and HEAD at start
+  and end come from `.git` files (no `git` process).
+- **Daemon spool ingestion**: an event-driven thread moves spooled agent
+  events into history (~0.2 s), deleting a record only after its events are
+  committed. `--agents` runs the daemon with no log sources (implied when an
+  integration is installed); `--no-agents` turns ingestion off.
+  `tailflow-daemon agent ingest` drains the spool once.
+- Gap reasons `agent_spool_overflow`, `agent_input_rejected`,
+  `agent_spool_corrupt`; `health.events_dropped.agent`.
+- **Agent observability dashboard** ([guide](docs/dashboard.md)): Overview
+  (index-backed counts, histogram, per-agent status and coverage limits,
+  recent sessions and failures), Sessions (search, filters, cursor
+  pagination, detail with git boundaries, coverage and events), Activity
+  search (FTS + structured filters, `key:value` syntax, filter chips,
+  copyable URLs, event inspector), multi-agent Timeline (agent lanes and a
+  runtime lane; zoom, pan, brush), Errors, Files, Commands, Integrations and
+  Settings (dark / light / system theme, local / UTC time). Keyboard
+  navigable, responsive down to phone width.
+- **Read-only aggregate endpoints** for the dashboard:
+  `GET /api/v1/stats` (sessions by status, tool calls, commands, distinct
+  failed operations, reported file activity, runtime errors and an event
+  histogram, from indexes, under the 3 s query budget) and
+  `GET /api/v1/files` (agent-reported file operations grouped by path,
+  `multi_agent=true` for paths more than one agent touched).
+- `GET /api/v1/sessions`: `until`, `q` (substring of id, project, directory,
+  branch), and cursor pagination (`cursor` → `has_more`, `next_cursor`).
+  Session counts gain `failed_operations`.
+- `GET /api/v1/events?program=` filters agent command events by program.
+- `GET /api/v1/agents/status` reports each integration's installation state
+  (`configured`, `incomplete`, `not_installed`, `unknown`) by reading the
+  install record and the agent's config read-only.
+- `GET /api/records?after=<seq>` and `instance_id` in `/health`, so live
+  clients catch up incrementally and detect a daemon restart.
+
+- **Local API authentication (M4-A).** Every data endpoint requires a
+  credential (see `docs/security.md`). The CLI, MCP and scripts use a per-run
+  256-bit API token that the daemon writes to an owner-only runtime file,
+  `<data dir>/run/daemon-<port>.json`, or `$TAILFLOW_TOKEN`. Browsers use an
+  `HttpOnly; SameSite=Strict` session cookie created by a one-time sign-in
+  link. New commands: `tailflow-daemon dashboard` (open the browser with a
+  fresh link; `--no-open`, `--revoke-sessions`) and `tailflow-daemon token`.
+  New endpoints: `GET /auth/login/<code>`, `GET /api/v1/auth/session`,
+  `POST /api/v1/auth/login-links`, `POST /api/v1/auth/sessions/revoke` (both
+  token-only) and `POST /api/v1/auth/logout`. The dashboard has a sign-in
+  screen and **Settings → Access → Sign out**.
+
+- **Live agent activity (M4-B).** New `GET /api/v1/stream/agent` (SSE).
+  - It carries agent, command, file and git events once they are committed
+    to durable history, in seq order, each with its seq as the SSE `id`.
+  - Clients resume from `after=` or `Last-Event-ID`, with catch-up from
+    SQLite (bounded at 5,000 events, then a `reset`).
+  - Detected loss and expired history arrive as `gap` events. A lagging
+    client is re-read from history rather than dropped (`lag`).
+  - One shared feed per daemon. It wakes on this daemon's commits and polls
+    the newest seq every 250 ms for other daemons' commits, only while
+    someone is subscribed.
+  - The dashboard replaces 10–30 s polling with targeted, coalesced reloads,
+    and adds an **Agents** stream pill in the top bar.
+
+- **Verified file changes (M4-C).** Opt-in `[observe] paths` / `--observe
+  DIR` watches selected project directories. It records `file.*`
+  observations (provenance `filesystem_observed`, no contents) and
+  compares them with agent-reported changes: `matched_observation`,
+  `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`.
+  - Built-in, `.gitignore`, editor temporary file and configured
+    exclusions apply; symlinks are not followed.
+  - On Linux there is a directory watch budget, and coverage beyond it is
+    reported as partial.
+  - Coverage is recorded per directory and run, and one daemon observes a
+    directory at a time.
+  - New loss reasons: `fs_observer_overflow` and `fs_watcher_rescan`.
+  - `GET /api/v1/observe/status` and `GET /api/v1/evidence/files`;
+    **Files → Verified on disk**; **Integrations → File & Git observation**.
+- **Git change evidence (M4-D).** Read-only, bounded `git status` and
+  `git diff --numstat` snapshots of observed repositories, taken at
+  startup, at agent session boundaries and after changes settle. They
+  produce `git.snapshot`, `git.commit`, `git.checkout` and `git.head.moved`
+  events.
+  - `GET /api/v1/sessions/{id}/changes` compares a session's worktree
+    before and after. It gives each changed path its reported/unreported
+    evidence, never credits pre-existing changes, and lists concurrent
+    sessions and limitations.
+  - **Session → Git changes**.
+- **Command outcomes (M4-E).** Hooks also record a command's intent:
+  - the effective program, for example after `cd …&&`;
+  - a subcommand from a fixed per-tool vocabulary;
+  - a script name matching a fixed pattern.
+
+  Arguments are never recorded. `GET /api/v1/outcomes` and **Commands →
+  Tests, builds & checks** classify commands (build, test, lint, typecheck,
+  format, deps), with the rule that decided each one. Outcomes are only
+  what was reported (`reported_success`, `reported_failure` with the exit
+  code, `interrupted`, `outcome_unknown`). Runtime errors during or up to
+  30 s after a command are listed as nearby. Session summaries list tests,
+  builds and checks.
+- **Evidence-graded correlation (M4-F).** `GET /api/v1/events/{seq}/related`
+  and the inspector's **Related evidence** list related events in five
+  tiers (direct identifiers, independent observation, shared context,
+  temporal proximity, inference), each with its reason, and no causal
+  claims.
+- Dashboard: provenance markers (**on disk**, **git**) in event lists, and
+  route-level code splitting (initial script 52.6 → 33.8 KB gzip).
+- Schema v4: `fs_coverage` and the partial indexes `events_path_ts` and
+  `events_fs_ts`. A large database prints progress around the one-time
+  upgrade (about 1.5 s at 1 M events, 3.6 s at 2 M); a second process that
+  opens the database meanwhile waits for it (up to 5 minutes).
+- The daemon also listens on `[::1]`, so `localhost` always reaches it; if
+  another process holds the port there, it refuses to start.
+- Accessibility: every view passes an axe-core WCAG 2.2 AA audit in light
+  and dark themes (contrast of muted text, badges, log levels and source
+  names; links in text underlined; valid ARIA on selectable rows and the
+  search combobox). Timeline items can be stepped through with ↑/↓,
+  Home and End, and are announced. The browser test suite runs in Chromium,
+  Firefox and WebKit.
+
+### Deprecated
+
+- `GET /api/v1/events?command=` matches `attributes.command`, which agent
+  command events do not set. Responses using it carry `Deprecation: true`
+  and an `X-TailFlow-Warning` header; use `program=`. Removal is planned for
+  0.5.
+
+### Changed
+
+- **Breaking: the HTTP API requires a credential.** `tailflow-mcp` and
+  `tailflow-logs` from this release find the token by themselves. Older
+  clients and plain `curl` get `401` and must send
+  `Authorization: Bearer $(tailflow-daemon token)`. `/health` without a
+  credential returns only `ok`, `version` and `auth_required`.
+  `tailflow-logs` exits `4` when not authorized. `npm run dev` proxies
+  `/events`, `/api` and `/health` without a credential of its own: sign in
+  through the daemon's link first.
+- **The live log view is virtualized.** Only on-screen rows are rendered
+  (variable height, expanded JSON, wrapping or horizontal scrolling), the
+  view stays put while paused or scrolled up, and a reconnect catches up
+  once from where the stream broke instead of re-reading the whole buffer.
+  A background tab no longer accumulates unbounded pending records.
+  Measured with 5,000 lines held while streaming 1,000 lines/s (headless
+  Chrome): DOM nodes 25,039 → 467, main thread ~99 % → ~19 %, frame p95
+  167–300 ms → 17 ms.
+
+- **Live output is redacted by default.** Redaction runs once at ingestion, so
+  the dashboard, SSE, `/api/records`, `/api/query`, `/api/errors`, MCP, and the
+  database all see `[REDACTED:<rule>]` in place of matched secrets. Set
+  `capture = "full"` to restore verbatim output.
+- Ingestion-bus overflow, previously only a log line on the daemon's stderr, is
+  now counted and surfaced: `ingest_dropped` on `/health`, `/api/sources`,
+  `/api/query`, `/api/errors`, and `/api/wait` (additive field), a
+  `[tailflow] N log records were dropped` warning in the live stream, and a
+  durable gap.
+- SSE subscribers that fall behind receive a named `gap` event; clients that
+  listen only for `message` events are unaffected.
+- `tailflow-mcp` and `tailflow-logs` warn when the daemon dropped records, and a
+  wait timeout after loss no longer claims the condition "did not occur".
+- The daemon handles `SIGTERM` like Ctrl-C and drains durable storage before
+  exiting.
+- The daemon applies `--grep`/`--source` in its single ingestion task instead
+  of a second broadcast hop, removing one point where records could be lost.
+- **Lower resource use (M1.5).** Durable storage commits every 500 ms (was
+  100 ms) or 512 events, cutting SQLite write volume by about two thirds at
+  typical event rates; `/api/v1/events` history trails live ingestion by up to
+  ~0.5 s (live endpoints are unaffected; `batch_max_delay_ms` restores the old
+  value). The in-memory buffer is also bounded by bytes (`--buffer-mb`,
+  default 16 MiB; `buffered_bytes` on `/health`), records are shared between
+  the buffer and every SSE subscriber instead of copied, level detection no
+  longer allocates per line, idle history-query connections give back their
+  cache, a quiet tailed file is polled every 2 s instead of every 250 ms, and
+  release binaries are built with LTO and stripped symbols (31–37 % smaller).
+  The dashboard re-renders only new rows.
+- **Minimum supported Rust version is now 1.89** (was 1.88), required by
+  rusqlite 0.41 for the bundled SQLite security fix below.
+
+- **Storage schema v2**: adds the `agent_sessions` table and drops the
+  never-used `events_ts` index (5–8 % fewer WAL bytes per event). Migrates in
+  one transaction; schema-v1 builds refuse a v2 file without modifying it.
+- **Storage schema v3**: a partial covering index over agent events
+  (`events_agent_activity`) for the dashboard aggregates. Runtime rows are not
+  indexed; the first open after upgrading builds it once (≈ 25 s for 2 M
+  events on a heavily loaded machine).
+- **Storage maintenance yields to ingestion**: retention stops early while the
+  storage queue is over a quarter full, and the full-text compaction is
+  postponed (or interrupted past half full) and retried; after 60 s of
+  deferral it runs regardless, so cleanup always progresses.
+  `health.maintenance` reports yields, deferrals and forced runs.
+- `[privacy] excluded_agents` accepts `claude-code` (alias `claude`) and
+  `codex` and rejects other names at startup, instead of silently excluding
+  nothing.
+- `[privacy] allowed_project_dirs` and `excluded_file_globs` now resolve `.`
+  and `..` before matching, so `/work/../etc/passwd` no longer passes an
+  allowlist of `/work`.
+- The per-user data-directory helpers moved from `tailflow-storage` to
+  `tailflow-core::paths` (re-exported from the old location).
+- The `tailflow` binary no longer starts its async runtime for subcommands.
+
+- **File observation is event-driven and keeps up with bursts.** The
+  observer, its supervisor and the Git snapshot loop wait for work instead of
+  waking on timers: an idle daemon observing one project wakes under once a
+  second (it was about 20 times). Repeated notifications for one path are
+  merged before the bounded queue, so bursts no longer overflow it in tests up
+  to about 2,800 new files per second, with less observer CPU.
+  `/api/v1/observe/status` adds `notifications`, `coalesced`, `filtered` and
+  `queue_peak`.
+- **Faster start and stop.** Credential files are no longer written with a
+  full device flush (`F_FULLFSYNC` on macOS) where an ordinary flush is
+  enough; sign-in, sign-out and revocation still flush.
+- **Release pipeline.** A prerelease version (`-rc.N`, `-beta.N`,
+  `-alpha.N`) is published to npm under `next` and as a GitHub prerelease;
+  only a stable version gets `latest`. A tag is refused unless it is on
+  `main` and Cargo.toml, Cargo.lock and every npm manifest already carry its
+  version. Binaries the build runner can execute (macOS ARM64, Linux x64,
+  Windows x64) must report it. Release actions are pinned to commits, and Rust,
+  Node, `cross` and its build image to exact versions.
+  `scripts/bump-version.js` accepts prerelease versions and updates
+  Cargo.lock.
+
+### Fixed
+
+- Sign-in durability: a sign-in is flushed to disk again, and a revocation
+  or sign-out that cannot be written fails closed (the old session store is
+  deleted), so a revoked session cannot be restored after a restart. The
+  session directory is flushed without following a planted FIFO or symlink,
+  and temporary file names include a random part.
+- Observation: directories created or moved into an observed project are
+  scanned (bounded) and watched; a save through an excluded temporary file
+  counts as a change of the real file; coverage starts once watches are in
+  place, is closed for the whole run at shutdown, and is re-claimed if
+  another daemon closed it.
+- Git snapshots are a sorted, deterministic prefix of the changed paths, so
+  two snapshots cut at different points no longer make a path look new.
+- The agent stream sends `reset` and ends when history cannot be read, and
+  resets a cursor from another database; catch-up is bounded by pages read.
+- Correlation: tier 1 no longer misses links in busy sessions; an inferred
+  item is no longer also listed as nearby. Outcomes report when nearby
+  runtime errors were truncated.
+- Dashboard: a live or polling refresh no longer aborts a slow load in
+  flight (which could keep a view from ever loading under steady activity).
+- Command intent: quoted arguments, wrapper flags with values and unknown
+  programs can no longer leak an argument into the recorded program.
+- A hash change that happened between the dashboard's first render and its
+  router effect was missed, leaving the previous page shown (more likely
+  since the sign-in check delays the first render).
+
+- Ctrl-C or `SIGTERM` did not stop the daemon while any client was connected
+  to the live stream (`/events` — an open dashboard tab, `curl`, an agent): the
+  HTTP server waited for that never-ending stream, so storage was never
+  drained and the eventual forced kill was recorded as an unclean shutdown.
+  Live streams now end when shutdown begins, and a pending `/api/wait` returns
+  `503` ("the daemon is shutting down") instead of waiting out its timeout.
+- Under continuous size eviction the full-text index kept the entries of
+  deleted events in segments that were almost never merged, and grew to
+  between 3 and 13 times its compacted size. Because the size cap counts it,
+  the database typically held about 40 % fewer events than it could (at
+  times about 65 % fewer). A cleanup cycle that removes events now ends with
+  one bounded merge (about 64 pages) of the index segments that consist mostly
+  of deleted entries; the index stays close to its compacted size without
+  extra work during ingestion. Retention reports carry `fts_compacted`.
+- On Windows the daemon now stops cleanly — draining storage and closing the
+  run — on Ctrl+Break (how supervisors stop console processes), not only on
+  Ctrl+C, and attempts the same when its console window is closed (Windows
+  allows about 5 seconds). Previously all of these ended it as an unclean
+  shutdown.
+- On Linux, tailing a file kept one CPU core busy for as long as the daemon ran:
+  the collector re-read the file on inotify *access* events, and its own
+  re-read produced the next one. Access events are now ignored.
+- A process, stdin, or tailed file that wrote a non-UTF-8 byte stopped being
+  captured (process and stdin) or failed its collector (file), silently. Invalid
+  bytes are now replaced with U+FFFD and capture continues.
+- Collectors buffered a line without a size limit. Lines are now capped at
+  64 KiB and marked `… [tailflow: line truncated from N bytes]`; the cut drops
+  the token it lands in so no fragment of a secret escapes redaction. A cut
+  JSON line is classified by its text, since it no longer parses.
+
+### Security
+
+- Sign-in links from `tailflow-daemon dashboard` expire after 60 seconds;
+  stored browser sessions are restored only by a daemon started within 15
+  minutes; session files are written atomically and only into an
+  owner-only directory.
+- Git snapshots disable every filter driver (a repository cannot make
+  TailFlow run a program), list only paths under the observed directories,
+  and withhold renames from paths excluded by privacy settings.
+- Local API access control: other OS users, containers on the host network
+  and web pages on other localhost ports can no longer read agent sessions,
+  paths, commands or logs. A session cookie counts only on requests the
+  browser marks `Sec-Fetch-Site: same-origin` (or `none` for a URL the user
+  opened), because browsers send loopback cookies to every port. The cookie
+  name carries the port, and tossed duplicate cookies are tolerated. Every
+  protected path refuses with the same answer whether or not the resource
+  exists, so there is no existence oracle. Tokens and sessions are compared
+  in constant time, and refused requests are counted in the authenticated
+  `/health`.
+- Browser requests with a non-loopback `Origin`, and cross-site requests other
+  than top-level navigation (`Sec-Fetch-Site`), are refused with `403`. Request
+  targets over 8 KiB are refused with `414`. No HTTP endpoint mutates or deletes
+  data.
+- New database files are created owner-only (`0600`) on Unix, inside an
+  owner-only data directory.
+- `/api/v1/events` pages are bounded to about 8 MiB of text and to 100 events
+  when `include_payload=true`.
+- Removed the unmaintained `atty` dependency (RUSTSEC-2021-0145,
+  RUSTSEC-2024-0375); terminal detection uses the standard library.
+- Bundled SQLite updated to 3.54.1 (rusqlite 0.41.1, libsqlite3-sys 0.39.1)
+  for CVE-2026-119375 / RUSTSEC-2026-0459: a database opened together with a
+  crafted `-wal` file could return uninitialized memory.
+- `url` 2.5.9 (RUSTSEC-2026-0592; not reachable from TailFlow), `tokio`
+  1.51.6, `rustix` 1.1.6 and `anyhow` 1.0.103 (unsoundness advisories).
+  `cargo audit` reports no vulnerabilities.
+
+- The embedded UI is served with a strict Content Security Policy
+  (`script-src 'self'`, no inline script, `frame-ancestors 'none'`),
+  `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+- Web dev dependencies: `vite` 6.4.6 and `source-map-js` 1.2.2 (override)
+  resolve the dev-server advisories reported by `npm audit`; the shipped
+  bundle was not affected.
+- Agent capture adds **no network listener and no HTTP write endpoint**: hook
+  processes hand events to the daemon through an owner-only spool directory.
+  Redaction and collection boundaries run in the hook before anything reaches
+  disk, and again in the daemon. Prompts, assistant messages, tool output and
+  file contents are never recorded; command lines only in `redacted`/`full`
+  capture mode.
 
 ## [0.3.3] - 2026-08-19
 
@@ -258,7 +653,8 @@ Initial release.
   (ARM64, x64), Linux (x64, ARM64), and Windows x64.
 - CI running `fmt`, `clippy`, `build`, and `test`.
 
-[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.4.0-rc.1...HEAD
+[0.4.0-rc.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...v0.4.0-rc.1
 [0.3.3]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.0...v0.3.1

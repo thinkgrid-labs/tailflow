@@ -1,8 +1,8 @@
-use super::Source;
+use super::{lines::BoundedLines, Source};
 use crate::{LogLevel, LogRecord, LogSender};
 use anyhow::Result;
 use chrono::Utc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -20,6 +20,10 @@ impl StdinSource {
 
 #[async_trait::async_trait]
 impl Source for StdinSource {
+    fn kind(&self) -> &'static str {
+        "stdin"
+    }
+
     fn name(&self) -> &str {
         &self.label
     }
@@ -27,7 +31,7 @@ impl Source for StdinSource {
     async fn run(self: Box<Self>, tx: LogSender, shutdown: CancellationToken) -> Result<()> {
         info!(source = %self.label, "reading from stdin");
         let stdin = tokio::io::stdin();
-        let mut lines = BufReader::new(stdin).lines();
+        let mut lines = BoundedLines::new(BufReader::new(stdin));
 
         loop {
             let line = tokio::select! {
@@ -35,7 +39,7 @@ impl Source for StdinSource {
                 line = lines.next_line() => line?,
             };
             let Some(line) = line else { break };
-            let payload = line.trim_end_matches('\n').to_string();
+            let payload = line;
             if payload.is_empty() {
                 continue;
             }

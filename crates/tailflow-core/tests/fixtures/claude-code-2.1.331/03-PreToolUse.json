@@ -1,0 +1,18 @@
+{
+  "session_id": "00000001-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/215327d6-696e-46e6-be8b-9b72e3872ef3.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "prompt_id": "cff04583-2c10-4cb5-aedc-7f837c8289c3",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git status --short",
+    "description": "Show short git working tree status"
+  },
+  "tool_use_id": "toolu_01BpqrEa5YMV1P2bTG9uGpu8"
+}

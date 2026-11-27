@@ -33,3 +33,42 @@ docker = false
 # [[sources.process]]
 # label = "worker"
 # cmd   = "cargo run -p my-worker"
+
+# ── Durable history ───────────────────────────────────────────────────────────
+# tailflow-daemon keeps a local SQLite history. Defaults shown; every key is
+# optional, and unknown keys in this section are rejected at startup.
+# See docs/storage.md.
+
+[storage]
+enabled = true
+# path = "/custom/place/events.db"   # default: the user data directory
+retention_days = 30                   # 1..36500, or "unlimited"
+max_size_mb = 2048                    # always enforced, even when unlimited
+payload_retention_days = 7
+full_text_search = true
+synchronous = "normal"                # "full" fsyncs every commit
+
+# ── Verified changes (opt-in) ─────────────────────────────────────────────────
+# Watch these project directories and take read-only Git snapshots, to
+# compare what agents report with what changed on disk. Never reads file
+# contents. See docs/evidence.md.
+
+# [observe]
+# paths = ["."]                     # relative to this file
+# exclude = ["fixtures/**"]         # in addition to .gitignore and built-ins
+# git = true
+
+# ── Privacy ───────────────────────────────────────────────────────────────────
+# Redaction runs before anything is displayed or stored. It is heuristic: it
+# catches common credential formats, not every secret.
+
+[privacy]
+capture = "metadata"                  # metadata | redacted | full (verbatim)
+# capture_enabled = false             # keep the live view, record nothing durable
+# disabled_rules = ["secret_assignment"]
+# excluded_event_types = ["runtime.log"]
+# excluded_file_globs = ["**/.env", "**/secrets/**"]
+
+# [[privacy.redaction_rules]]
+# name = "internal-token"
+# pattern = 'itk_(?P<secret>[a-z0-9]{32})'   # only the `secret` group is replaced

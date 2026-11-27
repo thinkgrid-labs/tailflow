@@ -1,0 +1,28 @@
+{
+  "session_id": "00000001-0000-4000-8000-000000000000",
+  "transcript_path": "/home/dev/.claude/projects/-work-proj/215327d6-696e-46e6-be8b-9b72e3872ef3.jsonl",
+  "cwd": "/work/proj",
+  "scratchpad_dir": "/tmp/scratch",
+  "prompt_id": "cff04583-2c10-4cb5-aedc-7f837c8289c3",
+  "permission_mode": "default",
+  "agent_id": "acdbe37b1e9c5c6a2",
+  "agent_type": "Explore",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "find . -mindepth 1 -print | sort && echo \"--- directories ---\" && find . -mindepth 1 -type d | sort",
+    "description": "List all entries including hidden ones and subdirectories"
+  },
+  "tool_response": {
+    "stdout": "./.git\n./.git/COMMIT_EDITMSG\n./.git/HEAD\n./.git/config\n./.git/description\n./.git",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_011g58TiaLNw9kjopTx2Adc8",
+  "duration_ms": 251
+}

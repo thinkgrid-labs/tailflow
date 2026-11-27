@@ -1,6 +1,11 @@
+pub mod agent;
 pub mod config;
+pub mod event;
 pub mod ingestion;
 pub mod json;
+pub mod observe;
+pub mod paths;
+pub mod privacy;
 pub mod processor;
 pub mod query;
 
@@ -72,64 +77,53 @@ impl LogLevel {
     }
 
     /// Attempt to detect level from raw log text.
+    ///
+    /// Runs once per ingested line, so it allocates nothing for plain text:
+    /// tokens are ASCII-only (`[A-Za-z0-9_]` runs) and compared with
+    /// `eq_ignore_ascii_case`; phrases are matched ASCII-case-insensitively,
+    /// which equals lowercasing first for these all-ASCII needles. The M1
+    /// implementation is kept in the tests as an oracle.
     pub fn detect(text: &str) -> Self {
         if let Some(level) = structured_level(text) {
             return level;
         }
-        let lower = text.to_lowercase();
-        let tokens: Vec<&str> = text
+        let mut failure_word = false;
+        let (mut warn, mut debug, mut trace, mut info) = (false, false, false, false);
+        for token in text
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .filter(|token| !token.is_empty())
-            .collect();
-        let words: Vec<String> = tokens
-            .iter()
-            .map(|token| token.to_ascii_lowercase())
-            .collect();
-        let explicitly_clean = [
-            "0 error",
-            "0 failure",
-            "no error",
-            "no failure",
-            "without error",
-            "error_count 0",
-            "error_count=0",
-            "errors: 0",
-            "errors=0",
-            "error-free",
-            "failure-free",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle));
-        let failure_word = words.iter().any(|word| {
-            matches!(
-                word.as_str(),
-                "err"
-                    | "error"
-                    | "errors"
-                    | "fatal"
-                    | "panic"
-                    | "panicked"
-                    | "exception"
-                    | "failed"
-                    | "failure"
-                    | "traceback"
-            )
-        }) || tokens
-            .iter()
-            .any(|token| token.ends_with("Error") || token.ends_with("Exception"))
-            || lower.contains("segmentation fault")
-            || lower.contains("unhandled rejection")
-            || lower.contains("uncaught exception");
-
-        if failure_word && !explicitly_clean {
+        {
+            if !failure_word
+                && (FAILURE_WORDS.iter().any(|w| token.eq_ignore_ascii_case(w))
+                    || token.ends_with("Error")
+                    || token.ends_with("Exception"))
+            {
+                failure_word = true;
+            }
+            warn |= token
+                .get(..4)
+                .is_some_and(|head| head.eq_ignore_ascii_case("warn"));
+            debug |= token.eq_ignore_ascii_case("debug");
+            trace |= token.eq_ignore_ascii_case("trace");
+            info |= token.eq_ignore_ascii_case("info");
+        }
+        let failure_word = failure_word
+            || FAILURE_PHRASES
+                .iter()
+                .any(|p| contains_ignore_ascii_case(text, p));
+        if failure_word
+            && !CLEAN_PHRASES
+                .iter()
+                .any(|p| contains_ignore_ascii_case(text, p))
+        {
             LogLevel::Error
-        } else if words.iter().any(|word| word.starts_with("warn")) {
+        } else if warn {
             LogLevel::Warn
-        } else if words.iter().any(|word| word == "debug") {
+        } else if debug {
             LogLevel::Debug
-        } else if words.iter().any(|word| word == "trace") {
+        } else if trace {
             LogLevel::Trace
-        } else if words.iter().any(|word| word == "info") {
+        } else if info {
             LogLevel::Info
         } else {
             LogLevel::Unknown
@@ -137,8 +131,60 @@ impl LogLevel {
     }
 }
 
+/// Whole words (case-insensitive) that mark a line as an error.
+const FAILURE_WORDS: [&str; 10] = [
+    "err",
+    "error",
+    "errors",
+    "fatal",
+    "panic",
+    "panicked",
+    "exception",
+    "failed",
+    "failure",
+    "traceback",
+];
+
+/// Multi-word failure markers (lowercase, matched case-insensitively).
+const FAILURE_PHRASES: [&str; 3] = [
+    "segmentation fault",
+    "unhandled rejection",
+    "uncaught exception",
+];
+
+/// Phrases that report the *absence* of errors and veto an error level.
+const CLEAN_PHRASES: [&str; 11] = [
+    "0 error",
+    "0 failure",
+    "no error",
+    "no failure",
+    "without error",
+    "error_count 0",
+    "error_count=0",
+    "errors: 0",
+    "errors=0",
+    "error-free",
+    "failure-free",
+];
+
+/// `haystack.to_lowercase().contains(needle)` for an ASCII-lowercase
+/// `needle`, without allocating.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 fn structured_level(text: &str) -> Option<LogLevel> {
-    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let text = text.trim();
+    // Only a JSON object can carry a level field; skip the parser (and its
+    // error allocation) for the plain-text majority.
+    if !text.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let object = value.as_object()?;
     for key in [
         "level",
@@ -287,6 +333,193 @@ mod tests {
         assert_eq!(LogLevel::detect("Error: bad"), LogLevel::Error);
         assert_eq!(LogLevel::detect("ERROR: bad"), LogLevel::Error);
         assert_eq!(LogLevel::detect("error: bad"), LogLevel::Error);
+    }
+
+    /// The M1 implementation, verbatim, as an oracle for the allocation-free
+    /// rewrite.
+    fn detect_reference(text: &str) -> LogLevel {
+        if let Some(level) = structured_level(text) {
+            return level;
+        }
+        let lower = text.to_lowercase();
+        let tokens: Vec<&str> = text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|token| !token.is_empty())
+            .collect();
+        let words: Vec<String> = tokens
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+        let explicitly_clean = [
+            "0 error",
+            "0 failure",
+            "no error",
+            "no failure",
+            "without error",
+            "error_count 0",
+            "error_count=0",
+            "errors: 0",
+            "errors=0",
+            "error-free",
+            "failure-free",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        let failure_word = words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "err"
+                    | "error"
+                    | "errors"
+                    | "fatal"
+                    | "panic"
+                    | "panicked"
+                    | "exception"
+                    | "failed"
+                    | "failure"
+                    | "traceback"
+            )
+        }) || tokens
+            .iter()
+            .any(|token| token.ends_with("Error") || token.ends_with("Exception"))
+            || lower.contains("segmentation fault")
+            || lower.contains("unhandled rejection")
+            || lower.contains("uncaught exception");
+
+        if failure_word && !explicitly_clean {
+            LogLevel::Error
+        } else if words.iter().any(|word| word.starts_with("warn")) {
+            LogLevel::Warn
+        } else if words.iter().any(|word| word == "debug") {
+            LogLevel::Debug
+        } else if words.iter().any(|word| word == "trace") {
+            LogLevel::Trace
+        } else if words.iter().any(|word| word == "info") {
+            LogLevel::Info
+        } else {
+            LogLevel::Unknown
+        }
+    }
+
+    #[test]
+    fn detect_matches_the_m1_implementation() {
+        let fixed = [
+            "",
+            " ",
+            "ERROR: connection refused",
+            "Build finished with 0 errors",
+            "build finished with 0 ERRORS but a fatal warning",
+            "WARNING: disk",
+            "warnings=3",
+            "Warn",
+            "TypeError: x is undefined",
+            "TypeERROR: x",
+            "NoSuchElementException thrown",
+            "SEGMENTATION FAULT (core dumped)",
+            "Unhandled Rejection at promise",
+            "UnCaught   Exception",
+            "uncaught exception",
+            "error_count=0 everything fine",
+            "ERROR_COUNT=0",
+            "errors: 0 warnings: 2",
+            "Error-Free run",
+            "terror level increased",
+            "err",
+            "e r r o r",
+            "\u{130}NFO with dotted capital I",
+            "\u{212a}elvin sign then error",
+            "noİ error",
+            "ﬁle failed",
+            "ß ERROR ß",
+            "日本語 error 日本語",
+            "emoji 🚨 failure 🚨",
+            r#"{"level":"warn","message":"error budget healthy"}"#,
+            r#"  {"severity":3}  "#,
+            r#"{"msg":"no level key but error"}"#,
+            "{not json error",
+            "[debug] trace info warn",
+            "info: tracer debugged",
+        ];
+        for line in fixed {
+            assert_eq!(LogLevel::detect(line), detect_reference(line), "{line:?}");
+        }
+
+        // Pseudo-random lines over the vocabulary the classifier cares about.
+        let vocab = [
+            "error",
+            "ERROR",
+            "Error",
+            "err",
+            "errors",
+            "fatal",
+            "panic",
+            "panicked",
+            "exception",
+            "Exception",
+            "failed",
+            "failure",
+            "traceback",
+            "TypeError",
+            "IOException",
+            "warn",
+            "WARNING",
+            "warned",
+            "debug",
+            "DEBUG",
+            "trace",
+            "info",
+            "INFO",
+            "0",
+            "no",
+            "without",
+            "error_count",
+            "errors:",
+            "errors=0",
+            "error-free",
+            "failure-free",
+            "segmentation",
+            "fault",
+            "unhandled",
+            "rejection",
+            "uncaught",
+            "ok",
+            "200",
+            "GET",
+            "/api/x",
+            "é",
+            "\u{130}",
+            "\u{212a}",
+            "ß",
+            "日本",
+            "_",
+            "-",
+            ":",
+            "=",
+            "{",
+            "}",
+            "\"level\"",
+            "\"warn\"",
+            "terror",
+            "informal",
+            "debugger",
+        ];
+        let seps = [" ", "", "  ", "-", "_", ":", "=", ", ", "\t", "/", "."];
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let words = 1 + next() % 8;
+            let mut line = String::new();
+            for _ in 0..words {
+                line.push_str(vocab[(next() % vocab.len() as u64) as usize]);
+                line.push_str(seps[(next() % seps.len() as u64) as usize]);
+            }
+            assert_eq!(LogLevel::detect(&line), detect_reference(&line), "{line:?}");
+        }
     }
 
     #[test]

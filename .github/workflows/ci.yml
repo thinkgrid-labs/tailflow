@@ -47,6 +47,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all
+      # Links, anchors, API routes, config keys and every documented CLI
+      # command/flag against the binaries just built.
+      - name: Documentation check
+        run: python3 scripts/docs/check_docs.py --bin target/debug
 
   # ── Tests ──────────────────────────────────────────────────────────────────
   test:
@@ -67,29 +71,175 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm test && npm run build
+      # Version validation, npm dist-tag and GitHub prerelease selection,
+      # and publish ordering used by release.yml.
+      - name: Release tooling tests
+        run: node --test scripts/release/release-plan.test.js
+      - name: Bundle size budget
+        run: |
+          js=$(cat web/dist/assets/*.js | gzip -9 | wc -c)
+          css=$(cat web/dist/assets/*.css | gzip -9 | wc -c)
+          echo "JS gzip: $js bytes, CSS gzip: $css bytes"
+          test "$js" -le 61440 || { echo "JS bundle over the 60 KiB gzip budget"; exit 1; }
+          test "$css" -le 10240 || { echo "CSS over the 10 KiB gzip budget"; exit 1; }
+
+  # ── Browser end-to-end ─────────────────────────────────────────────────────
+  # The real daemon (debug build, UI embedded from disk) with a fixture
+  # dataset fed through the real agent hook adapters.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cd web && npm ci && npm run build
+      - run: cargo build -p tailflow-daemon -p tailflow-tui --bins
+      - run: cd web && npx playwright install --with-deps chromium
+      - run: cd web && npx playwright test --project=chromium
+        env:
+          PLAYWRIGHT_CHANNEL: chromium
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: web/test-results
+
+  # The same suite (including axe and the Fetch Metadata checks) in Firefox
+  # and WebKit.
+  e2e-browsers:
+    name: e2e (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cd web && npm ci && npm run build
+      - run: cargo build -p tailflow-daemon -p tailflow-tui --bins
+      - run: cd web && npx playwright install --with-deps ${{ matrix.browser }}
+      - run: cd web && npx playwright test --project=${{ matrix.browser }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results-${{ matrix.browser }}
+          path: web/test-results
 
   msrv:
-    name: rust-1.88
+    name: rust-1.89
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Prepare web/dist for rust-embed
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - run: cargo check --all --locked
 
+  # ── Resource bounds ────────────────────────────────────────────────────────
+  # Deterministic checks only: zero event loss under short steady, burst and
+  # large-payload loads, release binary size within budget, and bounded
+  # memory. Shared-runner timing is noise, so CPU and latency are recorded
+  # (artifact) but never gated; compare those on a dedicated host with
+  # scripts/bench/compare.py.
+  resources:
+    name: resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked --bins
+      - run: cargo build --release --locked -p tailflow-daemon --examples
+      - run: python3 scripts/bench/check_budgets.py --require-size-budget --out resource-checks.jsonl
+      # The gate must fail on a crashed daemon, a failed SSE probe, real
+      # event loss, missing metrics and an oversized binary — proven here by
+      # injecting each fault against the real daemon.
+      - run: python3 scripts/bench/gate_selftest.py
+      # Agent hooks run as Claude Code and Codex run them (Linux).
+      - run: python3 scripts/smoke/agent_hook_smoke.py --out agent-smoke-ubuntu.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resource-checks
+          path: |
+            resource-checks.jsonl
+            agent-smoke-ubuntu.json
+          if-no-files-found: error
+
+  # ── Native platforms ───────────────────────────────────────────────────────
+  # The full test suite and a release smoke test (start, API, database, file
+  # and process collection, graceful stop, restart persistence, hard-kill
+  # recovery) on Windows x86_64 (MSVC) and macOS arm64, natively. Then the
+  # agent hook smoke test: install, run the hooks as Claude Code (exec form)
+  # and Codex (`cmd /C` on Windows) do from a path with spaces and
+  # parentheses, ingestion, evidence, privacy, restart, uninstall. It needs no
+  # agent, account or secret, and does not prove real agents call hooks
+  # this way (see the script's docstring).
+  platforms:
+    name: platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare web/dist for rust-embed
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform
+      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo build --release --locked --bins
+      - run: python3 scripts/smoke/platform_smoke.py --out smoke-${{ matrix.os }}.json
+      - run: python3 scripts/smoke/agent_hook_smoke.py --out agent-smoke-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ matrix.os }}
+          path: |
+            smoke-${{ matrix.os }}.json
+            agent-smoke-${{ matrix.os }}.json
+
   # ── Quality gate ───────────────────────────────────────────────────────────
   # Set this as the required status check in branch protection for main and dev.
   quality:
     name: quality
-    needs: [fmt, clippy, build, test, web, msrv]
+    needs: [fmt, clippy, build, test, web, e2e, e2e-browsers, msrv, resources, platforms]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All checks passed."

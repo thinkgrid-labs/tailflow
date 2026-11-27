@@ -5,24 +5,50 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 
 [Documentation index](README.md)
 
+## Not yet validated
+
+These checks have not been done, so the matching claims rest on synthetic
+tests or on one development machine:
+
+- **Codex:** run against a live Codex 0.171 session on macOS (sessions,
+  resume, subagents, `apply_patch`, token counts, spool replay), with hook
+  trust granted for each run. The interactive `/hooks` trust review, and
+  live Codex on Linux and Windows, are unconfirmed.
+- **Windows agents:** hook installation, capture, file observation and
+  shutdown pass CI on Windows with synthetic hook input. Real Claude Code and
+  Codex sessions on Windows have not been run.
+- **Long runs:** the longest runs so far are 8-hour soaks of earlier
+  development builds (macOS: memory flat; a Linux VM: still rising slowly at
+  hour 8). A 24-hour Linux endurance run of this release has not been
+  done.
+- **Benchmarks:** TailFlow has not been benchmarked on a quiet, dedicated
+  host, or on Linux or Windows, so these docs publish no CPU or memory
+  figures.
+
 ## Scope at a glance
 
 | Area | Current boundary | Practical implication |
 |---|---|---|
-| Network | Loopback-only HTTP, no auth or TLS | Do not expose the daemon directly to a network |
-| Retention | Bounded in-memory ring | History disappears on restart and can be evicted |
+| Network | Loopback-only HTTP; token or session required, no TLS | Do not expose the daemon directly to a network |
+| Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
+| Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
+| Redaction | Heuristic credential patterns | Not every secret is detected |
+| Agent activity | Opt-in Claude Code and Codex hooks (since v0.4.0) | Only what the agent's hooks report; hooks do not report shell side effects, Claude Code tokens or agent versions |
+| File and Git evidence | Opt-in `[observe]` directories (since v0.4.0) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
 | Docker | All running containers on the local daemon | No Compose-service allowlist, Kubernetes, or remote Docker target |
 | Files | Local paths | No network log drains or object-store ingestion |
-| Platforms | macOS ARM64/x64, Linux ARM64/x64, Windows x64 | Other targets require a source build and may be untested |
+| Platforms | macOS ARM64/x64, Linux ARM64/x64 (glibc; ARM64 needs glibc 2.39+), Windows x64 | Other targets, including musl, require a source build and may be untested |
 
 ## Security model
 
-The daemon binds to `127.0.0.1`, rejects nonloopback Host headers, and does not
-enable permissive cross-origin access. It has no users, permissions, API keys,
-or transport encryption.
+The daemon binds to `127.0.0.1`, rejects nonloopback Host headers, does not
+enable cross-origin access, and requires a credential on every data
+endpoint: a per-run API token (CLI, MCP, scripts) or a same-origin browser
+session (see [security](security.md)). It has one credential level (full
+read access), no per-user permissions, and no transport encryption.
 
 That is appropriate for one developer machine. It is not sufficient for:
 
@@ -32,8 +58,20 @@ That is appropriate for one developer machine. It is not sufficient for:
 - multi-tenant log access.
 
 Logs can contain credentials, tokens, personal data, and customer content.
-TailFlow does not redact payloads. Configure sources carefully and remember that
-any local process able to connect to the daemon can query its buffer.
+TailFlow redacts common credential formats (API keys, bearer tokens, URL
+passwords, private keys, `password=` assignments) before display and before
+storage, unless `capture = "full"`. That is a heuristic: personal data,
+customer content, and secrets in unrecognized formats pass through.
+
+Other OS users, containers sharing the host network and web pages on other
+localhost ports cannot read the API without a credential. Processes running
+as your own user can: they can read the token file and the database
+directly. Browsers send loopback cookies to every port, so a malicious
+server on another loopback port that your browser visits receives the
+session cookie (see [security](security.md#outside-the-threat-model)). No
+HTTP endpoint can delete or change data. The database file is protected only
+by filesystem permissions (a user-only directory on Unix) and is not
+encrypted at rest.
 
 If remote access is required, place an authenticated, encrypted proxy in front
 of TailFlow and evaluate the exposure deliberately. Remote operation is not a
@@ -41,9 +79,29 @@ tested first-class workflow.
 
 ## Retention and completeness
 
-The daemon retains the newest `--buffer` records, defaulting to 5,000. It does
-not persist them to disk. A restart starts a new cursor lifetime with no earlier
-history.
+The live ring retains the newest `--buffer` records (default 5,000), up to
+`--buffer-mb` of log text (default 16 MiB; reported as `buffered_bytes` on
+`/health`) — with very long lines the byte limit is reached first — and
+restarts its cursor at each daemon start. Single lines longer than 64 KiB are
+cut and marked `… [tailflow: line truncated from N bytes]`. Durable history is separate: SQLite,
+30-day retention, 2 GB cap, persistent cursors. See
+[durable history](storage.md) for its guarantees. In particular:
+
+- an event counts as persisted only after its batch commits; with the default
+  `synchronous = "normal"` the newest commits can be lost on power failure;
+- the size cap applies to live database pages; the WAL and not-yet-reclaimed
+  free pages can briefly add to the file size;
+- the TUI does not write history;
+- one database is shared by all your daemons by default, so history from
+  other projects (recorded under their own privacy settings) is visible unless
+  you filter by `project` or give each project its own `[storage] path`; and
+- time during which no daemon ran is not recorded as a gap; and
+- on Windows there is no cheap process-liveness probe, so a daemon that was
+  killed (not stopped cleanly) is recognised only once its heartbeat is more
+  than 60 s old — at the next start, or at the next full cleanup pass of a
+  running daemon. Until then the up to ~0.5 s of events it had not yet
+  committed are not reported as a gap. On macOS and Linux the next start
+  detects it immediately.
 
 Responses expose `buffer_start_cursor`, `next_cursor`, `buffer_starts_at`, and
 `cursor_gap` where relevant. Callers should treat `cursor_gap: true` or a short
@@ -122,6 +180,96 @@ after the process exits unless another source also writes it to a file.
   that no retained/new line matched before the deadline.
 - The MCP output is optimized for bounded context, so callers needing exact data
   should request JSON or use the HTTP API.
+- From v0.4.0 the API requires a credential. `tailflow-mcp` and
+  `tailflow-logs` 0.3.x, and scripts that send no token, get `401` until they
+  are upgraded or send `Authorization: Bearer $(tailflow-daemon token)`.
+
+## Agent capture boundaries
+
+See [agent capture](agent-capture.md#what-tailflow-cannot-see) for the full
+matrix. In short:
+
+- Events are **agent-reported**. An agent's `file.modified` means its file
+  tool reported an edit, not that TailFlow saw the file change. Hooks do not
+  report edits made through the shell (`sed -i`, `>`, `mv`, build scripts).
+  In a directory under `[observe]`, the file watcher does record those
+  changes, as unattributed observations.
+- **Claude Code** reports a shell command's exit code only when it fails
+  (parsed from the documented `Exit code N` error text). **Codex** documents
+  no exit code at all, so its commands have no recorded outcome unless the
+  response happens to carry one.
+- Codex runs hooks only after you trust them in `/hooks`; Claude Code
+  interactive sessions run hooks only in trusted folders; managed policy can
+  disable user hooks entirely. TailFlow reports what it can detect but cannot
+  override any of these.
+- A hook call costs the agent about 15 ms (two per Claude Code tool call),
+  almost all of it process start.
+- Without a running daemon, hook calls wait in the spool (about 20,000 calls).
+  Beyond that they are dropped and counted as a recorded gap.
+- Git association reads `.git` metadata at session start and end. A HEAD that
+  moved during a session is reported as inferred, low confidence, and never
+  attributed to the agent.
+- Codex sends no exit code for shell commands (a live 0.171 session sent only
+  the command's output), so a failed Codex command is shown as `unknown`, the
+  same as a successful one.
+- Codex runs hooks through your login shell (`$SHELL -lc`). Anything your shell
+  profile prints at startup becomes hook output, which Codex adds to the
+  model's context on `SessionStart`. TailFlow cannot prevent that; keep the
+  profile quiet for non-interactive shells.
+- Agent events are ingested only into the default per-user database; a daemon
+  with a custom `[storage] path` / `--db` does not ingest them.
+
+## File and Git evidence boundaries
+
+- Only directories listed in `[observe]` (or `--observe`) are watched, and only while a daemon runs. A change made while nothing was observing it is **unverified**, not absent.
+- A file watcher records that a path changed, not which process changed it. A **reported + observed** match is an association within a time window (± 5 s by default), not authorship.
+- The OS may coalesce or drop notifications. Drops the OS reports (`fs_watcher_rescan`) and TailFlow's own queue overflows (`fs_observer_overflow`) are recorded as loss; drops the OS does not report cannot be detected.
+- The observer's queue is bounded (8,192 entries). Repeated changes to one path share an entry, and in testing no overflow occurred up to about 2,800 new files per second, the fastest the test machine could write. Thousands of distinct paths changing faster than that can still overflow it; the loss is counted and the affected reports become **unverified**.
+- On Linux, a file changed only through a memory mapping (`mmap`) produces no notification, so the change is not observed.
+- macOS (FSEvents) can repeat a recently created file's "created" and "modified" flags on later notifications, so an attribute-only change (for example `chmod`) of a new file may be reported as a change to it. Linux reports such changes as attribute changes, which are not recorded.
+- On Linux at most `max_directories` directories per root are watched (inotify uses one watch per directory); beyond that coverage is reported as partial and reports there are **unverified**.
+- Git snapshots list at most 150 changed paths under the observed directories (the total is always recorded); a session comparison stops at the last listed path and is marked incomplete. Snapshots happen at startup, at session boundaries (seen at once, or within about 2 seconds when another daemon recorded them) and after changes settle (at most every 30 s by default): changes between snapshots are seen only as their net effect.
+- TailFlow runs `git status` and `git diff --numstat` read-only, with every filter driver disabled. Files managed by a filter (for example Git LFS) can therefore appear modified in snapshots when your own `git status` shows them clean.
+- `.gitignore` support is a subset (no `[[:class:]]`), and ignore files created after the observer started apply from the next start.
+
+## Outcomes and correlation boundaries
+
+- A command's outcome is what the agent reported. TailFlow does not run, trace or observe agent processes, so `verified_exit_status` never appears for them. Codex reports an outcome only when its tool response carries an exit code.
+- Classification uses the program, a vocabulary subcommand and a pattern-matched script name. Commands recorded before this release, wrappers TailFlow does not know, and custom script names are `unknown` or `other`.
+- "Nearby" runtime errors are close in time only. The one inference rule (an error message naming a changed file) is a heuristic and is labelled as such.
+
+## Dashboard boundaries
+
+See the [dashboard guide](dashboard.md) for how each view reads its data.
+
+- Agent activity streams to the dashboard only after it is committed to
+  durable history. Expect about 1 second from a hook call to an updated page
+  (spool pickup, the storage batch delay, a 250 ms coalescing window, then
+  the page's own query). Commits made by *another* daemon sharing the
+  database are seen within 250 ms of committing (polling interval). A
+  reconnecting tab catches up at most 5,000 events, then reloads its views
+  instead.
+- The live log view keeps the newest 5,000 lines and renders only the rows on
+  screen. Browser find-in-page and drag-selection cover only rendered rows;
+  use the filter box, **Copy lines**, or Activity search instead.
+- A timeline window draws at most 3,000 agent events and 500 runtime markers
+  and says when a window holds more. Activity and session lists load pages of
+  200–500 and stop after 5,000 (Activity) or 20,000 (one session) rows in the
+  browser; narrow the filters to see older events.
+- Result counts in Activity are "loaded so far", not a total: counting every
+  match of an arbitrary filter would mean scanning history.
+- Overview counts come from indexes and are exact for retained history. When
+  the range reaches back before retention, or overlaps recorded loss, the page
+  says the numbers are lower bounds.
+- The Integrations page reports hooks recorded by `tailflow agent install`.
+  Hooks added to an agent config by hand are not detected there;
+  `tailflow agent status` checks the default config paths.
+- Nearby runtime events in the inspector are matched by time (±30 s) only.
+  The dashboard does not infer causation.
+- The live view keeps up with 1,000 lines/s in testing. Far beyond that (tens
+  of thousands of lines/s), parsing the stream saturates the browser tab; the
+  daemon reports the lines it dropped for that tab; durable history, when
+  enabled, still records them.
 
 ## Non-goals
 

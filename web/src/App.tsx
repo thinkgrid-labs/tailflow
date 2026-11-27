@@ -1,184 +1,190 @@
-import { useMemo, useRef, useEffect, useState, useCallback } from 'preact/hooks'
-import { useLogStream } from './hooks/useLogStream'
-import { LogRow } from './components/LogRow'
-import { Sidebar } from './components/Sidebar'
-import type { LogLevel } from './types'
-import { LEVEL_COLOR } from './types'
+import { Fragment } from 'preact'
+import { useEffect, useRef, useState } from 'preact/hooks'
+import { useRoute, SettingsContext, navigate, useAgentStreamStatus } from './lib/hooks.ts'
+import { href, type Page } from './lib/router.ts'
+import { applySettings, loadSettings, saveSettings, type Settings } from './lib/settings.ts'
+import { useLiveStatus } from './hooks/useLogStream'
+import { Icon, type IconName } from './components/icons'
+import { Overview } from './pages/Overview'
+import { Sessions } from './pages/Sessions'
+import { Activity } from './pages/Activity'
+import { Logs } from './pages/Logs'
+import { lazy } from './lib/lazy.ts'
+import { Card, Loading } from './components/ui'
+import { SignIn } from './components/SignIn'
+import { authState, checkSession, subscribeAuth, type AuthState } from './lib/auth.ts'
 
-const ALL_LEVELS: LogLevel[] = ['error', 'warn', 'info', 'debug', 'trace', 'unknown']
+// Less-used pages load on first visit (route-level code splitting).
+const pageFallback = () => <div class="page"><Card><Loading rows={6} /></Card></div>
+const SessionDetailPage = lazy(() => import('./pages/SessionDetail').then(m => m.SessionDetailPage), pageFallback)
+const Timeline = lazy(() => import('./pages/Timeline').then(m => m.Timeline), pageFallback)
+const Files = lazy(() => import('./pages/Files').then(m => m.Files), pageFallback)
+const Commands = lazy(() => import('./pages/Commands').then(m => m.Commands), pageFallback)
+const Integrations = lazy(() => import('./pages/Integrations').then(m => m.Integrations), pageFallback)
+const SettingsPage = lazy(() => import('./pages/Settings').then(m => m.SettingsPage), pageFallback)
 
-function tryRegex(s: string): RegExp | null {
-  try { return new RegExp(s, 'i') } catch { return null }
+const NAV: { page: Page; label: string; icon: IconName; section?: string }[] = [
+  { page: 'overview', label: 'Overview', icon: 'overview' },
+  { page: 'sessions', label: 'Sessions', icon: 'sessions' },
+  { page: 'activity', label: 'Activity', icon: 'activity' },
+  { page: 'timeline', label: 'Timeline', icon: 'timeline' },
+  { page: 'logs', label: 'Logs', icon: 'logs' },
+  { page: 'errors', label: 'Errors', icon: 'errors' },
+  { page: 'files', label: 'Files', icon: 'files', section: 'Operations' },
+  { page: 'commands', label: 'Commands', icon: 'commands' },
+  { page: 'integrations', label: 'Integrations', icon: 'integrations', section: 'System' },
+  { page: 'settings', label: 'Settings', icon: 'settings' },
+]
+
+const TITLES: Record<Page, string> = {
+  overview: 'Overview', sessions: 'Sessions', session: 'Session', activity: 'Activity',
+  timeline: 'Timeline', logs: 'Logs', errors: 'Errors', files: 'Files', commands: 'Commands',
+  integrations: 'Integrations & storage', settings: 'Settings',
 }
 
+/** Agent stream state → the connection pill's tone and label. Pages fall
+ *  back to polling whenever the stream is not live. */
+const AGENT_CONN = { live: 'connected', connecting: 'connecting', reconnecting: 'connecting', off: 'disconnected' } as const
+const AGENT_LABEL = { live: 'Live', connecting: 'Connecting', reconnecting: 'Reconnecting', off: 'Polling' } as const
+
+/** Checks the browser session first: nothing that reads data (pages, the
+ *  live stream) mounts until the daemon accepts it. */
 export function App() {
-  const { records, status, clear } = useLogStream()
+  const [auth, setAuth] = useState<AuthState>(authState)
+  useEffect(() => {
+    const off = subscribeAuth(() => setAuth(authState()))
+    void checkSession()
+    return off
+  }, [])
+  useEffect(() => applySettings(loadSettings()), [])
+  if (auth.status === 'signed_out') {
+    document.title = 'Sign in · TailFlow'
+    return <SignIn reason={auth.reason} />
+  }
+  if (auth.status === 'checking') return <div class="signin" aria-busy="true" />
+  return <Dashboard />
+}
 
+function Dashboard() {
+  const [settings, setSettings] = useState<Settings>(loadSettings)
+  const update = (p: Partial<Settings>) => setSettings(s => {
+    const next = { ...s, ...p }
+    saveSettings(next)
+    return next
+  })
+  useEffect(() => applySettings(settings), [settings])
+
+  const route = useRoute()
+  const status = useLiveStatus()
+  const agentStatus = useAgentStreamStatus()
+  const [navOpen, setNavOpen] = useState(false)
   const [version, setVersion] = useState<string | null>(null)
+  const search = useRef<HTMLInputElement>(null)
+  const main = useRef<HTMLElement>(null)
+
   useEffect(() => {
-    let active = true
-    fetch('/health')
-      .then(response => response.ok
-        ? response.json()
-        : Promise.reject(new Error('health request failed')))
-      .then((health: { version?: unknown }) => {
-        if (active && typeof health.version === 'string') setVersion(health.version)
-      })
-      .catch(() => { /* the dashboard remains usable without version metadata */ })
-    return () => { active = false }
+    fetch('/health').then(r => (r.ok ? r.json() : null))
+      .then((h: { version?: unknown } | null) => { if (h && typeof h.version === 'string') setVersion(h.version) })
+      .catch(() => {})
   }, [])
 
-  // ── Filter state ──────────────────────────────────────────────────────────
-  const [filter,          setFilter]          = useState('')
-  const [selectedSources, setSelectedSources] = useState<Set<string> | null>(null)
-  const [selectedLevels,  setSelectedLevels]  = useState<Set<LogLevel> | null>(null)
+  // Page change: close the mobile drawer, reset scroll, set the title.
+  useEffect(() => {
+    setNavOpen(false)
+    main.current?.scrollTo(0, 0)
+    document.title = `${TITLES[route.page]} · TailFlow`
+  }, [route.page, route.id])
 
-  // ── Source map (name → total count) ───────────────────────────────────────
-  const sources = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const r of records) m.set(r.source, (m.get(r.source) ?? 0) + 1)
-    return m
-  }, [records])
-
-  // ── Filtered view ─────────────────────────────────────────────────────────
-  const filtered = useMemo(() => {
-    const re = filter ? tryRegex(filter) : null
-    const lower = filter.toLowerCase()
-    return records.filter(r => {
-      if (selectedSources && !selectedSources.has(r.source)) return false
-      if (selectedLevels  && !selectedLevels.has(r.level))   return false
-      if (filter) {
-        return re
-          ? re.test(r.payload) || re.test(r.source)
-          : r.payload.toLowerCase().includes(lower) || r.source.toLowerCase().includes(lower)
+  // `/` focuses search (unless typing somewhere already).
+  useEffect(() => {
+    const on = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement
+      if (e.key === '/' && !e.metaKey && !e.ctrlKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) {
+        e.preventDefault()
+        search.current?.focus()
       }
-      return true
-    })
-  }, [records, filter, selectedSources, selectedLevels])
-
-  // ── Auto-scroll ───────────────────────────────────────────────────────────
-  const feedRef    = useRef<HTMLDivElement>(null)
-  const sentinelRef = useRef<HTMLDivElement>(null)
-  const [atBottom, setAtBottom] = useState(true)
-
-  useEffect(() => {
-    const el = feedRef.current
-    if (!el) return
-    const ob = new IntersectionObserver(
-      ([entry]) => setAtBottom(entry.isIntersecting),
-      { root: el, threshold: 0.1 }
-    )
-    if (sentinelRef.current) ob.observe(sentinelRef.current)
-    return () => ob.disconnect()
-  }, [])
-
-  useEffect(() => {
-    if (atBottom && sentinelRef.current) {
-      sentinelRef.current.scrollIntoView({ behavior: 'instant', block: 'end' })
     }
-  }, [filtered, atBottom])
-
-  const scrollToBottom = useCallback(() => {
-    sentinelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-    setAtBottom(true)
+    window.addEventListener('keydown', on)
+    return () => window.removeEventListener('keydown', on)
   }, [])
 
-  // ── Source sidebar toggles ────────────────────────────────────────────────
-  const toggleSource = useCallback((name: string) => {
-    setSelectedSources(prev => {
-      if (prev === null) {
-        // deselect all except this one
-        return new Set([name])
-      }
-      const next = new Set(prev)
-      if (next.has(name)) {
-        next.delete(name)
-        return next.size === 0 ? null : next
-      } else {
-        next.add(name)
-        return next
-      }
-    })
-  }, [])
-
-  const selectAllSources = useCallback(() => setSelectedSources(null), [])
-
-  // ── Level pill toggles ────────────────────────────────────────────────────
-  const toggleLevel = useCallback((level: LogLevel) => {
-    setSelectedLevels(prev => {
-      if (prev === null) return new Set(ALL_LEVELS.filter(l => l !== level))
-      const next = new Set(prev)
-      if (next.has(level)) {
-        next.delete(level)
-        return next.size === 0 ? null : next
-      } else {
-        next.add(level)
-        if (next.size === ALL_LEVELS.length) return null   // all on → reset
-        return next
-      }
-    })
-  }, [])
-
-  const statusDot = status === 'connected' ? '●' : status === 'connecting' ? '◌' : '○'
-  const statusCls = `status-dot status-dot--${status}`
+  const active = route.page === 'session' ? 'sessions' : route.page
+  const statusLabel = status === 'connected' ? 'Live' : status === 'connecting' ? 'Reconnecting' : 'Disconnected'
 
   return (
-    <div class="layout">
-      {/* ── Header ──────────────────────────────────────────────────────── */}
-      <header class="header">
-        <span class="logo">TailFlow</span>
-        {version && <span class="version">v{version}</span>}
-
-        <input
-          class="filter-input"
-          type="text"
-          placeholder="filter by keyword or /regex/"
-          value={filter}
-          onInput={e => setFilter((e.target as HTMLInputElement).value)}
-          spellcheck={false}
-        />
-
-        <div class="level-pills">
-          {ALL_LEVELS.filter(l => l !== 'unknown').map(level => {
-            const active = selectedLevels === null || selectedLevels.has(level)
-            return (
-              <button
-                key={level}
-                class={`level-pill ${active ? 'level-pill--active' : 'level-pill--dim'}`}
-                style={{ '--lc': LEVEL_COLOR[level] } as never}
-                onClick={() => toggleLevel(level)}
-              >
-                {level.slice(0, 3).toUpperCase()}
-              </button>
-            )
-          })}
-        </div>
-
-        <span class={statusCls} title={status}>{statusDot}</span>
-        <span class="record-count">{filtered.length.toLocaleString()}</span>
-        <button class="clear-btn" onClick={clear} title="Clear all logs">✕</button>
-      </header>
-
-      {/* ── Body ────────────────────────────────────────────────────────── */}
-      <div class="body">
-        <Sidebar
-          sources={sources}
-          selected={selectedSources}
-          onToggle={toggleSource}
-          onSelectAll={selectAllSources}
-        />
-
-        <div class="feed" ref={feedRef}>
-          {filtered.map(r => <LogRow key={r.seq} record={r} />)}
-          <div ref={sentinelRef} class="sentinel" />
-
-          {!atBottom && (
-            <button class="scroll-btn" onClick={scrollToBottom} title="Scroll to bottom">
-              ↓ latest
+    <SettingsContext.Provider value={{ settings, update }}>
+      <a class="skip-link" href="#main" onClick={e => { e.preventDefault(); main.current?.focus() }}>Skip to content</a>
+      <div class={`app${settings.sidebarCollapsed ? ' collapsed' : ''}${navOpen ? ' nav-open' : ''}`} onClick={e => {
+        if (navOpen && (e.target as HTMLElement).classList.contains('app')) setNavOpen(false)
+      }}>
+        <nav class="sidebar" aria-label="Main">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"><Icon name="logo" size="sm" /></span>
+            <span class="brand-word">TailFlow</span>
+            {version && <span class="brand-ver">v{version}</span>}
+          </div>
+          {NAV.map(n => (
+            <Fragment key={n.page}>
+              {n.section && <div class="nav-section">{n.section}</div>}
+              <a class="nav-item" href={href(n.page)} aria-current={active === n.page ? 'page' : undefined}
+                title={settings.sidebarCollapsed ? n.label : undefined}>
+                <Icon name={n.icon} />
+                <span class="nav-label">{n.label}</span>
+              </a>
+            </Fragment>
+          ))}
+          <div class="sidebar-foot">
+            <button class="nav-item hide-sm" style={{ width: '100%' }} onClick={() => update({ sidebarCollapsed: !settings.sidebarCollapsed })}
+              aria-label={settings.sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-expanded={!settings.sidebarCollapsed}>
+              <Icon name="panel" />
+              <span class="nav-label">Collapse</span>
             </button>
-          )}
-        </div>
+          </div>
+        </nav>
+        <header class="topbar">
+          <button class="btn icon-only ghost menu-btn" onClick={() => setNavOpen(o => !o)} aria-label="Open navigation" aria-expanded={navOpen}>
+            <Icon name="menu" />
+          </button>
+          <h1>{TITLES[route.page]}</h1>
+          <div class="spacer" />
+          <form class="global-search" role="search" onSubmit={e => {
+            e.preventDefault()
+            const q = search.current?.value.trim() ?? ''
+            navigate(href('activity', { q }))
+          }}>
+            <Icon name="search" size="sm" />
+            <input ref={search} class="input" type="search" placeholder="Search all history  ( / )" aria-label="Search all history" />
+          </form>
+          <span class={`conn conn--${AGENT_CONN[agentStatus]}`} role="status" title={`Agent event stream: ${AGENT_LABEL[agentStatus].toLowerCase()}`}>
+            <span class="conn-dot" aria-hidden="true" />
+            <span class="conn-label">Agents {AGENT_LABEL[agentStatus].toLowerCase()}</span>
+          </span>
+          <span class={`conn conn--${status}`} role="status" title={`Live log stream: ${statusLabel.toLowerCase()}`}>
+            <span class="conn-dot" aria-hidden="true" />
+            <span class="conn-label">{statusLabel}</span>
+          </span>
+        </header>
+        <main class="main" id="main" ref={main} tabIndex={-1}>
+          <PageView />
+        </main>
       </div>
-    </div>
+    </SettingsContext.Provider>
   )
+}
+
+function PageView() {
+  const route = useRoute()
+  switch (route.page) {
+    case 'overview': return <Overview />
+    case 'sessions': return <Sessions params={route.params} />
+    case 'session': return <SessionDetailPage id={route.id ?? ''} params={route.params} />
+    case 'activity': return <Activity params={route.params} mode="activity" />
+    case 'errors': return <Activity params={route.params} mode="errors" />
+    case 'timeline': return <Timeline params={route.params} />
+    case 'logs': return <Logs />
+    case 'files': return <Files params={route.params} />
+    case 'commands': return <Commands params={route.params} />
+    case 'integrations': return <Integrations />
+    case 'settings': return <SettingsPage />
+  }
 }

@@ -1,9 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tailflow_core::{
     ingestion::{file::FileSource, Source},
-    new_bus,
+    new_bus, LogReceiver,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +13,39 @@ struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+/// Wait until the collector is tailing `path`. A file collector starts at
+/// the end of the file, so a line written before it opened the file is never
+/// seen; a fixed sleep races that on a loaded host. Append numbered markers
+/// until the newest one is delivered (earlier ones precede it in the file,
+/// so none can arrive later and leak into the test).
+async fn wait_until_tailing(path: &std::path::Path, rx: &mut LogReceiver) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for n in 0u32.. {
+        assert!(
+            Instant::now() < deadline,
+            "the file collector never started tailing"
+        );
+        let marker = format!("ready-{n}");
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open for append")
+            .write_all(format!("{marker}\n").as_bytes())
+            .expect("append marker");
+        let wait_until = Instant::now() + Duration::from_millis(250);
+        while let Ok(Ok(r)) = tokio::time::timeout(
+            wait_until.saturating_duration_since(Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            if r.payload == marker {
+                return;
+            }
+        }
     }
 }
 
@@ -35,7 +68,7 @@ async fn file_source_survives_rotation_and_truncation() {
     let task_shutdown = shutdown.clone();
     let source = FileSource::new(path.clone());
     let task = tokio::spawn(async move { Box::new(source).run(tx, task_shutdown).await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_tailing(&path, &mut rx).await;
 
     OpenOptions::new()
         .append(true)

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tailflow-core = { path = "../tailflow-core" }
+tailflow-storage = { path = "../tailflow-storage" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -29,14 +30,27 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# stdin detection
-atty = "0.2"
+# Agent spool watcher (same version as tailflow-core's file collector)
+notify = "7"
+
 
 # Embed the built web UI into the binary
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 
+# Per-run API tokens, session and sign-in secrets (OS CSPRNG; already in the
+# tree through tailflow-storage).
+getrandom = "0.4"
+# `stream::unfold` for the agent SSE stream (already in the tree via axum).
+futures-util = { version = "0.3", default-features = false }
+
+# O_DIRECTORY / O_NOFOLLOW when flushing the credential directory (already
+# in the tree through tokio).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
 chrono = { workspace = true }

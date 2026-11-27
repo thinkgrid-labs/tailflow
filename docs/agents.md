@@ -48,6 +48,16 @@ claude mcp add tailflow -- tailflow-mcp
 The daemon address is resolved in this order: `--url` flag, `$TAILFLOW_URL`,
 then `http://127.0.0.1:7878`.
 
+The daemon requires an API token. `tailflow-mcp` and `tailflow-logs` read it
+from the daemon's owner-only runtime file
+(`<data dir>/run/daemon-<port>.json`) when the host is loopback, and re-read
+it after a refusal, so a long-running MCP server keeps working across daemon
+restarts. If the MCP client runs as another user, in a container, or through
+a port forward, add `"TAILFLOW_TOKEN"` to its `env` (`tailflow-daemon token`
+prints the current one; start the daemon with the same `TAILFLOW_TOKEN` to
+keep it stable). A refused token is an MCP tool error naming the fix, and
+exit code `4` for `tailflow-logs`. See [security](security.md).
+
 ### When the daemon isn't running
 
 Tool calls return `isError: true` with:
@@ -211,7 +221,7 @@ tailflow-logs search [REGEX] [--source api] [--level error]
 tailflow-logs sources
 tailflow-logs wait [--grep REGEX] [--source api] [--level error]
                    [--since 30s] [--require-new]
-                   [--timeout-ms 30000] [--cursor 4210]
+                   [--timeout-ms 30000] [--cursor 4210] [--limit 100]
 tailflow-logs status
 ```
 
@@ -225,6 +235,7 @@ Global: `--url URL`, `--json`.
 | 1 | Bad request (invalid regex, level, or duration) |
 | 2 | `wait` reached its timeout without matching |
 | 3 | No daemon is listening |
+| 4 | The daemon refused the credential (missing, wrong or from an earlier run). `status` only checks that a daemon answers, so use `sources` to check access |
 
 So a script can gate on a real condition:
 
@@ -241,7 +252,13 @@ fi
 
 ## HTTP API
 
-All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
+The data endpoints are `GET` and return JSON. The daemon listens on loopback
+only (`127.0.0.1`, and `[::1]` when available); the only `POST` endpoints
+manage credentials ([security](security.md#auth-endpoints)).
+Each request needs `Authorization: Bearer <token>`; `tailflow-daemon token`
+prints the current one, and `401`/`403` answers carry
+`{"error", "kind"}` with `kind` one of `unauthorized`, `invalid_token`,
+`session_expired`, `cross_origin` ([security](security.md)).
 
 ### Shared parameters
 
@@ -253,14 +270,15 @@ All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
 | `since` | all | `30s`/`5m`/`2h`/`1d` or RFC 3339 |
 | `limit` | all | Max records or groups (capped at 1000) |
 | `cursor` | all | Only records with `seq >` this |
-| `max_payload_chars` | `/api/errors`, `/api/query` | Per-line elision cap (default 2000, max 10000) |
+| `max_payload_chars` | `/api/errors`, `/api/query`, `/api/wait` | Per-line elision cap (default 2000, max 10000) |
 | `context_lines` | `/api/errors` | Trailing context per group (max 50) |
 | `require_new` | `/api/wait` | `true` to ignore matches already in the buffer |
 | `timeout_ms` | `/api/wait` | Long-poll deadline (max 120000) |
 
-Any rejected argument returns **400** with `{"error": "..."}`, including a
-value of the wrong type (`limit=abc`). It is never ignored — see
-[Design notes](#failing-loudly).
+An invalid value returns **400** with `{"error": "..."}`, including a value
+of the wrong type (`limit=abc`) — see [Design notes](#failing-loudly). On these
+`/api/*` endpoints an **unknown parameter name** (a typo such as `?pattern=`)
+is ignored, so check the spelling; `/api/v1/*` rejects unknown names.
 
 `limit` and `max_payload_chars` are clamped down to their maximums but must be
 at least 1; `context_lines` above 50 is rejected rather than clamped, because a
@@ -342,8 +360,67 @@ Same shape as `/api/query`, plus `matched` (bool) and `waited_ms`.
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.3.3", "buffered": 125, "cursor": 125 }
+{ "ok": true, "version": "0.4.0", "instance_id": "4821-1795612684232685",
+  "buffered": 125, "cursor": 125,
+  "ingest_dropped": 0, "storage": { "state": "ok", "loss_detected": false } }
 ```
+
+`instance_id` identifies the daemon process: the ring's `seq` (and every
+cursor) restarts with each process, so a client that sees a different
+`instance_id` must discard its cursor. `GET /api/records?after=<seq>` returns
+the retained live records after a seq, for incremental catch-up.
+
+Without a credential, `/health` returns only `ok`, `version` and
+`auth_required: true`. `ok` means the daemon is serving. `ingest_dropped` (also present on
+`/api/query`, `/api/errors`, `/api/wait`, and `/api/sources`) counts records the
+daemon lost at ingestion in this run; when it is non-zero, an empty result is
+not evidence that nothing happened.
+
+### Durable history: `/api/v1/*`
+
+History that survives restarts, with persistent cursors and a `completeness`
+verdict, is served under `/api/v1/events`. See
+[durable history](storage.md#http-api-v1) for parameters and guarantees.
+
+### File and Git evidence, outcomes and related events
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/v1/observe/status` | Observed directories, backend, counts, coverage, Git repositories and snapshot status |
+| `GET /api/v1/evidence/files?since=&until=&session=&agent=&path_prefix=&window_ms=&status=&limit=` | Each reported or observed file change with `status` (`matched_observation`, `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`), an explanation, and the event seqs behind it; coverage and observer loss over the range |
+| `GET /api/v1/sessions/{id}/changes` | The session's worktree before/after comparison: changed paths with evidence, pre-existing changes, concurrent sessions, limitations |
+| `GET /api/v1/outcomes?since=&until=&session=&agent=&project=&category=&outcome=&limit=` | Command operations with `category` (+ `category_rule`), `outcome` (`reported_success`, `reported_failure`, `interrupted`, `outcome_unknown`), exit code when reported, duration, and nearby runtime errors; counts per category and outcome |
+| `GET /api/v1/events/{seq}/related?window_ms=` | Related events in five evidence tiers with an explanation per item; never causal |
+
+`git.snapshot`, `git.commit`, `git.checkout` and `git.head.moved` events are
+also available through `/api/v1/events`. See [evidence](evidence.md).
+
+### Live agent activity: `/api/v1/stream/agent`
+
+Server-Sent Events carrying agent, command, file and git events as they are
+**committed** to durable history. That includes events committed by other
+daemons sharing the per-user database.
+
+| Parameter / header | Meaning |
+|---|---|
+| `after=<seq>` | Resume after this seq: catch-up from history, then live |
+| `Last-Event-ID` | Sent by `EventSource` on reconnect; the later of the two wins |
+| `agent`, `session`, `project` | Comma-separated filters |
+
+| Event | Data |
+|---|---|
+| `agent` | One stored event (`id:` is its seq) |
+| `gap` | Detected loss or expired history in the delivered range: `reason`, `count` (null = unknown), `from_seq`, `to_seq` |
+| `ready` | Catch-up finished, now live (`id:` is the cursor) |
+| `reset` | Reload your views and continue from `cursor`. `reason`: `catchup_limit` (more than 5,000 events, or 40 pages, to catch up), `cursor_ahead` (the cursor came from another database), `storage_unavailable` (history could not be read; the stream then ends and your client reconnects) |
+| `lag` | This client fell behind the live feed; the missed events were re-read from history (nothing lost) |
+
+Guarantees:
+- Events arrive in strictly increasing `seq`, each once.
+- Nothing that is not yet committed is ever sent.
+- Loss is reported as a `gap`, never skipped silently.
+- At most 32 streams per daemon (`429` beyond).
+- Without a cursor, the stream starts live at the newest committed seq.
 
 ---
 
@@ -399,13 +476,15 @@ claiming the incremental read was exact.
 
 ### Failing loudly
 
-Invalid arguments are rejected rather than dropped — as a 400 at the HTTP layer,
-and as an `isError: true` tool result at the MCP layer.
+Invalid argument values are rejected rather than dropped — as a 400 at the HTTP
+layer, and as an `isError: true` tool result at the MCP layer. (Unknown
+parameter *names* on the `/api/*` endpoints are the exception: they are
+ignored. `/api/v1/*` rejects them.)
 
 A human passing a bad regex to a TUI sees an empty screen and immediately knows
 something is wrong. An agent doesn't have that feedback. Silently ignoring a
 malformed `grep` would return "0 errors" — indistinguishable from a healthy
-stack, and the agent would report success. Every filter argument is therefore
+stack, and the agent would report success. Every filter value is therefore
 validated, and every failure explains what was expected.
 
 The same reasoning decides whether a bound is clamped or refused: **a bound may
@@ -469,7 +548,7 @@ version message, rather than accepting a weaker answer than it asked for.
 
 ### Buffer horizon
 
-The daemon retains `--buffer` records (default 5000) and reports
-`buffer_starts_at`. A query for `since: "1h"` against a buffer holding twenty
+The daemon retains `--buffer` records (default 5000, or fewer once they
+exceed `--buffer-mb`, default 16 MiB) and reports `buffer_starts_at`. A query for `since: "1h"` against a buffer holding twenty
 minutes of a chatty stack cannot see the full hour — the horizon field is what
 lets a caller notice that rather than conclude the first forty minutes were quiet.

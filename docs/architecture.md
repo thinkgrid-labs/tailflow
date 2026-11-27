@@ -9,24 +9,37 @@ sources.
 ## System overview
 
 ```text
-┌────────────────────────── tailflow-core ──────────────────────────┐
-│ Docker ─┐                                                         │
-│ Process ┼──► broadcast channel of LogRecord ──┬──► bounded store  │
-│ File ───┤                                     │    + grouping     │
-│ Stdin ──┘                                     │                  │
-└───────────────────────────────────────────────┼──────────────────┘
-                                                │
-                         ┌──────────────────────┴──────────────────┐
-                         │                                         │
-                  ┌──────▼──────┐                         ┌────────▼────────┐
-                  │ tailflow TUI│                         │ daemon + web UI │
-                  └─────────────┘                         │ HTTP API + SSE  │
-                                                        └────────┬────────┘
-                                                                 │ HTTP
-                                                  ┌──────────────┴─────────────┐
-                                                  │ tailflow-mcp  tailflow-logs│
-                                                  └────────────────────────────┘
+Docker / Process / File / Stdin                 agent hooks           [observe] directories
+            │ LogRecord                (tailflow agent hook <agent>)    (opt-in)
+            ▼                                     │                         │
+   broadcast bus (4,096) ── lag → counted,        ▼                         ▼
+            │                 gap recorded    owner-only spool        file watcher (bounded
+            ▼                                     │                   queue) + Git snapshots
+   daemon fan-out: filter → redact →              │ ingest, waits for space │
+   ring push → SSE (/events)                      │                         │
+            │ try_send (never blocks)             │                         │
+            ▼                                     ▼                         ▼
+   bounded queue ── full → counted, gap recorded ◀──────────────────────────┘
+            │
+            ▼
+   writer thread: batch (≤512 / 500 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL, FTS5)
+            │                                       │
+            │ commit notification                   └─ retention, heartbeats, gap rows
+            ▼
+   agent stream (/api/v1/stream/agent) ── re-reads committed rows ──► dashboard
+   reader pool (read-only connections) ──► /api/v1/*
+
+   in-memory ring ──► /api/query, /api/errors, /api/wait, MCP, tailflow-logs
 ```
+
+Two kinds of state are kept apart:
+
+- **In-process notifications** (the broadcast bus, the SSE fan-out, the
+  agent stream's wake-up) are fast and bounded. They can lag, and lag is
+  counted, but they are not the record.
+- **Durable history** is what the writer committed to SQLite. The agent
+  stream only ever sends committed rows, re-reading them from SQLite, so a
+  slow browser costs a re-read, never a lost event.
 
 ## Components
 
@@ -40,18 +53,70 @@ Each source implements the same asynchronous lifecycle and receives a
 cancellation token. That lets the TUI and daemon shut down file watchers,
 container streams, and spawned process trees consistently.
 
+Its `agent` module holds the coding-agent integrations: adapters that turn
+Claude Code and Codex hook payloads into `ObservabilityEvent`s, the owner-only
+spool that hands them to a daemon, the hook installer, and read-only Git
+discovery. It does not depend on SQLite, so the hook bridge in the `tailflow`
+binary stays free of it.
+
+### `tailflow-storage`
+
+The durable event store: one writer thread owning a read-write SQLite
+connection, a small pool of read-only connections for queries, transactional
+schema migrations, FTS5 full-text search, chunked retention, durable gap rows,
+and run tracking for unclean-shutdown detection. It depends on `tailflow-core`
+for the event model and privacy policy and is used only by the daemon.
+
 ### `tailflow-daemon`
 
 Runs configured sources, tracks their lifecycle, retains a bounded in-memory
 ring, and serves:
 
-- the embedded Preact dashboard;
-- JSON query endpoints;
+- the embedded Preact dashboard (served with a strict Content Security
+  Policy);
+- JSON query endpoints, including read-only aggregates for the dashboard
+  (`/api/v1/stats`, `/api/v1/files`);
 - an SSE stream for the browser; and
 - long-polling for event-driven agent workflows.
 
-The server binds to loopback and validates the Host header. It is a local API,
-not a remotely exposed service.
+The server binds to loopback, validates the Host header, and requires a
+credential on every data endpoint: a per-run API token for CLI and MCP
+clients, or a browser session created by a one-time sign-in link
+([security](security.md)). It is a local API, not a remotely exposed service.
+
+### Filesystem and Git observation (`tailflow-core::observe`, daemon `observe.rs`)
+
+Opt-in, for directories listed in `[observe]`. One observer thread per
+directory reads notify events (FSEvents recursive on macOS, inotify per
+directory on Linux, ReadDirectoryChangesW recursive on Windows) through a
+bounded queue. It filters built-in, `.gitignore` and configured exclusions,
+coalesces bursts per path, and submits `file.*` events with provenance
+`filesystem_observed`. Queue overflow and OS rescans become loss gaps. A
+directory is observed by one daemon at a time (a claim in `fs_coverage`).
+
+A Git thread snapshots each repository containing an observed directory:
+startup, agent session boundaries, and settled changes. It runs `git status`
+and `git diff --numstat` read-only and with a timeout, and records
+`git.snapshot` plus HEAD transitions. Evidence queries
+(`tailflow-storage::evidence`, `/api/v1/evidence/files`,
+`/api/v1/sessions/{id}/changes`) compare reported and observed changes
+through indexed, bounded lookups.
+
+### Dashboard (`web/`)
+
+A Preact/Vite single-page app with hash routing and no other runtime
+dependency, embedded in the daemon binary at build time.
+Pages read the public read-only API; nothing in the browser filters a full
+dataset. The live log view keeps the newest 5,000 ring records and renders
+only the visible rows (a variable-height virtual list). Agent views follow
+`/api/v1/stream/agent`, a resumable SSE stream of *committed* agent events.
+Each event reloads only the views it concerns (coalesced), and the views
+fall back to polling when the stream is unavailable. The live log view
+hydrates from recent records, subscribes to `/events`, deduplicates by
+sequence number and rehydrates after a disconnect. Pure logic
+(`web/src/lib/`) has Node unit tests
+(`npm test`); `web/e2e/` runs Playwright against a real daemon fed through the
+real agent hook adapters.
 
 ### `tailflow-agent`
 
@@ -68,12 +133,6 @@ state out of each agent process.
 
 Runs the same core sources directly and renders their broadcast stream with
 Ratatui. It does not require the daemon.
-
-### `web`
-
-A Preact/Vite application embedded in the daemon binary at release time. It
-hydrates from recent records, subscribes to SSE, deduplicates by sequence number,
-and rehydrates after a disconnected stream.
 
 ## Data model and flow
 
@@ -95,7 +154,60 @@ addresses, UUIDs, and quoted values—to build a bounded fingerprint. The origin
 sample remains available, while repeated fingerprints collapse into one group
 with first/last timestamps and an occurrence count.
 
+## Event model
+
+`ObservabilityEvent` (schema version 1) is the envelope for everything stored:
+`event_id`, `timestamp` (source time) and `observed_at` (receive time),
+`event_type` from a fixed catalog, `provenance`, `source_type`/`source_id`,
+optional `project_id`, `session_id`, `operation_id`, `parent_operation_id`,
+`agent_name`, `severity`, `status`, `duration_ms`, `path`, `message`,
+`attributes`, `payload`, and `redaction` metadata. Unknown types and unknown
+envelope fields are rejected. Runtime lines are converted with
+`ObservabilityEvent::from_log_record`; the live path keeps using `LogRecord`.
+
+The persistent cursor is SQLite's `AUTOINCREMENT` `seq`, which never repeats
+even after deletes. The writer keeps `observed_at` non-decreasing in `seq`
+order and clamps future source timestamps, so a `since` bound translates into
+an exact seq bound. See [durable history](storage.md) for the full contract.
+
+## Agent capture path
+
+```text
+agent ── hook (stdin JSON) ──▶ tailflow agent hook <agent>
+                                 normalize → privacy → spool file (rename)
+                                                  │
+              tailflow-daemon ingest thread ◀─────┘ (watcher + 30 s rescan)
+                 claim by rename → submit with backpressure → flush → delete
+                                                  ▼
+                                  events + agent_sessions (same transaction)
+```
+
+The hook bridge never touches the database or the network, never prints to
+stdout and always exits 0. The spool is the only IPC: there is still no HTTP
+endpoint that writes. See [agent capture](agent-capture.md).
+
 ## Design invariants
+
+### Loss is never silent
+
+Every lossy hop inside TailFlow is counted and recorded: source-bus lag,
+storage-queue overflow, agent-spool overflow, file-observer queue overflow,
+failed commits, and unclean shutdowns. Persisted history carries gap rows in
+the same transaction as the next batch, and responses derive `completeness`
+from them. Loss outside TailFlow is recorded only when it is reported: the OS
+dropping file notifications it does not announce, or an agent not calling a
+hook, cannot be detected.
+
+### Persistence never blocks live logs
+
+Ingestion offers events to storage with `try_send`. A slow disk can cost
+durable history (visibly) but cannot stall SSE, the ring, or agents.
+
+### One redaction point
+
+Redaction runs once in the daemon fan-out, before the ring, SSE, legacy
+endpoints, MCP, and storage; storage re-applies the stateless rules as defense
+in depth.
 
 ### Bounded output
 
@@ -124,19 +236,28 @@ Windows so development servers are not left behind.
 ### Local security boundary
 
 The daemon is intentionally loopback-only, has no permissive CORS layer, and
-rejects nonlocal Host headers. Remote access would require a separate security
-model rather than an accidental bind-address change.
+rejects nonlocal Host headers. Browser requests carrying a non-loopback
+`Origin`, and cross-site requests other than top-level navigation, are refused.
+Every route except the static UI, `/health` (liveness only without a
+credential) and the sign-in link requires the API token or a same-origin
+browser session (`auth.rs`, `require_auth` in `routes.rs`). The only POST
+endpoints manage credentials (mint a sign-in link and revoke sessions, both
+token-only; sign out). No HTTP endpoint mutates or deletes data; purging is
+a local CLI command.
+Remote access would require a separate security model rather than an
+accidental bind-address change.
 
 ## Repository layout
 
 ```text
 tailflow/
 ├── crates/
-│   ├── tailflow-core/      ingestion, processing, query store
+│   ├── tailflow-core/      ingestion, processing, query store, agent adapters
 │   ├── tailflow-tui/       interactive terminal UI
+│   ├── tailflow-storage/   SQLite event store, retention, queries
 │   ├── tailflow-daemon/    HTTP/SSE server and embedded web UI
 │   └── tailflow-agent/     MCP and shell clients
-├── web/                    Preact dashboard
+├── web/                    Preact dashboard (src/lib pure logic, src/pages, e2e/)
 ├── npm/
 │   ├── tailflow/           public launcher package
 │   └── platforms/          OS/architecture binary packages
@@ -148,12 +269,13 @@ tailflow/
 
 | Layer | Technology |
 |---|---|
-| Core language | Rust 2021, Rust 1.88+ |
+| Core language | Rust 2021, Rust 1.89+ |
 | Async runtime | Tokio |
 | Docker client | Bollard |
 | File watching | notify |
 | Terminal UI | Ratatui and Crossterm |
 | HTTP server | Axum |
+| Durable storage | SQLite 3.54 (bundled via rusqlite 0.41), WAL, FTS5 |
 | Web UI | Preact and Vite, embedded with rust-embed |
 | Agent protocol | JSON-RPC 2.0 and MCP over stdio |
 | Distribution | npm platform packages and GitHub release binaries |
@@ -167,6 +289,9 @@ tailflow/
 - Keep agent rendering separate from HTTP response types so JSON and compact
   text remain available from the same operation.
 - Build the web dashboard before compiling a release daemon so `rust-embed`
-  receives production assets.
+  receives production assets. Debug builds read `web/dist` from disk, so UI
+  changes need only `npm run build`.
+- Dashboard data must come from bounded, indexed endpoints. Add an aggregate
+  endpoint rather than counting pages of events in the browser.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow.

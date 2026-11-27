@@ -1,8 +1,8 @@
 # TailFlow roadmap
 
-TailFlow's direction is to make runtime verification a normal, low-friction step
-in an agent coding loop. This roadmap communicates priorities; it is not a
-promise of dates or release numbers.
+TailFlow's direction is to show what coding agents actually do, and whether
+their changes work, from evidence on the developer's own machine. This roadmap
+communicates priorities; it is not a promise of dates or release numbers.
 
 [Documentation index](README.md)
 
@@ -19,66 +19,87 @@ Roadmap work should preserve four properties:
 4. **One collection path.** Human and agent interfaces should share ingestion
    and runtime state rather than implementing separate collectors.
 
-## Next priorities
+## Current capabilities
 
-### Reduce setup friction
+### Up to v0.3.3
 
-- [x] Add `tailflow init` with project detection, interactive selection, safe
-  config generation, explicit source flags, and a noninteractive `--yes` mode.
-- [ ] Optionally let `tailflow-mcp` start a local daemon when `tailflow.toml` exists
-  and no daemon is reachable.
-- [ ] Serve MCP directly from the daemon over streamable HTTP, removing the need
-  for a separate stdio bridge where clients support remote MCP transports.
+- Runtime collection from processes TailFlow starts, local Docker containers,
+  log files and piped stdin, in one ordered stream.
+- MCP tools and the `tailflow-logs` shell client; error grouping; server-side
+  waits; cursors for before/after comparisons.
+- The live-log dashboard, the terminal UI and `tailflow init`.
 
-### Improve change verification
+### Added in v0.4.0
 
-- Compare recent error groups against a baseline cursor: “what is failing now
-  that was not failing before this edit?”
-- Return clearer startup/readiness signals for configured sources.
-- Add reusable workflow examples for common frameworks and monorepos.
+- Durable SQLite history with retention, size cap, redaction, capture modes
+  and an explicit completeness verdict.
+- Opt-in Claude Code and Codex hooks: sessions, tool calls, commands, reported
+  file changes and subagents, with stated coverage.
+- The agent dashboard: overview, sessions, activity search, multi-agent
+  timeline, files, commands and live logs, updated from a stream of committed
+  events.
+- Opt-in file observation and Git snapshots compared with what agents
+  reported; command outcomes as reported; related evidence in five tiers that
+  never claim cause.
+- An authenticated local API: a per-run token for clients and a one-time
+  sign-in link for browsers.
 
-### Improve source selection
+## Still being validated
 
-- Understand Docker Compose projects and services instead of treating the local
-  Docker daemon as one undifferentiated source pool.
-- Add include/exclude filters for container discovery.
-- Add log-level toggles to the TUI to match the dashboard.
+- Live Codex sessions on Linux and Windows (a live session on macOS has
+  passed).
+- Real Claude Code and Codex sessions on Windows (so far CI with synthetic
+  hook input).
+- A 24-hour endurance run on Linux.
+- Benchmarks on a quiet, dedicated host, and on Linux.
+- Upgrading `ratatui` in the terminal UI to clear the `lru` advisory
+  ([security](security.md#dependency-advisories)).
 
-## Later opportunities
+## Planned
 
-### Correlation
+None of these is a commitment, and none has a date.
 
-- Group records sharing a request, trace, job, or correlation identifier.
-- Let an agent follow one operation across several services without broad text
-  searches.
+### Agents and evidence
 
-### Durable local history
+- More agent integrations.
+- Explicit command-to-runtime correlation using request, trace or job
+  identifiers, instead of closeness in time.
+- A verified exit status for commands TailFlow itself launches.
+- Stronger multi-agent investigations, such as comparing what two sessions
+  touched in one repository.
+- Resource usage per session.
 
-- Offer an optional SQLite-backed bounded store so a short history can survive
-  daemon restarts.
-- Preserve explicit horizons and retention limits even when persistence is
-  enabled.
+### Verification workflow
 
-### Additional interfaces
+- Compare recent error groups against a baseline cursor: "what is failing now
+  that was not failing before this edit?"
+- Clearer startup and readiness signals for configured sources.
+- A readable query language (`agent:claude type:file.modified since:24h`)
+  compiling to the existing structured filters.
+- Exports and diagnostics bundles for sharing an investigation.
 
-- Expose sources as MCP resources as well as tools.
-- Add a local webhook source for development log drains.
-- Support side-by-side source panes in the TUI.
+### Setup and sources
 
-### Runtime-aware fingerprints
+- Optionally let `tailflow-mcp` start a local daemon when `tailflow.toml`
+  exists and none is running.
+- Serve MCP directly from the daemon over streamable HTTP.
+- Understand Docker Compose projects and services, with include/exclude
+  filters for containers.
+- Better fingerprints for common runtime formats (Rust panics, Java
+  exceptions, Go panics, JavaScript stack traces).
 
-- Improve normalization for Rust panics, Java exceptions, Go panics, JavaScript
-  stack traces, and other common runtime formats.
-- Allow conservative project-level fingerprint rules without turning the daemon
-  into a general log-processing language.
+### Reliability
+
+- Longer automated reliability runs on Linux, macOS and Windows.
 
 ## Exploratory ideas
 
-These may be useful but need stronger evidence before becoming commitments:
+These may be useful but need stronger evidence before becoming plans:
 
 - pluggable local sources such as Kafka or Redis pub/sub;
-- opt-in adapters for hosted development environments;
-- lightweight health checks associated with configured processes; and
+- a local webhook source for development log drains;
+- sources exposed as MCP resources as well as tools;
+- side-by-side source panes and log-level toggles in the TUI; and
 - richer agent summaries that preserve exact supporting records.
 
 ## Explicit non-goals
