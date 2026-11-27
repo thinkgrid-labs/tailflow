@@ -18,6 +18,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The binaries are built from the committed Cargo.toml version; the
+      # publish job only rewrites package.json files. A tag pushed without
+      # the version-bump commit would ship packages whose binaries report the
+      # previous version. Fail here, before anything is built or published.
+      - name: Tag matches the committed version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          NPM="$(node -p "require('./npm/tailflow/package.json').version")"
+          echo "tag=$TAG Cargo.toml=$CARGO npm/tailflow=$NPM"
+          if [ -z "$TAG" ] || [ "$TAG" != "$CARGO" ] || [ "$TAG" != "$NPM" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml ($CARGO) and npm/tailflow/package.json ($NPM). Land the version-bump commit (node scripts/bump-version.js $TAG) before tagging."
+            exit 1
+          fi
+
       - name: Create web/dist placeholder
         run: mkdir -p web/dist && touch web/dist/.gitkeep
 
@@ -30,10 +45,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        run: cargo test --all --locked
 
       - uses: actions/setup-node@v4
         with:
@@ -125,7 +140,7 @@ jobs:
       - name: Build (native)
         if: "!matrix.cross"
         run: >
-          cargo build --release
+          cargo build --release --locked
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
@@ -134,7 +149,7 @@ jobs:
       - name: Build (cross)
         if: matrix.cross
         run: >
-          cross build --release
+          cross build --release --locked
           --target ${{ matrix.target }}
           -p tailflow-tui
           -p tailflow-daemon
@@ -302,6 +317,15 @@ jobs:
           name: tarball-linux-arm64
           path: dist/
 
+      # One checksum file for every binary attached to the release, so a
+      # download can be verified (`sha256sum -c SHA256SUMS`).
+      - name: Checksums
+        run: |
+          cp npm/platforms/win32-x64/bin/*.exe dist/
+          cd dist
+          sha256sum -- *.tar.gz *.exe > SHA256SUMS
+          cat SHA256SUMS
+
       # Create a GitHub Release with the tag as the title
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -312,7 +336,8 @@ jobs:
             dist/tailflow-darwin-x64.tar.gz
             dist/tailflow-linux-arm64.tar.gz
             dist/tailflow-linux-x64.tar.gz
-            npm/platforms/win32-x64/bin/tailflow.exe
-            npm/platforms/win32-x64/bin/tailflow-daemon.exe
-            npm/platforms/win32-x64/bin/tailflow-mcp.exe
-            npm/platforms/win32-x64/bin/tailflow-logs.exe
+            dist/tailflow.exe
+            dist/tailflow-daemon.exe
+            dist/tailflow-mcp.exe
+            dist/tailflow-logs.exe
+            dist/SHA256SUMS
