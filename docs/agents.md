@@ -221,7 +221,7 @@ tailflow-logs search [REGEX] [--source api] [--level error]
 tailflow-logs sources
 tailflow-logs wait [--grep REGEX] [--source api] [--level error]
                    [--since 30s] [--require-new]
-                   [--timeout-ms 30000] [--cursor 4210]
+                   [--timeout-ms 30000] [--cursor 4210] [--limit 100]
 tailflow-logs status
 ```
 
@@ -235,6 +235,7 @@ Global: `--url URL`, `--json`.
 | 1 | Bad request (invalid regex, level, or duration) |
 | 2 | `wait` reached its timeout without matching |
 | 3 | No daemon is listening |
+| 4 | The daemon refused the credential (missing, wrong or from an earlier run). `status` only checks that a daemon answers, so use `sources` to check access |
 
 So a script can gate on a real condition:
 
@@ -251,7 +252,9 @@ fi
 
 ## HTTP API
 
-All endpoints are `GET`, return JSON, and are served on `127.0.0.1` only.
+The data endpoints are `GET` and return JSON. The daemon listens on loopback
+only (`127.0.0.1`, and `[::1]` when available); the only `POST` endpoints
+manage credentials ([security](security.md#auth-endpoints)).
 Each request needs `Authorization: Bearer <token>`; `tailflow-daemon token`
 prints the current one, and `401`/`403` answers carry
 `{"error", "kind"}` with `kind` one of `unauthorized`, `invalid_token`,
@@ -267,14 +270,15 @@ prints the current one, and `401`/`403` answers carry
 | `since` | all | `30s`/`5m`/`2h`/`1d` or RFC 3339 |
 | `limit` | all | Max records or groups (capped at 1000) |
 | `cursor` | all | Only records with `seq >` this |
-| `max_payload_chars` | `/api/errors`, `/api/query` | Per-line elision cap (default 2000, max 10000) |
+| `max_payload_chars` | `/api/errors`, `/api/query`, `/api/wait` | Per-line elision cap (default 2000, max 10000) |
 | `context_lines` | `/api/errors` | Trailing context per group (max 50) |
 | `require_new` | `/api/wait` | `true` to ignore matches already in the buffer |
 | `timeout_ms` | `/api/wait` | Long-poll deadline (max 120000) |
 
-Any rejected argument returns **400** with `{"error": "..."}`, including a
-value of the wrong type (`limit=abc`). It is never ignored — see
-[Design notes](#failing-loudly).
+An invalid value returns **400** with `{"error": "..."}`, including a value
+of the wrong type (`limit=abc`) — see [Design notes](#failing-loudly). On these
+`/api/*` endpoints an **unknown parameter name** (a typo such as `?pattern=`)
+is ignored, so check the spelling; `/api/v1/*` rejects unknown names.
 
 `limit` and `max_payload_chars` are clamped down to their maximums but must be
 at least 1; `context_lines` above 50 is rejected rather than clamped, because a
@@ -377,14 +381,13 @@ History that survives restarts, with persistent cursors and a `completeness`
 verdict, is served under `/api/v1/events`. See
 [durable history](storage.md#http-api-v1) for parameters and guarantees.
 
-### File and Git evidence
+### File and Git evidence, outcomes and related events
 
 | Endpoint | Returns |
 |---|---|
 | `GET /api/v1/observe/status` | Observed directories, backend, counts, coverage, Git repositories and snapshot status |
 | `GET /api/v1/evidence/files?since=&until=&session=&agent=&path_prefix=&window_ms=&status=&limit=` | Each reported or observed file change with `status` (`matched_observation`, `reported_only`, `unverified`, `filesystem_observed`, `ambiguous`), an explanation, and the event seqs behind it; coverage and observer loss over the range |
 | `GET /api/v1/sessions/{id}/changes` | The session's worktree before/after comparison: changed paths with evidence, pre-existing changes, concurrent sessions, limitations |
-
 | `GET /api/v1/outcomes?since=&until=&session=&agent=&project=&category=&outcome=&limit=` | Command operations with `category` (+ `category_rule`), `outcome` (`reported_success`, `reported_failure`, `interrupted`, `outcome_unknown`), exit code when reported, duration, and nearby runtime errors; counts per category and outcome |
 | `GET /api/v1/events/{seq}/related?window_ms=` | Related events in five evidence tiers with an explanation per item; never causal |
 
@@ -472,13 +475,15 @@ claiming the incremental read was exact.
 
 ### Failing loudly
 
-Invalid arguments are rejected rather than dropped — as a 400 at the HTTP layer,
-and as an `isError: true` tool result at the MCP layer.
+Invalid argument values are rejected rather than dropped — as a 400 at the HTTP
+layer, and as an `isError: true` tool result at the MCP layer. (Unknown
+parameter *names* on the `/api/*` endpoints are the exception: they are
+ignored. `/api/v1/*` rejects them.)
 
 A human passing a bad regex to a TUI sees an empty screen and immediately knows
 something is wrong. An agent doesn't have that feedback. Silently ignoring a
 malformed `grep` would return "0 errors" — indistinguishable from a healthy
-stack, and the agent would report success. Every filter argument is therefore
+stack, and the agent would report success. Every filter value is therefore
 validated, and every failure explains what was expected.
 
 The same reasoning decides whether a bound is clamped or refused: **a bound may

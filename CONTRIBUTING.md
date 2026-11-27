@@ -46,6 +46,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+If you change documentation, also run the documentation check. With built
+binaries it also checks every documented CLI command and flag:
+
+```bash
+python3 scripts/docs/check_docs.py --bin target/debug
+```
+
+`npm run build` deletes the tracked `web/dist/.gitkeep`; restore it with
+`git checkout -- web/dist/.gitkeep` before committing.
+
 ---
 
 ## Development Workflow
@@ -66,14 +76,15 @@ cargo test --all
 ```
 tailflow/
 ├── crates/
-│   ├── tailflow-core/     # Ingestion engine — no UI dependencies
-│   ├── tailflow-tui/      # ratatui terminal UI binary
+│   ├── tailflow-core/     # Ingestion, event model, agent adapters, observation — no UI
+│   ├── tailflow-storage/  # SQLite event store, retention, queries
+│   ├── tailflow-tui/      # `tailflow` binary: TUI, init, agent hooks and CLI
 │   ├── tailflow-daemon/   # axum HTTP daemon binary
 │   └── tailflow-agent/    # MCP and shell client binaries
 ├── web/                   # Preact web dashboard (Vite)
 ├── npm/                   # npm distribution packages
 ├── docs/                  # User guides and design documentation
-└── scripts/               # Version bumping and packaging scripts
+└── scripts/               # Packaging, benchmarks, smoke tests, docs check
 ```
 
 New log sources belong in `crates/tailflow-core/src/ingestion/`. New UI features belong in either `crates/tailflow-tui/` or `web/src/`.

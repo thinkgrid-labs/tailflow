@@ -9,6 +9,7 @@ Use this page to find the shortest path to the information you need.
 | Install TailFlow and see my first logs | [Getting started](getting-started.md) |
 | Connect an MCP client | [Getting started: connect an agent](getting-started.md#connect-an-agent) |
 | Understand what TailFlow can do | [Features](features.md) |
+| Record what Claude Code or Codex does | [Agent capture](agent-capture.md) |
 | Learn the MCP tools | [TailFlow for agents](agents.md#mcp-tools) |
 | Use TailFlow from a shell or script | [TailFlow for agents: shell client](agents.md#shell-client) |
 | Call the HTTP API | [TailFlow for agents: HTTP API](agents.md#http-api) |
@@ -17,7 +18,7 @@ Use this page to find the shortest path to the information you need.
 | Sign in to the dashboard, use the API token, understand who can read the API | [Security](security.md) |
 | Compare what agents report with what changed on disk and in Git | [Evidence](evidence.md) |
 | Understand the internals | [Architecture](architecture.md) |
-| Evaluate production or automation use | [Limitations](limitations.md) |
+| Know what TailFlow cannot see or prove | [Limitations](limitations.md) |
 | See planned work | [Roadmap](roadmap.md) |
 | Contribute code | [Contributing](../CONTRIBUTING.md) |
 
@@ -50,6 +51,17 @@ The local web dashboard: overview, sessions, activity search, the multi-agent
 timeline, files, commands and live logs; how to read agent-reported data,
 coverage and loss; keyboard use, cost and security.
 
+### [Evidence](evidence.md)
+
+Opt-in file observation and Git snapshots compared with what agents report,
+command outcomes, and the five tiers of related evidence, with what each can
+and cannot prove.
+
+### [Security](security.md)
+
+Local API authentication: the per-run token, browser sign-in, browser
+protections, residual risks, dependency advisories, and upgrading from 0.3.x.
+
 ### [Durable history, retention, and privacy](storage.md)
 
 Where history is stored, durability and completeness guarantees, retention and
@@ -68,9 +80,11 @@ supported sources and platforms, and what TailFlow deliberately does not do.
 
 ### [Roadmap](roadmap.md)
 
-Near-term priorities, later opportunities, exploratory ideas, and non-goals.
+What is available, what is being validated, what is planned, and non-goals.
 
 ## Versioning
 
-The documentation on `main` describes the latest release. See the
-[changelog](../CHANGELOG.md) for behavior introduced in earlier versions.
+The documentation on `main` describes the latest release (v0.3.3). The
+documentation on `dev` describes the upcoming v0.4.0; pages and sections
+about features that are not yet released say so. See the
+[changelog](../CHANGELOG.md) for what changed in each version.

@@ -5,6 +5,12 @@ agent. A minimal setup takes about five minutes.
 
 [Documentation index](README.md)
 
+> **Which version?** `npm install -g tailflow` and the GitHub release
+> binaries install **v0.3.3**: runtime logs, MCP, the shell client, the TUI and
+> the live-log dashboard. Sections marked **v0.4.0** (durable history, agent
+> capture, file and Git evidence, API sign-in) describe the upcoming release on
+> `dev`; to use them now, [build from source](#build-from-source).
+
 ## Before you start
 
 TailFlow works best when:
@@ -59,13 +65,21 @@ needed. Choose a destination on your `PATH` that you have permission to write.
 
 ### Build from source
 
+This is how to run the upcoming v0.4.0 from `dev`. It needs Rust 1.89+ and
+Node.js 20+. Build the dashboard first: the daemon embeds `web/dist` at build
+time, and without it the dashboard pages are missing.
+
 ```bash
-git clone https://github.com/thinkgrid-labs/tailflow.git
+git clone --branch dev https://github.com/thinkgrid-labs/tailflow.git
 cd tailflow
-cargo install --path crates/tailflow-tui
-cargo install --path crates/tailflow-daemon
-cargo install --path crates/tailflow-agent
+(cd web && npm ci && npm run build)
+cargo install --locked --path crates/tailflow-tui      # tailflow
+cargo install --locked --path crates/tailflow-daemon   # tailflow-daemon
+cargo install --locked --path crates/tailflow-agent    # tailflow-mcp, tailflow-logs
 ```
+
+Install agent hooks from these installed binaries (in `~/.cargo/bin`), not
+from a `target/` directory: hooks stop working when their binary moves.
 
 ## Initialize a project
 
@@ -217,10 +231,13 @@ See [`tailflow.example.toml`](../tailflow.example.toml) for a copyable template.
 | `[storage]` | `max_size_mb` | No | Size cap, always enforced; default `2048` |
 | `[storage]` | `path` | No | Database file; default in the user data directory |
 | `[privacy]` | `capture` | No | `metadata` (default), `redacted`, or `full` |
+| `[observe]` | `paths` | No | Project directories to observe for file and Git evidence (v0.4.0); default none |
 
-The `[storage]` and `[privacy]` sections accept more settings; see
-[durable history, retention, and privacy](storage.md). Unknown keys in those two
-sections are errors, so a typo cannot silently change retention or redaction.
+The `[storage]`, `[privacy]` and `[observe]` sections accept more settings; see
+[durable history, retention, and privacy](storage.md) and
+[evidence](evidence.md#turn-it-on). Unknown keys in those three sections are
+errors, so a typo cannot silently change retention, redaction or what is
+observed. `[storage]`, `[privacy]` and `[observe]` apply from v0.4.0.
 
 ## Start and verify the daemon
 
@@ -230,8 +247,9 @@ Run this from the project root:
 tailflow-daemon
 ```
 
-You should see the local addresses for the dashboard, SSE stream, and agent API.
-In a second terminal, verify the daemon and sources:
+You should see the local addresses for the dashboard, SSE stream, and agent API
+(from v0.4.0, also a one-time dashboard sign-in link and where the API token
+is). In a second terminal, verify the daemon and sources:
 
 ```bash
 tailflow-logs status
@@ -239,8 +257,14 @@ tailflow-logs sources
 tailflow-logs errors --since 5m
 ```
 
+`status` only checks that a daemon answers; `sources` also proves that this
+client may read it (v0.4.0).
+
 The daemon keeps the newest 5,000 records by default (at most 16 MiB of log
 text). Change that with `tailflow-daemon --buffer N` and `--buffer-mb M`.
+
+Stop the daemon with Ctrl+C (or `SIGTERM`). It stops the processes it
+started and, from v0.4.0, removes its API token file.
 
 ### Add sources without a config file
 
@@ -304,7 +328,7 @@ configured services even when they have not printed a log line yet.
 See [TailFlow for agents](agents.md) for the four tools and recommended
 verification workflows.
 
-### Record what the agent does (opt-in)
+### Record what the agent does (opt-in, v0.4.0)
 
 MCP lets the agent read your stack's output. To also record the agent's own
 sessions, tool calls, commands and file edits, install TailFlow's hooks:
@@ -314,11 +338,15 @@ tailflow agent install claude    # or: codex
 tailflow agent status
 # … use the agent …
 tailflow sessions
+tailflow agent uninstall claude  # removes only TailFlow's hooks; history stays
 ```
+
+Install keeps your other settings and other tools' hooks, saves a
+`.tailflow-backup` copy first, and can be re-run safely.
 
 See [agent capture](agent-capture.md) for coverage, privacy and uninstalling.
 
-### Verify what changed on disk (opt-in)
+### Verify what changed on disk (opt-in, v0.4.0)
 
 Agent hooks report what the agent *says* it did. To compare that with what
 actually changed in your project, observe it:
@@ -351,6 +379,7 @@ Add `--json` to receive the daemon response directly. The exit codes are:
 | `1` | Invalid request or another request error |
 | `2` | `wait` timed out without a match |
 | `3` | No daemon is reachable |
+| `4` | The daemon refused the credential (v0.4.0) |
 
 ## Human views
 
@@ -386,7 +415,7 @@ tailflow-logs --url http://127.0.0.1:7878 status
 
 ### `401` / "refused access" / exit code 4
 
-From this release the API requires a credential. `tailflow-mcp` and
+From v0.4.0 the API requires a credential. `tailflow-mcp` and
 `tailflow-logs` read the token from the daemon's runtime file automatically
 when they run as the same user (and the same `TAILFLOW_DATA_DIR`). In a
 container, as another user, or over a port forward, set
