@@ -44,6 +44,11 @@ getrandom = "0.4"
 # `stream::unfold` for the agent SSE stream (already in the tree via axum).
 futures-util = { version = "0.3", default-features = false }
 
+# O_DIRECTORY / O_NOFOLLOW when flushing the credential directory (already
+# in the tree through tokio).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -1888,6 +1888,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "http-body-util",
+ "libc",
  "mime_guess",
  "notify",
  "rust-embed",
