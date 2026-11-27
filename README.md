@@ -184,7 +184,7 @@ own actions.
 | Agent | Reads runtime output | Records its actions |
 |---|---|---|
 | Claude Code | MCP: `claude mcp add tailflow -- tailflow-mcp` | `tailflow agent install claude`: sessions, prompt counts (no text), every tool call with duration, shell commands (exit code only when one fails), files reported by Read/Write/Edit, subagents. Tested with a live Claude Code 2.1.331 session. |
-| Codex CLI | Register `tailflow-mcp` as a stdio MCP server | `tailflow agent install codex` (Codex 0.124+; trust the hooks in `/hooks`): sessions, turns, tool calls, shell commands (an outcome only when Codex includes an exit code), `apply_patch` file changes, subagents (0.133+), token counts (0.171+). **Not yet validated against a live Codex session**: built from Codex's published hook schemas and tested with synthetic hook input. |
+| Codex CLI | Register `tailflow-mcp` as a stdio MCP server | `tailflow agent install codex` (Codex 0.124+; trust the hooks in `/hooks`): sessions, turns, tool calls, shell commands (an outcome only when Codex includes an exit code), `apply_patch` file changes, subagents (0.133+), token counts (0.171+). Tested with a live Codex 0.171 session on macOS (turns, resume, subagents, `apply_patch`, token counts). Codex sends no exit code for shell commands, so their outcome shows as unknown. |
 | Other MCP clients | Register `tailflow-mcp` (standard MCP; not tested per client) | Not supported |
 | Any agent with a shell | `tailflow-logs` with `--json` | Not supported |
 
@@ -247,8 +247,9 @@ CI; real Claude Code and Codex sessions on Windows have not been validated.
 
 The full list is in [limitations](docs/limitations.md). The most important:
 
-- Agent events are what the agent's hooks report. Codex support has not yet
-  been run against a live Codex session.
+- Agent events are what the agent's hooks report. Codex sends no exit code
+  for shell commands, so TailFlow shows their outcome as unknown, never as a
+  success. Live Codex has been run on macOS only.
 - File observation records that a path changed, not who changed it. The OS
   can coalesce or drop notifications; drops TailFlow detects are reported as
   loss. Very large bursts can still overflow its bounded queue, and Linux

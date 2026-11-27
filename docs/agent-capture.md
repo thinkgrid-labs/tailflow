@@ -2,8 +2,8 @@
 
 > **Status:** v0.4.0 (upcoming, on `dev`); not in a published release yet.
 > Supported agents: **Claude Code** (tested with a live 2.1.331 session) and
-> **OpenAI Codex** (0.124+; built from the published hook schemas and tested
-> with synthetic hook input; **not yet run against a live Codex session**).
+> **OpenAI Codex** (0.124+; built from the published hook schemas, tested
+> with synthetic hook input and with a live 0.171 session on macOS).
 > On Windows, both are tested in CI with synthetic hook input only.
 
 TailFlow can record a coding agent's own activity: its sessions, the tools it
@@ -118,7 +118,7 @@ does not verify it independently.
 | `agent.prompt.submitted` | UserPromptSubmit: character count only | UserPromptSubmit: character count only |
 | `agent.turn.completed` / `failed` | Stop / StopFailure (error kind) | Stop |
 | `agent.tool.started` / `completed` / `failed` | Every tool incl. MCP, paired by `tool_use_id`, with `duration_ms` | Bash, apply_patch, MCP and local function tools; **no failure event**; no duration |
-| `command.started` / `completed` / `failed` | Bash/PowerShell; exit code only on failure (from the error text) | Bash; end event **only if** the response carries an exit code (undocumented), else `command.outcome = unknown` |
+| `command.started` / `completed` / `failed` | Bash/PowerShell; exit code only on failure (from the error text) | Bash; end event **only if** the response carries an exit code (undocumented; a live 0.171 session sent plain output and no exit code), else `command.outcome = unknown` |
 | `file.read` | Read tool | — (no read tool) |
 | `file.created` / `modified` | Write (create vs update), Edit, MultiEdit, NotebookEdit | apply_patch Add/Update |
 | `file.deleted` / `renamed` | — | apply_patch Delete / Move |
