@@ -298,14 +298,22 @@ pub(crate) fn open_writer_with(
         .map_err(|e| StorageError::from_open(path, e))?;
 
     // First real read of the file: a non-SQLite file fails here.
-    let page_count: i64 = conn
-        .pragma_query_value(None, "page_count", |r| r.get(0))
-        .map_err(|e| StorageError::from_open(path, e))?;
-    let app_id: i32 = conn
-        .pragma_query_value(None, "application_id", |r| r.get(0))
-        .map_err(|e| StorageError::from_open(path, e))?;
-    let user_version: i32 = conn
-        .pragma_query_value(None, "user_version", |r| r.get(0))
+    //
+    // One statement, so one read snapshot. Another process may be creating
+    // this file right now: it writes page 1 (auto_vacuum), then stamps the
+    // application id, then creates the tables. Separate reads could see the
+    // unstamped page 1 and then the new tables, and refuse our own database
+    // as foreign. In a single snapshot, tables are only ever visible
+    // together with the stamp.
+    let (page_count, app_id, user_version, has_tables): (i64, i32, i32, i64) = conn
+        .query_row(
+            "SELECT (SELECT page_count FROM pragma_page_count()), \
+                    (SELECT application_id FROM pragma_application_id()), \
+                    (SELECT user_version FROM pragma_user_version()), \
+                    (SELECT count(*) FROM sqlite_master)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .map_err(|e| StorageError::from_open(path, e))?;
 
     if page_count == 0 {
@@ -313,8 +321,6 @@ pub(crate) fn open_writer_with(
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         conn.pragma_update(None, "application_id", APPLICATION_ID)?;
     } else if app_id != APPLICATION_ID {
-        let has_tables: i64 =
-            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
         if app_id != 0 || has_tables > 0 || user_version != 0 {
             return Err(StorageError::ForeignDatabase {
                 path: path.into(),
@@ -332,9 +338,7 @@ pub(crate) fn open_writer_with(
         });
     }
 
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
-        .map_err(|e| StorageError::from_open(path, e))?;
+    let mode = enable_wal(&conn).map_err(|e| StorageError::from_open(path, e))?;
     if !mode.eq_ignore_ascii_case("wal") {
         tracing::warn!(journal_mode = %mode, "SQLite refused WAL mode; continuing with {mode}");
     }
@@ -354,6 +358,33 @@ pub(crate) fn open_writer_with(
 
     migrate(&mut conn, migrations)?;
     Ok(conn)
+}
+
+/// Switch the database to WAL and return the journal mode SQLite reports.
+///
+/// Leaving rollback mode needs an exclusive lock. When another connection
+/// holds the file (a second daemon opening the same new database), SQLite
+/// returns `SQLITE_BUSY` at once without calling the busy handler, so the
+/// connection's busy timeout does not apply. Retry with a short backoff for
+/// up to [`BUSY_TIMEOUT`]. Once any connection has switched the file, WAL is
+/// persistent and this statement no longer needs the exclusive lock.
+fn enable_wal(conn: &Connection) -> rusqlite::Result<String> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)) {
+            Err(e)
+                if matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Create a new database file readable only by its owner, so a custom path
@@ -380,13 +411,24 @@ fn create_private_file(path: &Path) -> std::io::Result<()> {
 /// The version is re-read inside each migration's write transaction, so two
 /// daemons opening a fresh shared database at the same moment cannot both
 /// apply the same migration.
+///
+/// A newer build may migrate the same new file past this build's schema
+/// after the caller's identity check. Every re-read refuses that, so this
+/// build never writes into a database from a newer schema.
 pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<i32> {
+    let latest = migrations.iter().map(|m| m.version).max().unwrap_or(0);
     let mut current: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if current > latest {
+        return Err(StorageError::NewerSchema {
+            found: current,
+            supported: latest,
+        });
+    }
     if migrations.iter().all(|m| m.version <= current) {
         return Ok(current);
     }
     conn.busy_timeout(MIGRATION_BUSY_TIMEOUT)?;
-    let result = migrate_pending(conn, migrations, &mut current);
+    let result = migrate_pending(conn, migrations, latest, &mut current);
     // Back to the normal wait on every exit path.
     conn.busy_timeout(BUSY_TIMEOUT)?;
     result.map(|()| current)
@@ -395,6 +437,7 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
 fn migrate_pending(
     conn: &mut Connection,
     migrations: &[Migration],
+    latest: i32,
     current: &mut i32,
 ) -> Result<()> {
     for m in migrations {
@@ -403,6 +446,13 @@ fn migrate_pending(
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if now > latest {
+            // Dropping `tx` rolls back; nothing was written.
+            return Err(StorageError::NewerSchema {
+                found: now,
+                supported: latest,
+            });
+        }
         if now >= m.version {
             // Another process applied it while we waited for the lock.
             tx.commit()?;
@@ -620,6 +670,42 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_that_becomes_newer_before_migration_is_refused() {
+        // The race: this build's identity check saw an older schema, then a
+        // newer build migrated the file before `migrate` ran.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        drop(open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..1]).unwrap());
+        let mut c = Connection::open(&path).unwrap();
+        c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let tables_before: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        // Fast path (nothing pending from this build's point of view)...
+        let err = migrate(&mut c, MIGRATIONS).unwrap_err();
+        assert!(
+            matches!(err, StorageError::NewerSchema { found, supported }
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION),
+            "{err:?}"
+        );
+        // ...and the re-read inside a pending migration's transaction.
+        let mut current = 1;
+        let err = migrate_pending(&mut c, MIGRATIONS, SCHEMA_VERSION, &mut current).unwrap_err();
+        assert!(matches!(err, StorageError::NewerSchema { .. }), "{err:?}");
+        let (v, tables_after): (i32, i64) = c
+            .query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version()), \
+                        (SELECT count(*) FROM sqlite_master)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "the newer version is left alone");
+        assert_eq!(tables_after, tables_before, "no migration was applied");
+    }
+
+    #[test]
     fn interrupted_migration_rolls_back_completely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
@@ -817,16 +903,37 @@ mod tests {
 
     #[test]
     fn concurrent_first_open_applies_the_migration_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.db");
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let p = path.clone();
-                std::thread::spawn(move || open_writer(&p, SyncMode::Normal).map(drop))
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap().expect("every concurrent opener succeeds");
+        // Several daemons starting together on a new data directory. Before
+        // the single-snapshot identity read and the WAL retry, about 4 % of
+        // rounds here had an opener fail with `ForeignDatabase` or
+        // "database is locked". The barrier lines the openers up so the
+        // windows are actually hit.
+        for _ in 0..60 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.db");
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let p = path.clone();
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        open_writer(&p, SyncMode::Normal).map(drop)
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().expect("every concurrent opener succeeds");
+            }
+            let conn = open_writer(&path, SyncMode::Normal).unwrap();
+            let v: i32 = conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            let mode: String = conn
+                .pragma_query_value(None, "journal_mode", |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
         }
     }
 
