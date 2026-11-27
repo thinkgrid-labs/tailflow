@@ -4,6 +4,9 @@
 survives a daemon restart and can be queried by time, source, type, and text.
 Nothing leaves your machine, and no account or external database is involved.
 
+> **v0.4.0 (upcoming, on `dev`).** Durable history is not in a published
+> release yet; v0.3.3 keeps logs in memory only.
+
 [Documentation index](README.md)
 
 ## What is recorded
@@ -38,7 +41,7 @@ upgrade runs in one transaction on first open. A build that only knows an
 older schema refuses the newer database and runs memory-only; it never
 modifies it.
 
-**Schema v4** (M4) adds `fs_coverage` (which directories were observed, when,
+**Schema v4** (v0.4.0) adds `fs_coverage` (which directories were observed, when,
 by which daemon run, and whether coverage was partial) and two partial
 indexes, `events_path_ts` (filesystem observations and agent hook events
 that carry a path) and `events_fs_ts` (observations by time), for file
@@ -186,11 +189,41 @@ take a second or two; persistence waits behind them, live logs do not.
 
 ## Resource cost
 
-Measured on a 2018 4-core laptop: idle CPU stays at 0 %, and persistence adds
-roughly 35 µs of CPU per stored event (about 2 % of one core at 100 events/s).
-Each event takes about 400 bytes on disk including indexes, so the 2 GB default
-holds roughly 5 million events. Setting `full_text_search = false` cuts the
-write cost by about a third; `--no-storage` removes it.
+Whole-daemon cost with durable history on (default settings, release build):
+
+| Workload | CPU (share of one core) | Private memory | Loss |
+|---|---|---|---|
+| Idle, no observation | about 0.005 % | about 5 MB | — |
+| 1,000 log lines/s | about 12 % | about 13 MB average, 20 MB peak | none |
+| 10,000 log lines/s | about 55 % | about 25 MB | none |
+| Idle, observing one 2,000-file project | about 0.02 % | about 6–7 MB | — |
+
+How these were measured, and what they do not show:
+
+- One machine: a 2018 Intel MacBook (Core i5-8259U, 4 cores, 8 GB,
+  macOS 15.8.1). It was **not** a quiet benchmark host: other work kept its
+  load average between about 2 and 8 during the logging runs, and up to 27
+  during some observation runs. Linux and Windows
+  have not been measured.
+- `scripts/bench/resource_bench.py` (60-second idle samples, 20-second load
+  runs) and `scripts/bench/m4f_observe_bench.py`; medians of 2–3 repeats.
+- An open dashboard adds a live stream that wakes the daemon about ten times
+  a second (see [dashboard cost](dashboard.md#cost)).
+
+To reproduce on your machine:
+
+```bash
+(cd web && npm ci && npm run build)
+cargo build --release -p tailflow-daemon --bin tailflow-daemon --examples
+python3 scripts/bench/resource_bench.py --bin dev=target/release/tailflow-daemon \
+    --scenarios idle,load:1000,load:10000 --repeat 3
+```
+
+A runtime log event takes about 400 bytes on disk including indexes (a
+3-million-event bulk load measured 408 bytes per event), so the 2 GB default
+holds roughly 5 million such events. Setting `full_text_search = false`
+skips the full-text index, which makes writes cheaper and the database
+smaller; `--no-storage` removes durable history altogether.
 
 ## Privacy
 
@@ -201,7 +234,7 @@ capture_enabled = true        # false = record nothing durable
 disabled_rules = []           # turn off built-in rules by name
 excluded_event_types = []     # e.g. ["runtime.log"] or ["git.*"]
 excluded_agents = []
-allowed_project_dirs = []     # prepared for future file/agent collectors
+allowed_project_dirs = []     # record agent and file events only under these
 excluded_file_globs = []      # e.g. ["**/.env", "**/secrets/**"]
 
 [[privacy.redaction_rules]]
@@ -284,9 +317,9 @@ contain SQLite messages and file paths.
 
 ## HTTP API (v1)
 
-All endpoints are read-only `GET`s on the loopback listener and require the
-API token (`Authorization: Bearer …`) or a dashboard session; see
-[security](security.md).
+The data endpoints are read-only `GET`s on the loopback listener and require
+the API token (`Authorization: Bearer …`) or a dashboard session. The only
+`POST` endpoints manage sign-in; see [security](security.md#auth-endpoints).
 
 | Endpoint | Returns |
 |---|---|

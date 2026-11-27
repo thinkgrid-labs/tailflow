@@ -1,5 +1,7 @@
 # Verified file changes and Git evidence
 
+> **v0.4.0 (upcoming, on `dev`).** Not in a published release yet.
+
 An agent hook saying "I edited `src/api.ts`" is a claim. For projects you
 choose, TailFlow can also record what the filesystem and Git themselves
 show, and compare the two. Nothing here identifies *who* changed a file.
@@ -22,9 +24,11 @@ coalesce_ms = 200              # quiet time before a burst becomes one observati
 git_min_interval_secs = 30     # at most one change-triggered snapshot per repo per 30 s
 ```
 
-Or pass `--observe DIR` to `tailflow-daemon` (repeatable). The daemon's
-startup banner, **Integrations → File & Git observation**, and
-`GET /api/v1/observe/status` show what is observed.
+Or pass `--observe DIR` to `tailflow-daemon` (repeatable).
+**Integrations → File & Git observation** and `GET /api/v1/observe/status`
+show what is observed. (The startup banner's `observe` line can print
+`0 directories` because it is written before the observers start; trust the
+status endpoint.)
 
 ## What is observed
 
@@ -128,7 +132,8 @@ Git is only read:
 - TailFlow never stages, checks out, resets or cleans.
 
 Filter drivers (Git LFS, for example) are disabled for snapshots: TailFlow
-never runs a program a repository configures. Files they manage may then
+never runs a program a repository configures. If the configured filters
+cannot be listed, the snapshot is skipped rather than risk running one. Files they manage may then
 show as modified; the snapshot records `git.filters_disabled`.
 
 A snapshot lists only paths under the observed directories (the total for

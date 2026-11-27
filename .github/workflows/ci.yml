@@ -47,6 +47,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all
+      # Links, anchors, API routes, config keys and every documented CLI
+      # command/flag against the binaries just built.
+      - name: Documentation check
+        run: python3 scripts/docs/check_docs.py --bin target/debug
 
   # ── Tests ──────────────────────────────────────────────────────────────────
   test:

@@ -9,45 +9,37 @@ sources.
 ## System overview
 
 ```text
-Docker / Process / File / Stdin
-            │ LogRecord
-            ▼
-   broadcast bus (4,096) ── Lagged(n) → counted, gap recorded, warn record
+Docker / Process / File / Stdin                 agent hooks           [observe] directories
+            │ LogRecord                (tailflow agent hook <agent>)    (opt-in)
+            ▼                                     │                         │
+   broadcast bus (4,096) ── lag → counted,        ▼                         ▼
+            │                 gap recorded    owner-only spool        file watcher (bounded
+            ▼                                     │                   queue) + Git snapshots
+   daemon fan-out: filter → redact →              │ ingest, waits for space │
+   ring push → SSE (/events)                      │                         │
+            │ try_send (never blocks)             │                         │
+            ▼                                     ▼                         ▼
+   bounded queue ── full → counted, gap recorded ◀──────────────────────────┘
             │
             ▼
-   daemon fan-out (one task): filter → redact → ring push → SSE broadcast
-            │                                      │
-            │ try_send (never blocks)              └─► /api/query, /errors, /wait, MCP
+   writer thread: batch (≤512 / 500 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL, FTS5)
+            │                                       │
+            │ commit notification                   └─ retention, heartbeats, gap rows
             ▼
-   bounded queue ── full → counted, gap recorded
-            │
-            ▼
-   writer thread: batch (≤512 / 500 ms) → BEGIN IMMEDIATE … COMMIT (SQLite WAL)
-            │                                                        ▲
-            └─ retention, heartbeats, gap rows          reader pool ─┘ /api/v1/*
+   agent stream (/api/v1/stream/agent) ── re-reads committed rows ──► dashboard
+   reader pool (read-only connections) ──► /api/v1/*
+
+   in-memory ring ──► /api/query, /api/errors, /api/wait, MCP, tailflow-logs
 ```
 
-The pre-M1 view of the same system:
+Two kinds of state are kept apart:
 
-```text
-┌────────────────────────── tailflow-core ──────────────────────────┐
-│ Docker ─┐                                                         │
-│ Process ┼──► broadcast channel of LogRecord ──┬──► bounded store  │
-│ File ───┤                                     │    + grouping     │
-│ Stdin ──┘                                     │                  │
-└───────────────────────────────────────────────┼──────────────────┘
-                                                │
-                         ┌──────────────────────┴──────────────────┐
-                         │                                         │
-                  ┌──────▼──────┐                         ┌────────▼────────┐
-                  │ tailflow TUI│                         │ daemon + web UI │
-                  └─────────────┘                         │ HTTP API + SSE  │
-                                                        └────────┬────────┘
-                                                                 │ HTTP
-                                                  ┌──────────────┴─────────────┐
-                                                  │ tailflow-mcp  tailflow-logs│
-                                                  └────────────────────────────┘
-```
+- **In-process notifications** (the broadcast bus, the SSE fan-out, the
+  agent stream's wake-up) are fast and bounded. They can lag, and lag is
+  counted, but they are not the record.
+- **Durable history** is what the writer committed to SQLite. The agent
+  stream only ever sends committed rows, re-reading them from SQLite, so a
+  slow browser costs a re-read, never a lost event.
 
 ## Components
 
@@ -112,13 +104,17 @@ through indexed, bounded lookups.
 
 ### Dashboard (`web/`)
 
-A Preact single-page app with hash routing and no other runtime dependency.
+A Preact/Vite single-page app with hash routing and no other runtime
+dependency, embedded in the daemon binary at build time.
 Pages read the public read-only API; nothing in the browser filters a full
 dataset. The live log view keeps the newest 5,000 ring records and renders
 only the visible rows (a variable-height virtual list). Agent views follow
 `/api/v1/stream/agent`, a resumable SSE stream of *committed* agent events.
 Each event reloads only the views it concerns (coalesced), and the views
-fall back to polling when the stream is unavailable. Pure logic (`web/src/lib/`) has Node unit tests
+fall back to polling when the stream is unavailable. The live log view
+hydrates from recent records, subscribes to `/events`, deduplicates by
+sequence number and rehydrates after a disconnect. Pure logic
+(`web/src/lib/`) has Node unit tests
 (`npm test`); `web/e2e/` runs Playwright against a real daemon fed through the
 real agent hook adapters.
 
@@ -137,12 +133,6 @@ state out of each agent process.
 
 Runs the same core sources directly and renders their broadcast stream with
 Ratatui. It does not require the daemon.
-
-### `web`
-
-A Preact/Vite application embedded in the daemon binary at release time. It
-hydrates from recent records, subscribes to SSE, deduplicates by sequence number,
-and rehydrates after a disconnected stream.
 
 ## Data model and flow
 
@@ -200,10 +190,13 @@ endpoint that writes. See [agent capture](agent-capture.md).
 
 ### Loss is never silent
 
-Every lossy hop is counted and recorded: source-bus lag, storage-queue
-overflow, failed commits, and unclean shutdowns. Persisted history carries gap
-rows in the same transaction as the next batch, and responses derive
-`completeness` from them.
+Every lossy hop inside TailFlow is counted and recorded: source-bus lag,
+storage-queue overflow, agent-spool overflow, file-observer queue overflow,
+failed commits, and unclean shutdowns. Persisted history carries gap rows in
+the same transaction as the next batch, and responses derive `completeness`
+from them. Loss outside TailFlow is recorded only when it is reported: the OS
+dropping file notifications it does not announce, or an agent not calling a
+hook, cannot be detected.
 
 ### Persistence never blocks live logs
 

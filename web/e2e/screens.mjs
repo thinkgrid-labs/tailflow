@@ -1,16 +1,19 @@
 // Capture every page at several viewports and themes, and report console
 // errors and CSP violations. For visual QA (not a pass/fail test).
 //   node e2e/screens.mjs <base url> <out dir> [--quick]
+// <base url> is a daemon started by `node e2e/fixture.mjs <bin dir>` (it uses
+// the fixture's API token to sign each browser context in).
 
 import { chromium } from '@playwright/test'
 import fs from 'node:fs'
 import path from 'node:path'
+import { authHeaders, signInUrl } from './fixture.mjs'
 
 const [base, out] = process.argv.slice(2)
 const quick = process.argv.includes('--quick')
 fs.mkdirSync(out, { recursive: true })
 
-const sessions = await (await fetch(`${base}/api/v1/sessions?limit=10`)).json()
+const sessions = await (await fetch(`${base}/api/v1/sessions?limit=10`, { headers: authHeaders })).json()
 const c1 = sessions.sessions.find(s => s.session_id.startsWith('claude-code:1111'))?.session_id ?? sessions.sessions[0]?.session_id
 
 const pages = [
@@ -38,6 +41,7 @@ for (const theme of themes) {
   for (const [vp, w, h] of viewports) {
     const ctx = await browser.newContext({ viewport: { width: w, height: h }, colorScheme: theme, deviceScaleFactor: 1 })
     const page = await ctx.newPage()
+    await page.goto(await signInUrl(base))
     page.on('console', m => { if (m.type() === 'error' || m.type() === 'warning') problems.push(`${theme}/${vp} console ${m.type()}: ${m.text()}`) })
     page.on('pageerror', e => problems.push(`${theme}/${vp} pageerror: ${e.message}`))
     for (const [name, hash] of pages) {

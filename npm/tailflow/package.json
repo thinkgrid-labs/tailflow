@@ -1,13 +1,16 @@
 {
   "name": "tailflow",
   "version": "0.3.3",
-  "description": "Runtime verification for coding agents using local process, Docker and file logs over MCP",
+  "description": "See what your coding agents actually do: local-first observability for Claude Code and Codex, with runtime logs over MCP and file and Git evidence",
   "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
     "ai-agent",
     "claude",
+    "claude-code",
+    "codex",
+    "observability",
     "log",
     "tail",
     "docker",

@@ -5,6 +5,25 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 
 [Documentation index](README.md)
 
+## Validation still pending for v0.4.0
+
+v0.4.0 is not released. These checks have not been done yet, so the matching
+claims rest on synthetic tests only:
+
+- **Codex:** support is built from Codex's published hook schemas and tested
+  with synthetic hook input. It has not been run against a live Codex
+  session, so the real `apply_patch`, exit-code and token payloads, and hook
+  trust, are unconfirmed.
+- **Windows agents:** hook installation, capture, file observation and
+  shutdown pass CI on Windows with synthetic hook input. Real Claude Code and
+  Codex sessions on Windows have not been run.
+- **Long runs:** the longest runs so far are 8-hour soaks of earlier
+  development builds (macOS: memory flat; a Linux VM: still rising slowly at
+  hour 8). A 24-hour Linux endurance run of the v0.4.0 code has not been
+  done.
+- **Benchmarks:** all published numbers come from one shared development
+  machine, not a quiet dedicated host, and none from Linux or Windows.
+
 ## Scope at a glance
 
 | Area | Current boundary | Practical implication |
@@ -13,8 +32,8 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 | Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
 | Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
 | Redaction | Heuristic credential patterns | Not every secret is detected |
-| Agent activity | Opt-in Claude Code and Codex hooks (next release) | Only what the agent's hooks report; shell side effects, Claude Code tokens and agent versions are not seen |
-| File and Git evidence | Opt-in `[observe]` directories (next release) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
+| Agent activity | Opt-in Claude Code and Codex hooks (v0.4.0, upcoming) | Only what the agent's hooks report; hooks do not report shell side effects, Claude Code tokens or agent versions |
+| File and Git evidence | Opt-in `[observe]` directories (v0.4.0, upcoming) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
@@ -160,15 +179,20 @@ after the process exits unless another source also writes it to a file.
   that no retained/new line matched before the deadline.
 - The MCP output is optimized for bounded context, so callers needing exact data
   should request JSON or use the HTTP API.
+- From v0.4.0 the API requires a credential. `tailflow-mcp` and
+  `tailflow-logs` 0.3.x, and scripts that send no token, get `401` until they
+  are upgraded or send `Authorization: Bearer $(tailflow-daemon token)`.
 
 ## Agent capture boundaries
 
 See [agent capture](agent-capture.md#what-tailflow-cannot-see) for the full
 matrix. In short:
 
-- Events are **agent-reported**. A `file.modified` means the agent's file tool
-  reported an edit, not that TailFlow saw the file change. Edits made through
-  the shell (`sed -i`, `>`, `mv`, build scripts) are not recorded.
+- Events are **agent-reported**. An agent's `file.modified` means its file
+  tool reported an edit, not that TailFlow saw the file change. Hooks do not
+  report edits made through the shell (`sed -i`, `>`, `mv`, build scripts).
+  In a directory under `[observe]`, the file watcher does record those
+  changes, as unattributed observations.
 - **Claude Code** reports a shell command's exit code only when it fails
   (parsed from the documented `Exit code N` error text). **Codex** documents
   no exit code at all, so its commands have no recorded outcome unless the
@@ -198,6 +222,8 @@ matrix. In short:
 - Only directories listed in `[observe]` (or `--observe`) are watched, and only while a daemon runs. A change made while nothing was observing it is **unverified**, not absent.
 - A file watcher records that a path changed, not which process changed it. A **reported + observed** match is an association within a time window (± 5 s by default), not authorship.
 - The OS may coalesce or drop notifications. Drops the OS reports (`fs_watcher_rescan`) and TailFlow's own queue overflows (`fs_observer_overflow`) are recorded as loss; drops the OS does not report cannot be detected.
+- The observer's queue is bounded (8,192 entries). Repeated changes to one path share an entry, and in testing no overflow occurred up to about 2,800 new files per second, the fastest the test machine could write. Thousands of distinct paths changing faster than that can still overflow it; the loss is counted and the affected reports become **unverified**.
+- On Linux, a file changed only through a memory mapping (`mmap`) produces no notification, so the change is not observed.
 - macOS (FSEvents) can repeat a recently created file's "created" and "modified" flags on later notifications, so an attribute-only change (for example `chmod`) of a new file may be reported as a change to it. Linux reports such changes as attribute changes, which are not recorded.
 - On Linux at most `max_directories` directories per root are watched (inotify uses one watch per directory); beyond that coverage is reported as partial and reports there are **unverified**.
 - Git snapshots list at most 150 changed paths under the observed directories (the total is always recorded); a session comparison stops at the last listed path and is marked incomplete. Snapshots happen at startup, at session boundaries (seen at once, or within about 2 seconds when another daemon recorded them) and after changes settle (at most every 30 s by default): changes between snapshots are seen only as their net effect.
@@ -236,7 +262,7 @@ See the [dashboard guide](dashboard.md) for how each view reads its data.
 - The Integrations page reports hooks recorded by `tailflow agent install`.
   Hooks added to an agent config by hand are not detected there;
   `tailflow agent status` checks the default config paths.
-- Nearby runtime events in the inspector are matched by time (±60 s) only.
+- Nearby runtime events in the inspector are matched by time (±30 s) only.
   The dashboard does not infer causation.
 - The live view keeps up with 1,000 lines/s in testing. Far beyond that (tens
   of thousands of lines/s), parsing the stream saturates the browser tab; the

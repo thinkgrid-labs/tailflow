@@ -1,5 +1,8 @@
 # Security and local API access
 
+> **Applies to v0.4.0 (upcoming, on `dev`).** v0.3.3 and earlier have no API
+> authentication; see [upgrading from 0.3.x](#upgrading-from-03x).
+
 TailFlow's daemon serves its dashboard and HTTP API on `127.0.0.1`. That
 API can return agent sessions, project and file paths, commands (depending on
 the capture mode), runtime logs and error details. Read-only is not the same
@@ -129,9 +132,9 @@ The daemon listens on `127.0.0.1` and, when available, `[::1]`, so
 `localhost` always reaches it. If another process already holds the port on
 `[::1]`, the daemon refuses to start rather than leave `localhost` to it.
 
-For dashboard development, `npm run dev` proxies `/api` and `/auth` to the
-daemon without any credential of its own: sign in through the daemon's link
-first. The proxy forwards your session cookie and strips the dev server's
+For dashboard development, `npm run dev` proxies `/events`, `/api` and
+`/health` to the daemon without any credential of its own: sign in through the
+daemon's own link first. The proxy forwards your session cookie and strips the dev server's
 `Origin`; a page on another port still cannot use it.
 
 ## What is public
@@ -145,6 +148,27 @@ Only these paths work without a credential:
 
 Everything else needs a credential, including paths that don't exist. A new
 endpoint can't ship unauthenticated by accident.
+
+Refused requests are answered in this order:
+
+| Check | Status |
+|---|---|
+| `Host` is not a loopback name | `421` |
+| `Origin` is not loopback, or a cross-site request that is not a top-level navigation | `403` |
+| Request target over 8 KiB / body over 16 KiB | `414` / `413` |
+| No valid credential | `401` (or `403` for a cookie without same-origin Fetch Metadata) |
+
+## Auth endpoints
+
+| Endpoint | Credential | Purpose |
+|---|---|---|
+| `GET /auth/login/<code>` | the one-time code | Sets the session cookie and redirects to the dashboard |
+| `GET /api/v1/auth/session` | token or session | Whether this request is authenticated, with which kind of credential, and the session timeouts |
+| `POST /api/v1/auth/login-links` | API token only | Mints a sign-in link (what `tailflow-daemon dashboard` uses) |
+| `POST /api/v1/auth/logout` | session | Signs this browser out |
+| `POST /api/v1/auth/sessions/revoke` | API token only | Signs every browser out (`tailflow-daemon dashboard --revoke-sessions`) |
+
+A browser session cannot mint sign-in links or revoke sessions.
 
 ## File observation and Git
 
@@ -194,9 +218,23 @@ Commit ids are validated before they are passed to Git. See
   seconds; use `--no-open` on shared Linux hosts.
 - **Cookie replay by a loopback server** (above, outside the threat model).
 
+## Dependency advisories
+
+At the time of writing (2026-11-27), `cargo audit` reports no known
+vulnerabilities in TailFlow's dependencies and `npm audit` reports none in
+the dashboard's. `cargo audit` does report warnings:
+
+- `lru` 0.12 is flagged unsound (RUSTSEC-2026-0002, RUSTSEC-2026-0253). It is
+  reached only through `ratatui` in the `tailflow` terminal UI, not the
+  daemon; the fix needs a `ratatui` upgrade.
+- `chrono`, `instant` and `paste` are flagged unmaintained
+  (RUSTSEC-2026-0543, RUSTSEC-2024-0384, RUSTSEC-2024-0436).
+
+Run `cargo audit` yourself for the current state.
+
 ## Upgrading from 0.3.x
 
-The API now requires a credential.
+v0.4.0 (upcoming) requires a credential for the API.
 
 - `tailflow-mcp` and `tailflow-logs` from the same release handle this
   automatically. Older binaries get `401` and need upgrading together with the

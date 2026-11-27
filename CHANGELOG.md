@@ -9,19 +9,20 @@ crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
 ## [0.4.0] - [Unreleased]
 
-Milestone M1: durable event engine and observability foundation. TailFlow now
-keeps a local, private, queryable history and states explicitly when that
-history is incomplete.
+Not yet released; merged on `dev`. Live Codex sessions, real agents on
+Windows and a 24-hour Linux endurance run are still to be validated (see
+[limitations](docs/limitations.md#validation-still-pending-for-v040)).
 
-Milestone M2: agent capture and session tracking. With opt-in hooks, TailFlow
-records what Claude Code and Codex report doing — sessions, tool calls, shell
-commands, the files their tools read or edit — and says what it cannot see.
-
-Milestone M3: agent observability dashboard. The local web UI becomes an
-investigation tool for agent activity and the runtime around it, without
-claiming more than the hooks reported.
-
-Milestone M4: verified changes, runtime correlation and local API security.
+- **Durable history.** TailFlow keeps a local, private, queryable history and
+  states explicitly when that history is incomplete.
+- **Agent capture and session tracking.** With opt-in hooks, TailFlow records
+  what Claude Code and Codex report doing — sessions, tool calls, shell
+  commands, the files their tools read or edit — and says what it cannot see.
+- **Agent observability dashboard.** The local web UI becomes an
+  investigation tool for agent activity and the runtime around it, without
+  claiming more than the hooks reported.
+- **Evidence and security.** Opt-in file and Git evidence, reported command
+  outcomes, graded related evidence, and an authenticated local API.
 
 ### Added
 
@@ -210,7 +211,8 @@ Milestone M4: verified changes, runtime correlation and local API security.
   `Authorization: Bearer $(tailflow-daemon token)`. `/health` without a
   credential returns only `ok`, `version` and `auth_required`.
   `tailflow-logs` exits `4` when not authorized. `npm run dev` proxies
-  without a credential of its own: sign in through the daemon's link first.
+  `/events`, `/api` and `/health` without a credential of its own: sign in
+  through the daemon's link first.
 - **The live log view is virtualized.** Only on-screen rows are rendered
   (variable height, expanded JSON, wrapping or horizontal scrolling), the
   view stays put while paused or scrolled up, and a reconnect catches up
@@ -273,8 +275,25 @@ Milestone M4: verified changes, runtime correlation and local API security.
   `tailflow-core::paths` (re-exported from the old location).
 - The `tailflow` binary no longer starts its async runtime for subcommands.
 
+- **File observation is event-driven and keeps up with bursts.** The
+  observer, its supervisor and the Git snapshot loop wait for work instead of
+  waking on timers: an idle daemon observing one project wakes under once a
+  second (it was about 20 times). Repeated notifications for one path are
+  merged before the bounded queue, so bursts no longer overflow it in tests up
+  to about 2,800 new files per second, with less observer CPU.
+  `/api/v1/observe/status` adds `notifications`, `coalesced`, `filtered` and
+  `queue_peak`.
+- **Faster start and stop.** Credential files are no longer written with a
+  full device flush (`F_FULLFSYNC` on macOS) where an ordinary flush is
+  enough; sign-in, sign-out and revocation still flush.
+
 ### Fixed
 
+- Sign-in durability: a sign-in is flushed to disk again, and a revocation
+  or sign-out that cannot be written fails closed (the old session store is
+  deleted), so a revoked session cannot be restored after a restart. The
+  session directory is flushed without following a planted FIFO or symlink,
+  and temporary file names include a random part.
 - Observation: directories created or moved into an observed project are
   scanned (bounded) and watched; a save through an excluded temporary file
   counts as a change of the real file; coverage starts once watches are in
