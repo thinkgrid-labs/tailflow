@@ -40,7 +40,7 @@ tests or on one development machine:
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
 | Docker | All running containers on the local daemon | No Compose-service allowlist, Kubernetes, or remote Docker target |
 | Files | Local paths | No network log drains or object-store ingestion |
-| Platforms | macOS ARM64/x64, Linux ARM64/x64, Windows x64 | Other targets require a source build and may be untested |
+| Platforms | macOS ARM64/x64, Linux ARM64/x64 (glibc; ARM64 needs glibc 2.39+), Windows x64 | Other targets, including musl, require a source build and may be untested |
 
 ## Security model
 

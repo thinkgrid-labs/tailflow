@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
-## [0.4.0] - 2026-11-27
+## [0.4.0-rc.1] - 2026-11-27
+
+**Prerelease.** The first v0.4.0 release candidate, published on npm under
+`next` (`npm install -g tailflow@next`); `latest` stays on 0.3.3. It is
+experimental and for early testing. A 24-hour Linux endurance run,
+quiet-host benchmarks and real agent sessions on Windows have not been done.
+See the [release notes](docs/releases/v0.4.0-rc.1.md).
 
 - **Durable history.** TailFlow keeps a local, private, queryable history and
   states explicitly when that history is incomplete.
@@ -282,6 +288,15 @@ crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 - **Faster start and stop.** Credential files are no longer written with a
   full device flush (`F_FULLFSYNC` on macOS) where an ordinary flush is
   enough; sign-in, sign-out and revocation still flush.
+- **Release pipeline.** A prerelease version (`-rc.N`, `-beta.N`,
+  `-alpha.N`) is published to npm under `next` and as a GitHub prerelease;
+  only a stable version gets `latest`. A tag is refused unless it is on
+  `main` and Cargo.toml, Cargo.lock and every npm manifest already carry its
+  version. Binaries the build runner can execute (macOS ARM64, Linux x64,
+  Windows x64) must report it. Release actions are pinned to commits, and Rust,
+  Node, `cross` and its build image to exact versions.
+  `scripts/bump-version.js` accepts prerelease versions and updates
+  Cargo.lock.
 
 ### Fixed
 
@@ -638,8 +653,8 @@ Initial release.
   (ARM64, x64), Linux (x64, ARM64), and Windows x64.
 - CI running `fmt`, `clippy`, `build`, and `test`.
 
-[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...v0.4.0
+[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.4.0-rc.1...HEAD
+[0.4.0-rc.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...v0.4.0-rc.1
 [0.3.3]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.0...v0.3.1

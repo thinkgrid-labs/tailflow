@@ -22,9 +22,19 @@ x64. Building from source requires Rust 1.89 or newer.
 ### npm
 
 ```bash
-npm install -g tailflow
-tailflow --version
+npm install -g tailflow@next
+tailflow --version   # tailflow 0.4.0-rc.1
 ```
+
+v0.4.0 is available as a release candidate, v0.4.0-rc.1. It is an experimental
+prerelease on the npm `next` tag: see the
+[release notes](releases/v0.4.0-rc.1.md) for what is not validated yet.
+`npm install -g tailflow@0.4.0-rc.1` pins it. `npm install -g tailflow`
+installs the stable v0.3.3, which has none of the features marked v0.4.0 in
+these docs. Before you switch back to it, remove any agent hooks with
+`tailflow agent uninstall claude` (or `codex`; add `--scope` if you installed
+with one). v0.3.3 cannot run the hooks and refuses them with status 2, which
+the agent treats as "block" for every tool call.
 
 The package installs:
 

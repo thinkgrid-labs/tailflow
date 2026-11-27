@@ -108,9 +108,13 @@ path in detail.
 Prebuilt binaries cover macOS (ARM64, x64), Linux (ARM64, x64) and Windows
 (x64). The npm package needs Node.js 18+ but no Rust toolchain.
 
+> v0.4.0 is in testing as an experimental prerelease, v0.4.0-rc.1, on npm `next`.
+> `npm install -g tailflow` still installs v0.3.3, which has no agent capture.
+> [Release notes](docs/releases/v0.4.0-rc.1.md).
+
 ```bash
 # 1. Install tailflow, tailflow-daemon, tailflow-mcp and tailflow-logs
-npm install -g tailflow
+npm install -g tailflow@next
 
 # 2. In your project, pick sources and write tailflow.toml
 cd your-project
