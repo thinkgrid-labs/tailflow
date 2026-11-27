@@ -76,6 +76,8 @@ def idle_observe(binary, n, seconds, trees):
         ready_s = None
         if n:
             ready_s, _ = m4.wait_observing(port, n, timeout=300)
+            if ready_s is None:
+                raise RuntimeError(f"{n} root(s) never reached 'observing'")
         time.sleep(5)
         s = rb.Sampler(p.pid, every=1.0)
         time.sleep(seconds)
@@ -237,7 +239,7 @@ def main():
 
     with m4.Projects() as pd:
         trees = []
-        if want("idle_observe") or want("idle_dashboard"):
+        if any(want(f"idle_observe:{n}") for n in (1, 4)) or want("idle_dashboard"):
             for i in range(4):
                 t = os.path.join(pd, f"proj{i}")
                 m4.make_tree(t, 200, 10)
