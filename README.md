@@ -224,7 +224,6 @@ not watch agent processes or their exit codes. See [evidence](docs/evidence.md).
 | **What is not collected** | Prompt text, assistant messages, file contents and transcripts, in any mode. By default, command lines are reduced to the program and a known subcommand (for example `cargo test`), and failure text is dropped. |
 | **Retention** | 30 days and a 2 GB cap by default (`[storage]`); `--no-storage` keeps everything in memory. |
 | **Redaction** | Common credential formats (API keys, bearer tokens, URL passwords, private keys) are redacted before display and storage. It is pattern-based and will not catch every secret. |
-| **Resource use** | Idle: about 0.005 % of one core and 5 MB of private memory. At 1,000 log lines/s: about 12 % of one core and 13 MB, with no loss. Measured on a 2018 Intel MacBook that was also running other work, not a dedicated benchmark host; see [resource cost](docs/storage.md#resource-cost) for the method and limits. |
 
 Read [durable history and privacy](docs/storage.md) and
 [limitations](docs/limitations.md) before using TailFlow with sensitive logs.

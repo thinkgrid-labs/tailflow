@@ -21,8 +21,9 @@ tests or on one development machine:
   development builds (macOS: memory flat; a Linux VM: still rising slowly at
   hour 8). A 24-hour Linux endurance run of this release has not been
   done.
-- **Benchmarks:** all published numbers come from one shared development
-  machine, not a quiet dedicated host, and none from Linux or Windows.
+- **Benchmarks:** TailFlow has not been benchmarked on a quiet, dedicated
+  host, or on Linux or Windows, so these docs publish no CPU or memory
+  figures.
 
 ## Scope at a glance
 

@@ -134,16 +134,10 @@ The dashboard is meant to be left open all day.
 - Every count comes from SQLite indexes on the daemon. Each query runs under a
   3-second budget and returns a bounded response. The browser never downloads
   the database to filter it.
-- The live log view renders about 60 rows whatever the buffer holds. In a
-  headless-Chrome benchmark streaming 1,000 lines/s into a full 5,000-line
-  view it used about 18–22 % of the browser's main thread at a steady 60 fps
-  (the v0.3.3 log view: about 99 % at 6–8 fps). Expanding large JSON rows
-  costs more.
-- An open dashboard costs the daemon about 0.1 % of one core. While a tab is
-  connected, the daemon checks for new commits every 250 ms, so it wakes
-  about ten times a second instead of staying idle.
-- These figures come from a 2018 Intel MacBook (macOS) that was running
-  other work at the same time; treat them as indications, not guarantees.
+- The live log view renders about 60 rows whatever the buffer holds.
+  Expanding large JSON rows costs more.
+- While a tab is connected, the daemon checks for new commits every 250 ms,
+  so it wakes about ten times a second instead of staying idle.
 - The UI is about 56 KB of JavaScript (gzip): a main file of about 34 KB,
   plus per-page chunks that load on first visit, and one stylesheet. All of
   it is embedded in the daemon binary. It uses no web fonts and no
