@@ -4,8 +4,7 @@
 survives a daemon restart and can be queried by time, source, type, and text.
 Nothing leaves your machine, and no account or external database is involved.
 
-> **v0.4.0 (upcoming, on `dev`).** Durable history is not in a published
-> release yet; v0.3.3 keeps logs in memory only.
+> **Since v0.4.0.** v0.3.3 and earlier keep logs in memory only.
 
 [Documentation index](README.md)
 

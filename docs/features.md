@@ -239,7 +239,7 @@ underlying evidence should not.
 3. TailFlow reconciles the new container ID and begins following its output.
 4. Verify the new startup event rather than assuming replacement implies health.
 
-## 7. Keep history that survives restarts (v0.4.0, upcoming)
+## 7. Keep history that survives restarts (v0.4.0)
 
 ### Problem
 
@@ -265,7 +265,7 @@ That an event was received and committed — or, when `complete` is `false`,
 exactly that the record is known to be incomplete. History does not prove what
 happened while no daemon was running. See [durable history](storage.md).
 
-## Agent capture (v0.4.0, upcoming)
+## Agent capture (v0.4.0)
 
 **What it does.** `tailflow agent install claude|codex` adds observe-only hooks
 to the agent's configuration. Each hook call becomes normalized events
@@ -280,7 +280,7 @@ On its own it does not prove that a file changed on disk (that needs
 through the shell beyond the command line itself. Every session says
 whether its history is `complete`, `partial` or `unknown`, and why.
 
-## Verified changes and Git evidence (v0.4.0, upcoming)
+## Verified changes and Git evidence (v0.4.0)
 
 **What it does.** For the project directories you list in `[observe]` (or with
 `--observe`), TailFlow watches the filesystem and takes bounded, read-only
@@ -295,7 +295,7 @@ change: a file watcher cannot see the writing process, and Git cannot tell
 an agent's edit from a person's. A match between a report and an
 observation is an association, never authorship.
 
-## Live activity, outcomes and related evidence (v0.4.0, upcoming)
+## Live activity, outcomes and related evidence (v0.4.0)
 
 **What it does.** The dashboard follows agent activity live through one
 authenticated stream of events already committed to history: each update
@@ -313,7 +313,7 @@ observation, shared context, or nearness in time. TailFlow does not observe
 processes, so a command's outcome is what the agent reported. No tier claims
 that one event caused another.
 
-## Local access control (v0.4.0, upcoming)
+## Local access control (v0.4.0)
 
 The daemon's API holds agent sessions, paths and commands, so it requires a
 credential: a per-run token for the CLI, MCP and scripts, and a one-time

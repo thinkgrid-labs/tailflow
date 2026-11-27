@@ -5,12 +5,6 @@ agent. A minimal setup takes about five minutes.
 
 [Documentation index](README.md)
 
-> **Which version?** `npm install -g tailflow` and the GitHub release
-> binaries install **v0.3.3**: runtime logs, MCP, the shell client, the TUI and
-> the live-log dashboard. Sections marked **v0.4.0** (durable history, agent
-> capture, file and Git evidence, API sign-in) describe the upcoming release on
-> `dev`; to use them now, [build from source](#build-from-source).
-
 ## Before you start
 
 TailFlow works best when:
@@ -65,12 +59,12 @@ needed. Choose a destination on your `PATH` that you have permission to write.
 
 ### Build from source
 
-This is how to run the upcoming v0.4.0 from `dev`. It needs Rust 1.89+ and
-Node.js 20+. Build the dashboard first: the daemon embeds `web/dist` at build
-time, and without it the dashboard pages are missing.
+Building from source needs Rust 1.89+ and Node.js 20+. Build the dashboard
+first: the daemon embeds `web/dist` at build time, and without it the
+dashboard pages are missing.
 
 ```bash
-git clone --branch dev https://github.com/thinkgrid-labs/tailflow.git
+git clone --branch main https://github.com/thinkgrid-labs/tailflow.git
 cd tailflow
 (cd web && npm ci && npm run build)
 cargo install --locked --path crates/tailflow-tui      # tailflow

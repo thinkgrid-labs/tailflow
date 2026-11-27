@@ -84,7 +84,6 @@ What is available, what is being validated, what is planned, and non-goals.
 
 ## Versioning
 
-The documentation on `main` describes the latest release (v0.3.3). The
-documentation on `dev` describes the upcoming v0.4.0; pages and sections
-about features that are not yet released say so. See the
+The documentation on `main` describes the latest release (v0.4.0). The `dev`
+branch can describe changes that are not released yet. See the
 [changelog](../CHANGELOG.md) for what changed in each version.

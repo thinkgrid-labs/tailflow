@@ -1,6 +1,6 @@
 # Verified file changes and Git evidence
 
-> **v0.4.0 (upcoming, on `dev`).** Not in a published release yet.
+> **Since v0.4.0.**
 
 An agent hook saying "I edited `src/api.ts`" is a claim. For projects you
 choose, TailFlow can also record what the filesystem and Git themselves

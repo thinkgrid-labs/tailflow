@@ -1,7 +1,6 @@
 # Dashboard
 
-> **v0.4.0 (upcoming, on `dev`).** The agent dashboard described here is not
-> in a published release yet. v0.3.3 has the earlier live-log view only.
+> **Since v0.4.0.** v0.3.3 and earlier have the live-log view only.
 
 The daemon serves a local dashboard at `http://127.0.0.1:7878` (or the port
 you pass with `--port`). Sign in once per browser with the one-time link the

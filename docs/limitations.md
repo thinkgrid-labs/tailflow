@@ -5,10 +5,10 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 
 [Documentation index](README.md)
 
-## Validation still pending for v0.4.0
+## Not yet validated
 
-v0.4.0 is not released. These checks have not been done yet, so the matching
-claims rest on synthetic tests only:
+These checks have not been done, so the matching claims rest on synthetic
+tests or on one development machine:
 
 - **Codex:** run against a live Codex 0.171 session on macOS (sessions,
   resume, subagents, `apply_patch`, token counts, spool replay), with hook
@@ -19,7 +19,7 @@ claims rest on synthetic tests only:
   Codex sessions on Windows have not been run.
 - **Long runs:** the longest runs so far are 8-hour soaks of earlier
   development builds (macOS: memory flat; a Linux VM: still rising slowly at
-  hour 8). A 24-hour Linux endurance run of the v0.4.0 code has not been
+  hour 8). A 24-hour Linux endurance run of this release has not been
   done.
 - **Benchmarks:** all published numbers come from one shared development
   machine, not a quiet dedicated host, and none from Linux or Windows.
@@ -32,8 +32,8 @@ claims rest on synthetic tests only:
 | Live buffer | Bounded in-memory ring per daemon run | MCP tools and `/api/query` see only the current run |
 | Durable history | Local SQLite, 30 days / 2 GB by default | Events in flight at `kill -9` are lost (reported as a gap) |
 | Redaction | Heuristic credential patterns | Not every secret is detected |
-| Agent activity | Opt-in Claude Code and Codex hooks (v0.4.0, upcoming) | Only what the agent's hooks report; hooks do not report shell side effects, Claude Code tokens or agent versions |
-| File and Git evidence | Opt-in `[observe]` directories (v0.4.0, upcoming) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
+| Agent activity | Opt-in Claude Code and Codex hooks (since v0.4.0) | Only what the agent's hooks report; hooks do not report shell side effects, Claude Code tokens or agent versions |
+| File and Git evidence | Opt-in `[observe]` directories (since v0.4.0) | Shows what changed on disk and in the worktree, never who changed it; a watcher can miss or coalesce notifications (loss is recorded when the OS reports it) |
 | Data type | Text logs | No traces, metrics, profiles, or state inspection |
 | Classification | Text and JSON severity heuristics | Custom formats may receive the wrong level |
 | Grouping | Normalized line fingerprints | Similar errors may merge; variable shapes may split |
