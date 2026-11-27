@@ -75,6 +75,10 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: cd web && npm ci && npm test && npm run build
+      # Version validation, npm dist-tag and GitHub prerelease selection,
+      # and publish ordering used by release.yml.
+      - name: Release tooling tests
+        run: node --test scripts/release/release-plan.test.js
       - name: Bundle size budget
         run: |
           js=$(cat web/dist/assets/*.js | gzip -9 | wc -c)
