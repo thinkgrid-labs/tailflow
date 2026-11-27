@@ -18,7 +18,7 @@ sends nothing off it.
   An observation shows that a file changed, never who changed it.
 
 ```bash
-npm install -g tailflow
+npm install -g tailflow@next   # v0.4.0-rc.1, an experimental prerelease; plain `tailflow` is v0.3.3
 tailflow init
 tailflow-daemon
 claude mcp add tailflow -- tailflow-mcp

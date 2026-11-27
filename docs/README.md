@@ -84,6 +84,8 @@ What is available, what is being validated, what is planned, and non-goals.
 
 ## Versioning
 
-The documentation on `main` describes the latest release (v0.4.0). The `dev`
-branch can describe changes that are not released yet. See the
+The documentation on `main` describes v0.4.0, now in testing as the
+release candidate v0.4.0-rc.1 on npm `next`
+([release notes](releases/v0.4.0-rc.1.md)). The stable release on npm `latest`
+is v0.3.3. The `dev` branch can describe changes that are not released yet. See the
 [changelog](../CHANGELOG.md) for what changed in each version.

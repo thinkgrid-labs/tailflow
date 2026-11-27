@@ -36,10 +36,13 @@ function run(binaryName) {
   try {
     pkgJsonPath = require.resolve(`${pkg}/package.json`)
   } catch {
+    // Name the exact version: without it npm installs the platform package's
+    // `latest`, which for a prerelease of this package is an older release.
+    const { version } = require('../package.json')
     process.stderr.write(
       `tailflow: platform package "${pkg}" is not installed.\n` +
       `This usually means the optional dependency was skipped.\n` +
-      `Try: npm install ${pkg}\n`
+      `Try: npm install -g ${pkg}@${version}  (without -g for a project install)\n`
     )
     process.exit(1)
   }
