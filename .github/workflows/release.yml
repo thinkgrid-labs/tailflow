@@ -140,15 +140,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-14 is retired: GitHub rejects it ("The configuration
+          # 'macos-14-arm64-us-default' is not supported") and the job never
+          # starts. macos-26 is what macos-latest resolved to on 2026-11-27
+          # (CI run 45954941719, image macos-26-arm64).
           - platform: darwin-arm64
-            os: macos-14           # GitHub's ARM macOS runner
+            os: macos-26           # ARM runner
             target: aarch64-apple-darwin
+            macos_min: "11.0"      # v0.3.3's minimum; Rust's default
             cross: false
             runnable: true
 
           - platform: darwin-x64
-            os: macos-14           # Cross-compile x64 from ARM runner (macos-13 deprecated)
+            os: macos-26           # Cross-compile x64 from the ARM runner
             target: x86_64-apple-darwin
+            macos_min: "10.12"     # v0.3.3's minimum; Rust's default
             cross: false
             runnable: false        # Rosetta is not guaranteed on the runner
 
@@ -202,8 +208,11 @@ jobs:
         if: matrix.cross
         run: cargo install cross --locked --git https://github.com/cross-rs/cross --rev a9301e91f72bba3850460512685f6b16062015ff
 
+      # Pinned so a newer runner image cannot raise the minimum macOS version.
       - name: Build (native)
         if: "!matrix.cross"
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
         run: >
           cargo build --release --locked
           --target ${{ matrix.target }}
@@ -221,6 +230,22 @@ jobs:
           -p tailflow-tui
           -p tailflow-daemon
           -p tailflow-agent
+
+      - name: Binaries keep the minimum macOS version
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          EXPECTED: ${{ matrix.macos_min }}
+          BIN_DIR: target/${{ matrix.target }}/release
+        run: |
+          for b in tailflow tailflow-daemon tailflow-mcp tailflow-logs; do
+            min=$(otool -l "$BIN_DIR/$b" | awk '/LC_BUILD_VERSION/{bv=1} /LC_VERSION_MIN_MACOSX/{vm=1} bv&&$1=="minos"{print $2; exit} vm&&$1=="version"{print $2; exit}')
+            echo "$b: minimum macOS ${min:-unknown}"
+            if [ "$min" != "$EXPECTED" ]; then
+              echo "::error::$b requires macOS ${min:-unknown}, expected $EXPECTED"
+              exit 1
+            fi
+          done
 
       # The binaries must report the tag's version (they read it from
       # Cargo.toml at compile time). Checked where the runner can execute them.

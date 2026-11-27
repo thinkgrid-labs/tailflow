@@ -413,6 +413,18 @@ test('release.yml pins actions, scopes permissions and routes npm publish throug
   assert.match(yml, /make_latest:\s*\$\{\{\s*needs\.plan\.outputs\.make_latest\s*\}\}/)
 })
 
+test('release.yml macOS builds use a supported runner and keep the minimum macOS version', () => {
+  const yml = fs.readFileSync(path.join(ROOT, '.github/workflows/release.yml'), 'utf8')
+  // Retired labels are not errors at parse time: the job just never starts.
+  const os = [...yml.matchAll(/^\s+os:\s*(\S+)/gm)].map((m) => m[1])
+  for (const label of os) assert.doesNotMatch(label, /^macos-1[0-4]\b/, `${label} is a retired runner`)
+  for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
+    assert.match(yml, new RegExp(`target: ${target}\\n\\s+macos_min: "\\d+\\.\\d+"`), `${target} needs macos_min`)
+  }
+  assert.match(yml, /MACOSX_DEPLOYMENT_TARGET: \$\{\{ matrix\.macos_min \}\}/)
+  assert.match(yml, /name: Binaries keep the minimum macOS version\n\s+if: runner\.os == 'macOS'/)
+})
+
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 test('plan CLI writes the GitHub outputs the workflow reads', () => {
