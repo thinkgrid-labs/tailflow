@@ -36,13 +36,6 @@ and Codex. It puts two kinds of evidence on one timeline on your machine:
 It runs as one small Rust daemon. It needs no account and no cloud service,
 and it sends nothing off your machine.
 
-> [!NOTE]
-> **Release status.** The latest release is **v0.3.3**. `npm install -g tailflow`
-> installs it, and it covers runtime logs, MCP and the shell client. Agent
-> capture, the agent dashboard, file and Git evidence, and the authenticated
-> local API are merged on `dev` for the upcoming **v0.4.0**, which is not yet
-> released. To try them now, [build from source](#try-the-upcoming-v040-from-source).
-
 ## Why TailFlow?
 
 Coding agents edit files, run commands and restart services on their own.
@@ -62,19 +55,19 @@ presents an inference as a fact.
 
 ## What TailFlow does
 
-| Capability | What you get | Status |
-|---|---|---|
-| **One runtime timeline** | stdout/stderr of dev processes, local Docker containers, log files and piped stdin in one ordered stream | v0.3.3 |
-| **Agent access over MCP** | Four bounded tools: `list_log_sources`, `get_recent_errors`, `search_logs`, `wait_for_logs` | v0.3.3 |
-| **Shell client** | `tailflow-logs` for agents and scripts without MCP, with JSON output and exit codes | v0.3.3 |
-| **Error grouping and waits** | Repeated failures collapse into one group with stack-trace context; wait for a rebuild or error instead of polling | v0.3.3 |
-| **Terminal UI and guided setup** | `tailflow` TUI; `tailflow init` detects dev scripts, Compose files and log files | v0.3.3 |
-| **Durable local history** | SQLite with full-text search, 30-day / 2 GB defaults, secret redaction, and a completeness verdict on every answer | v0.4.0 (upcoming) |
-| **Agent capture** | Opt-in Claude Code and Codex hooks record sessions, tool calls, commands and reported file edits; `tailflow sessions` | v0.4.0 (upcoming) |
-| **Agent dashboard** | Overview, sessions, activity search, a multi-agent timeline beside runtime errors, files, commands and live logs; agent views update from a live stream | v0.4.0 (upcoming) |
-| **File and Git evidence** | Opt-in observation of chosen directories: what changed on disk, and Git worktree snapshots at session start and end, compared with what the agent reported | v0.4.0 (upcoming) |
-| **Command outcomes and related evidence** | Builds, tests, lint and type checks with the outcome the agent reported; related events graded in five evidence tiers | v0.4.0 (upcoming) |
-| **Authenticated local API** | A per-run token for CLI, MCP and scripts, and a one-time sign-in link for the browser | v0.4.0 (upcoming) |
+| Capability | What you get |
+|---|---|
+| **One runtime timeline** | stdout/stderr of dev processes, local Docker containers, log files and piped stdin in one ordered stream |
+| **Agent access over MCP** | Four bounded tools: `list_log_sources`, `get_recent_errors`, `search_logs`, `wait_for_logs` |
+| **Shell client** | `tailflow-logs` for agents and scripts without MCP, with JSON output and exit codes |
+| **Error grouping and waits** | Repeated failures collapse into one group with stack-trace context; wait for a rebuild or error instead of polling |
+| **Terminal UI and guided setup** | `tailflow` TUI; `tailflow init` detects dev scripts, Compose files and log files |
+| **Durable local history** | SQLite with full-text search, 30-day / 2 GB defaults, secret redaction, and a completeness verdict on every answer |
+| **Agent capture** | Opt-in Claude Code and Codex hooks record sessions, tool calls, commands and reported file edits; `tailflow sessions` |
+| **Agent dashboard** | Overview, sessions, activity search, a multi-agent timeline beside runtime errors, files, commands and live logs; agent views update from a live stream |
+| **File and Git evidence** | Opt-in observation of chosen directories: what changed on disk, and Git worktree snapshots at session start and end, compared with what the agent reported |
+| **Command outcomes and related evidence** | Builds, tests, lint and type checks with the outcome the agent reported; related events graded in five evidence tiers |
+| **Authenticated local API** | A per-run token for CLI, MCP and scripts, and a one-time sign-in link for the browser |
 
 The [feature guide](docs/features.md) explains each capability and what its
 results do and do not prove.
@@ -89,7 +82,7 @@ results do and do not prove.
   <img src="assets/screenshots/tailflow-timeline.png" width="100%" alt="TailFlow multi-agent timeline: Claude Code and Codex lanes with session bars over their observed spans, tool and command intervals, failure markers in red, point events as diamonds, and a runtime lane with error markers.">
 </p>
 
-<sub>The v0.4.0 dashboard on <code>dev</code>, captured from the synthetic end-to-end fixture: two Claude Code and two Codex sessions (one joined mid-way), failing tests, and a runtime source logging connection errors. No real project data. See the <a href="docs/dashboard.md">dashboard guide</a>.</sub>
+<sub>Captured from the synthetic end-to-end fixture: two Claude Code and two Codex sessions (one joined mid-way), failing tests, and a runtime source logging connection errors. No real project data. See the <a href="docs/dashboard.md">dashboard guide</a>.</sub>
 
 ## How it works
 
@@ -112,8 +105,6 @@ path in detail.
 
 ## Quick start
 
-### Install the current release (v0.3.3)
-
 Prebuilt binaries cover macOS (ARM64, x64), Linux (ARM64, x64) and Windows
 (x64). The npm package needs Node.js 18+ but no Rust toolchain.
 
@@ -125,11 +116,18 @@ npm install -g tailflow
 cd your-project
 tailflow init
 
-# 3. Start the collector and keep it running
-tailflow-daemon
+# 3. Optional: record what Claude Code does (or: codex)
+tailflow agent install claude
+
+# 4. Start the collector; --observe adds file and Git evidence for this project
+tailflow-daemon --observe .
 ```
 
-Connect Claude Code from another terminal:
+The daemon prints a one-time sign-in link for the dashboard at
+`http://127.0.0.1:7878`; later, `tailflow-daemon dashboard` opens it with a
+fresh link.
+
+Let Claude Code read your stack's output from another terminal:
 
 ```bash
 claude mcp add tailflow -- tailflow-mcp
@@ -146,15 +144,18 @@ Other MCP clients can run `tailflow-mcp` as a stdio server:
 ```
 
 Then ask your agent to call `list_log_sources`; it should list your configured
-services. For a shell-only check, run `tailflow-logs sources`.
+services. For a shell-only check, run `tailflow-logs sources`. After an agent
+session, `tailflow sessions` lists what was recorded.
 
-### Try the upcoming v0.4.0 from source
+Stop the daemon with Ctrl+C. `tailflow agent uninstall claude` removes the
+hooks, and only TailFlow's.
 
-Agent capture, the agent dashboard and file evidence are on `dev`. Building
-them needs Rust 1.89+ and Node.js 20+:
+### Build from source
+
+With Rust 1.89+ and Node.js 20+:
 
 ```bash
-git clone --branch dev https://github.com/thinkgrid-labs/tailflow.git
+git clone https://github.com/thinkgrid-labs/tailflow.git
 cd tailflow
 (cd web && npm ci && npm run build)   # the daemon embeds the dashboard at build time
 cargo install --locked --path crates/tailflow-tui      # tailflow
@@ -162,25 +163,12 @@ cargo install --locked --path crates/tailflow-daemon   # tailflow-daemon
 cargo install --locked --path crates/tailflow-agent    # tailflow-mcp, tailflow-logs
 ```
 
-Then, in your project:
-
-```bash
-tailflow init                       # once: write tailflow.toml
-tailflow agent install claude       # optional: record Claude Code (or: codex)
-tailflow-daemon --observe .         # --observe is optional: file and Git evidence
-```
-
-The daemon prints a one-time sign-in link for the dashboard
-(`http://127.0.0.1:7878`); later, `tailflow-daemon dashboard` opens it with a
-fresh link. After a Claude Code session, run `tailflow sessions`. Stop the
-daemon with Ctrl+C, and remove the hooks with `tailflow agent uninstall claude`.
-
 The [getting-started guide](docs/getting-started.md) covers configuration,
 Docker and file sources, custom ports and troubleshooting.
 
 ### Upgrading from 0.3.x
 
-v0.4.0 requires a credential for every API call. `tailflow-mcp` and
+The API now requires a credential for every call. `tailflow-mcp` and
 `tailflow-logs` from the same release find the token on their own; older
 clients get `401` and need upgrading together with the daemon. `curl` and
 scripts send `Authorization: Bearer $(tailflow-daemon token)`, and the
@@ -191,7 +179,7 @@ browser signs in once with the link the daemon prints. See
 
 TailFlow works with agents in two directions: the agent can **read** your
 stack's output, and, with opt-in hooks, TailFlow can **record** the agent's
-own actions (v0.4.0, upcoming).
+own actions.
 
 | Agent | Reads runtime output | Records its actions |
 |---|---|---|
@@ -231,7 +219,7 @@ not watch agent processes or their exit codes. See [evidence](docs/evidence.md).
 | Topic | Behavior |
 |---|---|
 | **Where data lives** | One SQLite file per user: `~/Library/Application Support/tailflow/events.db` (macOS), `~/.local/share/tailflow/events.db` (Linux), `%LOCALAPPDATA%\tailflow\events.db` (Windows). Override with `TAILFLOW_DATA_DIR`, `[storage] path` or `--db`. |
-| **Network** | The daemon listens on loopback only (`127.0.0.1`, and `[::1]` when available) and rejects non-loopback `Host` headers. From v0.4.0 every data endpoint requires a credential ([security](docs/security.md)). There is no telemetry and no hosted service. |
+| **Network** | The daemon listens on loopback only (`127.0.0.1`, and `[::1]` when available) and rejects non-loopback `Host` headers. Every data endpoint requires a credential ([security](docs/security.md)). There is no telemetry and no hosted service. |
 | **What is collected** | Only what you configure: processes TailFlow starts, containers on the local Docker daemon, files you name, piped stdin, agent hooks you install, and directories you list under `[observe]`. |
 | **What is not collected** | Prompt text, assistant messages, file contents and transcripts, in any mode. By default, command lines are reduced to the program and a known subcommand (for example `cargo test`), and failure text is dropped. |
 | **Retention** | 30 days and a 2 GB cap by default (`[storage]`); `--no-storage` keeps everything in memory. |
@@ -274,24 +262,18 @@ The full list is in [limitations](docs/limitations.md). The most important:
 
 ## Roadmap
 
-**Available now (v0.3.3):** runtime collection from processes, Docker, files
-and stdin; MCP and shell access; error grouping; server-side waits; the live
-log dashboard and TUI; guided setup.
-
-**On `dev` for v0.4.0:** durable history with redaction and loss reporting;
-Claude Code and Codex capture; the agent dashboard with live updates; file and
-Git evidence; command outcomes and graded related evidence; the authenticated
-local API.
-
-**Before v0.4.0 ships:** validation against a live Codex session and real
-agents on Windows, a 24-hour Linux endurance run, and benchmarks on a quiet,
-dedicated host.
+**Available today:** runtime collection from processes, Docker, files and
+stdin; MCP and shell access; error grouping and server-side waits; durable
+history with redaction and loss reporting; Claude Code and Codex capture; the
+agent dashboard with live updates; file and Git evidence; command outcomes and
+graded related evidence; an authenticated local API; the TUI and guided setup.
 
 **Planned, not committed:** more agent integrations; explicit command-to-runtime
 trace correlation; verified exit status for commands TailFlow itself launches;
 stronger multi-agent investigations; a readable query language; "what is
 failing now that was not before" comparisons; Compose-aware Docker discovery;
-MCP served by the daemon; exports and diagnostics bundles.
+MCP served by the daemon; exports and diagnostics bundles; longer automated
+reliability runs on every platform.
 
 The [roadmap](docs/roadmap.md) lists priorities and non-goals.
 
