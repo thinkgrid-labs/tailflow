@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-agent"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-daemon"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-storage"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "getrandom",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "tailflow-tui"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
