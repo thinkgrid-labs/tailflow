@@ -374,7 +374,12 @@ impl Auth {
     pub fn attach_session_store(&self, path: PathBuf) {
         let port = self.port.get().copied().unwrap_or(0);
         let now = now_secs();
-        let loaded: Vec<Session> = read_bounded(&path)
+        let loaded: Vec<Session> = read_session_store(&path)
+            .inspect_err(|e| {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(err = %e, "not restoring browser sessions");
+                }
+            })
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
             .filter(|f| f.version == RUNTIME_FILE_VERSION && f.port == port)
@@ -869,6 +874,54 @@ pub fn read_runtime_file(path: &Path) -> Result<RuntimeInfo, String> {
     serde_json::from_slice(&buf).map_err(|e| format!("{}: malformed ({e})", path.display()))
 }
 
+/// Read the session store, only if nobody else could have written it.
+///
+/// A session in the store is a credential, so the store gets the same rule
+/// as [`write_private`]: on Unix, the directory and the file must belong to
+/// this user with no group or other access, and the file must be a regular
+/// file. Otherwise a pre-created `run/` directory in a shared
+/// `TAILFLOW_DATA_DIR` could plant a session that this daemon then accepts.
+/// The file is opened without following a symlink, and non-blocking so a
+/// FIFO cannot hang startup. Windows: per-user ACLs on the data directory;
+/// no extra check.
+fn read_session_store(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        // SAFETY: geteuid takes no arguments, has no preconditions and
+        // cannot fail (POSIX).
+        let me = unsafe { libc::geteuid() };
+        let private = |m: &std::fs::Metadata| m.uid() == me && m.mode() & 0o077 == 0;
+        let refuse = |what: &Path| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not private to this user; ignoring the session store",
+                    what.display()
+                ),
+            )
+        };
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !private(&std::fs::metadata(dir)?) {
+            return Err(refuse(dir));
+        }
+        let m = f.metadata()?;
+        if !m.is_file() || !private(&m) {
+            return Err(refuse(path));
+        }
+        let mut buf = Vec::new();
+        f.take(64 * 1024).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(unix))]
+    read_bounded(path)
+}
+
 /// Read at most 64 KiB (runtime files) — a 64-session store is ~10 KiB.
 fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
@@ -1200,9 +1253,94 @@ mod tests {
             "sessions": [{"secret": "a".repeat(64), "created": now - 10, "last_used": now - 10}],
         });
         std::fs::write(&path, file.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            // Private, so only the age decides.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let a = auth();
         a.attach_session_store(path);
         assert_eq!(a.view().sessions_active, 0, "the daemon was gone too long");
+    }
+
+    /// A fresh, valid store is restored only from a private directory and
+    /// a private regular file: one planted in a shared `run/` directory,
+    /// left group/world-accessible, reached through a symlink, or replaced
+    /// by a FIFO (which must not hang startup) is ignored.
+    #[cfg(unix)]
+    #[test]
+    fn planted_session_stores_are_not_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let secret = "b".repeat(64);
+        let now = now_secs();
+        let body = serde_json::json!({
+            "version": RUNTIME_FILE_VERSION, "port": 7878, "saved_at": now,
+            "sessions": [{"secret": secret, "created": now - 10, "last_used": now - 10}],
+        })
+        .to_string();
+        let restored = |path: PathBuf| {
+            let a = auth();
+            a.attach_session_store(path);
+            a.view().sessions_active
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // Control: private directory, private file.
+        let run = dir.path().join("ok");
+        std::fs::create_dir(&run).unwrap();
+        mode(&run, 0o700);
+        let path = run.join("sessions-7878.json");
+        std::fs::write(&path, &body).unwrap();
+        mode(&path, 0o600);
+        assert_eq!(restored(path), 1);
+
+        // A shared directory.
+        let run = dir.path().join("shared");
+        std::fs::create_dir(&run).unwrap();
+        let path = run.join("sessions-7878.json");
+        std::fs::write(&path, &body).unwrap();
+        mode(&path, 0o600);
+        mode(&run, 0o777);
+        assert_eq!(restored(path), 0, "shared directory");
+
+        // A group/world-readable file.
+        let run = dir.path().join("loose");
+        std::fs::create_dir(&run).unwrap();
+        mode(&run, 0o700);
+        let path = run.join("sessions-7878.json");
+        std::fs::write(&path, &body).unwrap();
+        mode(&path, 0o644);
+        assert_eq!(restored(path), 0, "file readable by others");
+
+        // A symlink to a private store elsewhere.
+        let run = dir.path().join("link");
+        std::fs::create_dir(&run).unwrap();
+        mode(&run, 0o700);
+        let target = dir.path().join("ok/sessions-7878.json");
+        std::fs::write(&target, &body).unwrap();
+        mode(&target, 0o600);
+        let path = run.join("sessions-7878.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(restored(path), 0, "symlink");
+
+        // A FIFO: ignored at once instead of blocking the open.
+        let run = dir.path().join("fifo");
+        std::fs::create_dir(&run).unwrap();
+        mode(&run, 0o700);
+        let path = run.join("sessions-7878.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            mode(&path, 0o600);
+            assert_eq!(restored(path), 0, "fifo");
+        }
     }
 
     #[cfg(unix)]
@@ -1243,6 +1381,13 @@ mod tests {
             ]
         });
         std::fs::write(&path, file.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            // Private, as a daemon-written store is.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let a = auth();
         a.attach_session_store(path.clone());
         assert_eq!(
