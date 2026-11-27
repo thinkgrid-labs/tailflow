@@ -203,7 +203,7 @@ underlying evidence should not.
 |---|---:|---:|---:|---:|
 | Source lifecycle and counts | Yes | Yes | Yes | Logs only |
 | Deduplicated error groups | Yes | Yes | No | No |
-| Agent sessions, activity search, timeline | API | Sessions only | Yes (next release) | No |
+| Agent sessions, activity search, timeline (v0.4.0) | API | Sessions only | Yes | No |
 | Exact filtered records | Yes | Yes | Yes | Yes |
 | Server-side event waiting | Yes | Yes | No | Live stream |
 | Cursor-based incremental reads | Yes | Yes | Internal | No |
@@ -239,7 +239,7 @@ underlying evidence should not.
 3. TailFlow reconciles the new container ID and begins following its output.
 4. Verify the new startup event rather than assuming replacement implies health.
 
-## 7. Keep history that survives restarts
+## 7. Keep history that survives restarts (v0.4.0, upcoming)
 
 ### Problem
 
@@ -265,7 +265,7 @@ That an event was received and committed — or, when `complete` is `false`,
 exactly that the record is known to be incomplete. History does not prove what
 happened while no daemon was running. See [durable history](storage.md).
 
-## Agent capture (next release)
+## Agent capture (v0.4.0, upcoming)
 
 **What it does.** `tailflow agent install claude|codex` adds observe-only hooks
 to the agent's configuration. Each hook call becomes normalized events
@@ -275,11 +275,12 @@ grouped into sessions with lifecycle status and coverage. Inspect them with
 
 **What it proves.** That the agent's hook reported the activity. A tool
 failure with an exit code, a file the Write tool created, a subagent that ran.
-It does not prove that a file changed on disk, and it cannot see what the
-agent did through the shell beyond the command line itself. Every session says
+On its own it does not prove that a file changed on disk (that needs
+[file observation](evidence.md)), and the hooks cannot see what the agent did
+through the shell beyond the command line itself. Every session says
 whether its history is `complete`, `partial` or `unknown`, and why.
 
-## Verified changes and Git evidence (next release)
+## Verified changes and Git evidence (v0.4.0, upcoming)
 
 **What it does.** For the project directories you list in `[observe]` (or with
 `--observe`), TailFlow watches the filesystem and takes bounded, read-only
@@ -294,11 +295,13 @@ change: a file watcher cannot see the writing process, and Git cannot tell
 an agent's edit from a person's. A match between a report and an
 observation is an association, never authorship.
 
-## Live activity, outcomes and related evidence (next release)
+## Live activity, outcomes and related evidence (v0.4.0, upcoming)
 
 **What it does.** The dashboard follows agent activity live through one
-authenticated stream of events already committed to history (it resumes
-after a disconnect and reports gaps instead of skipping them). Commands are
+authenticated stream of events already committed to history: each update
+re-runs the page's bounded query, and after a disconnect the stream catches up
+from history (or, if it is too far behind, tells the page to reload). Loss
+recorded in history still shows on each page as incomplete coverage. Commands are
 classified as build, test, lint, typecheck, format or dependency work, with
 the outcome the agent reported. For any event, **Related evidence** lists
 other events in five tiers: shared operation ids, an independent
@@ -310,7 +313,7 @@ observation, shared context, or nearness in time. TailFlow does not observe
 processes, so a command's outcome is what the agent reported. No tier claims
 that one event caused another.
 
-## Local access control (next release)
+## Local access control (v0.4.0, upcoming)
 
 The daemon's API holds agent sessions, paths and commands, so it requires a
 credential: a per-run token for the CLI, MCP and scripts, and a one-time

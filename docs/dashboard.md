@@ -1,14 +1,15 @@
 # Dashboard
 
-> **Next release.** The agent observability dashboard is merged on `dev` and
-> ships in the next version. v0.3.3 has the earlier live-log view only.
+> **v0.4.0 (upcoming, on `dev`).** The agent dashboard described here is not
+> in a published release yet. v0.3.3 has the earlier live-log view only.
 
 The daemon serves a local dashboard at `http://127.0.0.1:7878` (or the port
 you pass with `--port`). Sign in once per browser with the one-time link the
 daemon prints at startup, or run `tailflow-daemon dashboard` to open the
 browser with a fresh link (see [security](security.md)). The session
-survives a daemon restart on the same port within 15 minutes. It shows what your coding agents did, what your
-running stack logged, and how the two line up in time. It talks only to the
+survives a daemon restart on the same port within 15 minutes. It shows what
+your coding agents did, what your running stack logged, and how the two line
+up in time. It talks only to the
 daemon that served it, through read-only endpoints, and loads nothing from
 the internet.
 
@@ -34,8 +35,11 @@ The dashboard is built to never claim more than the data supports.
 
 - **Agent-reported, not verified.** Every agent event comes from the agent's
   own hook. A file shown as *Reported modified* means the agent's edit tool
-  said so. TailFlow does not watch the file system, so it did not confirm the
-  change, and it does not see edits made by shell commands.
+  said so; hooks do not report edits made by shell commands. Only with
+  `[observe]` set does TailFlow also watch the project's files, and then
+  **Files → Verified on disk** shows whether a change was also observed
+  ([below](#verified-changes-and-git-evidence)). An observation still does
+  not say who made the change.
 - **Outcome not reported.** Codex has no failure hook and its tool responses
   carry no documented exit code. Its tool calls show *Outcome not reported*,
   never *Succeeded*. A Claude Code shell command that succeeded shows
@@ -56,9 +60,9 @@ The dashboard is built to never claim more than the data supports.
 - **Git HEAD.** When HEAD differs between a session's observed start and end,
   the session page says so. That is an observation of two boundaries, not proof
   that the agent made the commit.
-- **Nearby events are not causes.** The event inspector lists runtime warnings
-  and errors within ±60 seconds of an agent operation, and agent activity near
-  a log line. They are shown because they are close in time. The dashboard
+- **Nearby events are not causes.** The event inspector's **Related
+  evidence** lists runtime warnings and errors within ±30 seconds of an agent
+  operation, and agent activity near a log line. They are shown because they are close in time. The dashboard
   never labels one as caused by the other.
 
 ## Timeline
@@ -110,13 +114,21 @@ operating system's reduced-motion setting.
 
 The dashboard is meant to be left open all day.
 
-- Agent views update live. The daemon streams committed agent events to the
-  dashboard (one connection per tab, `/api/v1/stream/agent`), and a page
-  reloads its own bounded query only when an event concerns it, at most
-  once a second (every 3 seconds for the timeline). The **Agents** pill in
-  the top bar shows the stream's state. When it reads **Polling** (the
-  stream is not available), views fall back to refreshing every 10–30
-  seconds.
+- Agent views update from a live stream, but they do not insert rows one
+  by one. The daemon streams committed agent events to the dashboard (one
+  connection per tab, `/api/v1/stream/agent`); when an event concerns a
+  page, the page re-runs its own bounded query, at most once a second
+  (every 3 seconds for the timeline). The **Agents** pill in the top bar
+  shows the stream's state.
+- Some views do not follow the stream: **Integrations** refreshes every 10
+  seconds, and the Overview's agent cards and the observation status on
+  **Files** every 30 seconds. The **Timeline** follows it only while the
+  window ends at "now". **Sessions**, **Activity** and **Commands** stop
+  updating once you load older pages, so the rows you are reading do not
+  move.
+- When the pill reads **Polling** (the stream is not available), most views
+  refresh every 10–30 seconds instead; Activity search does not refresh on
+  its own.
 - A tab hidden for a minute closes the stream and makes no requests. When
   it is shown again it reconnects from the last event it received, and the
   daemon catches it up from durable history.
@@ -125,13 +137,18 @@ The dashboard is meant to be left open all day.
   the database to filter it.
 - The live log view renders about 60 rows whatever the buffer holds. In a
   headless-Chrome benchmark streaming 1,000 lines/s into a full 5,000-line
-  view it used ~19 % of the browser's main thread at a steady 60 fps (the
-  previous view: ~99 % at 6–8 fps). Expanding large JSON rows costs more.
-- An open dashboard page added 0.07–0.17 % of one core to the daemon in the
-  same tests.
-- The whole UI is one JavaScript file (~46 KB gzip) and one stylesheet,
-  embedded in the daemon binary. It uses no web fonts and no third-party
-  scripts.
+  view it used about 18–22 % of the browser's main thread at a steady 60 fps
+  (the v0.3.3 log view: about 99 % at 6–8 fps). Expanding large JSON rows
+  costs more.
+- An open dashboard costs the daemon about 0.1 % of one core. While a tab is
+  connected, the daemon checks for new commits every 250 ms, so it wakes
+  about ten times a second instead of staying idle.
+- These figures come from a 2018 Intel MacBook (macOS) that was running
+  other work at the same time; treat them as indications, not guarantees.
+- The UI is about 56 KB of JavaScript (gzip): a main file of about 34 KB,
+  plus per-page chunks that load on first visit, and one stylesheet. All of
+  it is embedded in the daemon binary. It uses no web fonts and no
+  third-party scripts.
 
 ## Security
 
@@ -180,14 +197,12 @@ Nothing in these views says who made a change; a match is an association.
   proximity, inference), each item with its reason.
 - **Event lists** mark filesystem and Git observations with **on disk**
   and **git** instead of an agent name.
-- Timeline, Session details, Files, Commands, Integrations and Settings
-  load on first visit (separate script chunks from the same origin), so
-  the first page loads less code.
 
 ## API used by the dashboard
 
-All `GET` and read-only. The dashboard uses the same public endpoints that
-agents and scripts can call:
+The dashboard reads only through `GET` endpoints that agents and scripts can
+call too. Its only other request is `POST /api/v1/auth/logout` for
+**Settings → Access → Sign out**.
 
 | Endpoint | Used for |
 |---|---|
@@ -197,6 +212,12 @@ agents and scripts can call:
 | `GET /api/v1/events?…&program=` | Activity, errors, commands, timeline windows |
 | `GET /api/v1/files?since=7d&multi_agent=true` | Per-path reported file activity |
 | `GET /api/v1/agents/status` | Hook installation (read-only check), capabilities, spool and ingest counters |
+| `GET /api/v1/stream/agent` (SSE) | Live agent events that trigger the views' reloads |
+| `GET /api/v1/events/{seq}`, `GET /api/v1/events/{seq}/related` | The event inspector and its related evidence |
+| `GET /api/v1/evidence/files`, `GET /api/v1/sessions/{id}/changes`, `GET /api/v1/observe/status` | Verified on disk, Git changes, observation status |
+| `GET /api/v1/outcomes` | Tests, builds & checks |
+| `GET /api/v1/storage/status`, `GET /api/v1/collectors/status`, `GET /api/v1/privacy`, `GET /health` | Integrations and Settings diagnostics |
+| `GET /api/v1/auth/session` | Whether this browser is signed in |
 | `GET /events` (SSE), `GET /api/records?after=` | Live log stream and reconnect catch-up |
 
 See [durable history](storage.md) for the full `/api/v1/events` reference.

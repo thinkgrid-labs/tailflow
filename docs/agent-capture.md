@@ -1,8 +1,10 @@
 # Agent capture: recording what your coding agent does
 
-> **Status:** on `dev`, ships in the next release. Supported agents: **Claude
-> Code** (validated live against 2.1.331) and **OpenAI Codex** (0.124+, built
-> from the published hook schemas; not yet run against a live Codex).
+> **Status:** v0.4.0 (upcoming, on `dev`); not in a published release yet.
+> Supported agents: **Claude Code** (tested with a live 2.1.331 session) and
+> **OpenAI Codex** (0.124+; built from the published hook schemas and tested
+> with synthetic hook input; **not yet run against a live Codex session**).
+> On Windows, both are tested in CI with synthetic hook input only.
 
 TailFlow can record a coding agent's own activity: its sessions, the tools it
 calls, the shell commands it runs, and the files its tools report reading or
@@ -72,8 +74,8 @@ and the daemon must see the same value.
 
 | Command | What it does |
 |---|---|
-| `tailflow agent install claude [--scope user\|project\|local]` | Adds TailFlow's hooks to Claude Code settings. `user` (default) is `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`), `project` is `.claude/settings.json`, `local` is `.claude/settings.local.json`. |
-| `tailflow agent install codex [--codex-version X.Y.Z]` | Adds hooks to `~/.codex/hooks.json` (or `$CODEX_HOME`). Only events your Codex version supports are registered; the version is read from `codex --version`. |
+| `tailflow agent install claude [--scope user\|project\|local] [--project-dir DIR]` | Adds TailFlow's hooks to Claude Code settings. `user` (default) is `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`), `project` is `.claude/settings.json`, `local` is `.claude/settings.local.json`, relative to `--project-dir` (default: the current directory). Versions before 2.1.331 get a warning. |
+| `tailflow agent install codex [--codex-version X.Y.Z]` | Adds hooks to `~/.codex/hooks.json` (or `$CODEX_HOME`); user scope only. Only events your Codex version supports are registered; the version is read from `codex --version`. Codex before 0.124 is refused; if the version cannot be detected, only the 0.124 event set is installed. |
 | `… --dry-run` | Prints the resulting configuration without writing it. |
 | `… --config FILE` | Edits a specific file instead. |
 | `tailflow agent status` | What is installed where, missing events, policy blockers, the capture mode, and the spool. |
@@ -112,7 +114,7 @@ does not verify it independently.
 
 | Event | Claude Code | Codex |
 |---|---|---|
-| `agent.session.started` / `ended` | SessionStart (startup, resume, clear, compact) / SessionEnd with reason | SessionStart / SessionEnd (0.145+; reason is always `other`) |
+| `agent.session.started` / `ended` | SessionStart (startup, resume, clear, compact, fork) / SessionEnd with reason | SessionStart / SessionEnd (0.145+; reason is always `other`) |
 | `agent.prompt.submitted` | UserPromptSubmit: character count only | UserPromptSubmit: character count only |
 | `agent.turn.completed` / `failed` | Stop / StopFailure (error kind) | Stop |
 | `agent.tool.started` / `completed` / `failed` | Every tool incl. MCP, paired by `tool_use_id`, with `duration_ms` | Bash, apply_patch, MCP and local function tools; **no failure event**; no duration |
@@ -124,15 +126,19 @@ does not verify it independently.
 | `agent.model.completed` | — | PostModelRequest (0.171+): token counts per attempt |
 
 Sessions record the project (Git working tree, or the working directory), the
-Git branch and HEAD commit at start and end (read from `.git` files, never by
-running `git`), the model when reported, and counts.
+Git branch and HEAD commit at start and end (read from `.git` files; the hook
+never runs `git`), the model when reported, and counts. Separately, a daemon
+with `[observe]` runs read-only `git status` snapshots of observed
+repositories ([evidence](evidence.md#git-snapshots)).
 
 ### What TailFlow cannot see
 
 - **Shell side effects.** A file written by `echo > f`, `sed -i`, `mv` or a
-  build script is not reported by any file tool, so it is not recorded.
-  `file.*` events mean "the agent's tool reported this", not "TailFlow saw the
-  file change".
+  build script is not reported by any file tool, so the hooks do not record
+  it. An agent's `file.*` events mean "the agent's tool reported this", not
+  "TailFlow saw the file change". With [`[observe]`](evidence.md) on the
+  project, the file watcher does record such changes, but as observations
+  with no author.
 - **Commands inside commands.** Only the command line the agent ran is
   recorded, not what the scripts it started did.
 - **Who moved HEAD.** If HEAD differs between session start and end, the
@@ -169,12 +175,16 @@ TailFlow cannot tell which).
 Agent activity can reveal source code, commands, paths and credentials, so
 capture is **metadata-first**:
 
-- **Never recorded** in any mode: prompt text, assistant messages, tool
-  output, file contents, transcript contents.
-- **Shell commands:** by default only the program name (`cargo`, `npm`) and
-  shape (length, whether it is compound). The full command line is stored only
-  in `redacted` (after secret redaction) or `full` capture mode.
+- **Never recorded** in any mode: prompt text, assistant messages, file
+  contents, transcript contents, and the output of successful tools.
+- **Shell commands:** by default only the program (`cargo`, `npm`), the
+  program doing the work (`cd web && npm test` → `npm`), a subcommand only if
+  it is in that tool's fixed vocabulary (`test`, `build`), a package-script
+  name only if it matches a fixed pattern (`test:unit`), and the command's
+  shape (length, whether it is compound). The full command line is stored
+  only in `redacted` (after secret redaction) or `full` capture mode.
 - **Error text** of failed tools is stored only in `redacted`/`full` mode.
+  It can quote command output.
 - Redaction and collection boundaries run **in the hook, before anything is
   written to disk**, and again in the daemon.
 
@@ -205,7 +215,8 @@ events are trusted at that boundary and no further.
   calls). Beyond that, new hook calls are dropped and **counted**; the count
   becomes a recorded `agent_spool_overflow` gap when a daemon next ingests.
 - **Malformed or oversized hook input** (> 8 MiB) and **invalid config**:
-  recorded as `agent_input_rejected` gaps.
+  recorded as `agent_input_rejected` gaps. A normalized record over 2 MiB is
+  dropped and counted with spool overflow.
 - **Corrupt spool records:** `agent_spool_corrupt` gap.
 - **Daemon crash during ingestion:** records are deleted only after their
   events are committed, so a crash replays them; stable event ids make the
@@ -216,8 +227,10 @@ events are trusted at that boundary and no further.
 
 Measured on the reference laptop (2018 4-core Intel MacBook, release build):
 
-- A hook call adds about **15 ms** to the agent (p50; p95 ≈ 23 ms), almost
-  all of it starting the `tailflow` process. TailFlow's own work is about
+- A hook call adds about **15 ms** to the agent (p50; p95 ≈ 23 ms) on a
+  lightly loaded machine, almost all of it starting the `tailflow` process.
+  On a heavily loaded machine process start takes longer (about 45 ms p50 in
+  one test at a load average near 300). TailFlow's own work is about
   0.6 ms. Claude Code runs it twice per tool call (before and after).
 - The daemon ingests a hook call within about **0.2 s**.
 - Reproduce with `python3 scripts/bench/agent_bench.py --bin target/release`.
