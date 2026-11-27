@@ -21,7 +21,7 @@ Roadmap work should preserve four properties:
 
 ## Current capabilities
 
-### Released (v0.3.3)
+### Up to v0.3.3
 
 - Runtime collection from processes TailFlow starts, local Docker containers,
   log files and piped stdin, in one ordered stream.
@@ -29,7 +29,7 @@ Roadmap work should preserve four properties:
   waits; cursors for before/after comparisons.
 - The live-log dashboard, the terminal UI and `tailflow init`.
 
-### On `dev` for v0.4.0 (upcoming)
+### Added in v0.4.0
 
 - Durable SQLite history with retention, size cap, redaction, capture modes
   and an explicit completeness verdict.
@@ -44,7 +44,7 @@ Roadmap work should preserve four properties:
 - An authenticated local API: a per-run token for clients and a one-time
   sign-in link for browsers.
 
-## Being validated before v0.4.0
+## Still being validated
 
 - Live Codex sessions on Linux and Windows (a live session on macOS has
   passed).

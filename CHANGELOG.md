@@ -7,11 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the version is below 1.0.0, minor bumps may include changes to the Rust
 crate APIs; the HTTP API and CLI surfaces are additive within a minor series.
 
-## [0.4.0] - [Unreleased]
-
-Not yet released; merged on `dev`. Live Codex sessions, real agents on
-Windows and a 24-hour Linux endurance run are still to be validated (see
-[limitations](docs/limitations.md#validation-still-pending-for-v040)).
+## [0.4.0] - 2026-11-27
 
 - **Durable history.** TailFlow keeps a local, private, queryable history and
   states explicitly when that history is incomplete.
@@ -642,7 +638,8 @@ Initial release.
   (ARM64, x64), Linux (x64, ARM64), and Windows x64.
 - CI running `fmt`, `clippy`, `build`, and `test`.
 
-[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/thinkgrid-labs/tailflow/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thinkgrid-labs/tailflow/compare/v0.3.0...v0.3.1

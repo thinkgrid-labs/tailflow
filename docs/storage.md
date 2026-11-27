@@ -4,8 +4,7 @@
 survives a daemon restart and can be queried by time, source, type, and text.
 Nothing leaves your machine, and no account or external database is involved.
 
-> **v0.4.0 (upcoming, on `dev`).** Durable history is not in a published
-> release yet; v0.3.3 keeps logs in memory only.
+> **Since v0.4.0.** v0.3.3 and earlier keep logs in memory only.
 
 [Documentation index](README.md)
 
@@ -187,37 +186,7 @@ Cleanup passes aim for 250 ms. Clearing a large backlog — for example after
 lowering `max_size_mb` on a multi-gigabyte database — can make individual passes
 take a second or two; persistence waits behind them, live logs do not.
 
-## Resource cost
-
-Whole-daemon cost with durable history on (default settings, release build):
-
-| Workload | CPU (share of one core) | Private memory | Loss |
-|---|---|---|---|
-| Idle, no observation | about 0.005 % | about 5 MB | — |
-| 1,000 log lines/s | about 12 % | about 13 MB average, 20 MB peak | none |
-| 10,000 log lines/s | about 55 % | about 25 MB | none |
-| Idle, observing one 2,000-file project | about 0.02 % | about 6–7 MB | — |
-
-How these were measured, and what they do not show:
-
-- One machine: a 2018 Intel MacBook (Core i5-8259U, 4 cores, 8 GB,
-  macOS 15.8.1). It was **not** a quiet benchmark host: other work kept its
-  load average between about 2 and 8 during the logging runs, and up to 27
-  during some observation runs. Linux and Windows
-  have not been measured.
-- `scripts/bench/resource_bench.py` (60-second idle samples, 20-second load
-  runs) and `scripts/bench/m4f_observe_bench.py`; medians of 2–3 repeats.
-- An open dashboard adds a live stream that wakes the daemon about ten times
-  a second (see [dashboard cost](dashboard.md#cost)).
-
-To reproduce on your machine:
-
-```bash
-(cd web && npm ci && npm run build)
-cargo build --release -p tailflow-daemon --bin tailflow-daemon --examples
-python3 scripts/bench/resource_bench.py --bin dev=target/release/tailflow-daemon \
-    --scenarios idle,load:1000,load:10000 --repeat 3
-```
+## Disk use
 
 A runtime log event takes about 400 bytes on disk including indexes (a
 3-million-event bulk load measured 408 bytes per event), so the 2 GB default

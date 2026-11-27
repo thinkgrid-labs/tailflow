@@ -1,6 +1,6 @@
 # Agent capture: recording what your coding agent does
 
-> **Status:** v0.4.0 (upcoming, on `dev`); not in a published release yet.
+> **Since v0.4.0.**
 > Supported agents: **Claude Code** (tested with a live 2.1.331 session) and
 > **OpenAI Codex** (0.124+; built from the published hook schemas, tested
 > with synthetic hook input and with a live 0.171 session on macOS).

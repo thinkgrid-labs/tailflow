@@ -1,6 +1,6 @@
 # Security and local API access
 
-> **Applies to v0.4.0 (upcoming, on `dev`).** v0.3.3 and earlier have no API
+> **Applies to v0.4.0 and later.** v0.3.3 and earlier have no API
 > authentication; see [upgrading from 0.3.x](#upgrading-from-03x).
 
 TailFlow's daemon serves its dashboard and HTTP API on `127.0.0.1`. That
@@ -234,7 +234,7 @@ Run `cargo audit` yourself for the current state.
 
 ## Upgrading from 0.3.x
 
-v0.4.0 (upcoming) requires a credential for the API.
+v0.4.0 requires a credential for the API.
 
 - `tailflow-mcp` and `tailflow-logs` from the same release handle this
   automatically. Older binaries get `401` and need upgrading together with the
