@@ -411,13 +411,24 @@ fn create_private_file(path: &Path) -> std::io::Result<()> {
 /// The version is re-read inside each migration's write transaction, so two
 /// daemons opening a fresh shared database at the same moment cannot both
 /// apply the same migration.
+///
+/// A newer build may migrate the same new file past this build's schema
+/// after the caller's identity check. Every re-read refuses that, so this
+/// build never writes into a database from a newer schema.
 pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<i32> {
+    let latest = migrations.iter().map(|m| m.version).max().unwrap_or(0);
     let mut current: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if current > latest {
+        return Err(StorageError::NewerSchema {
+            found: current,
+            supported: latest,
+        });
+    }
     if migrations.iter().all(|m| m.version <= current) {
         return Ok(current);
     }
     conn.busy_timeout(MIGRATION_BUSY_TIMEOUT)?;
-    let result = migrate_pending(conn, migrations, &mut current);
+    let result = migrate_pending(conn, migrations, latest, &mut current);
     // Back to the normal wait on every exit path.
     conn.busy_timeout(BUSY_TIMEOUT)?;
     result.map(|()| current)
@@ -426,6 +437,7 @@ pub(crate) fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result
 fn migrate_pending(
     conn: &mut Connection,
     migrations: &[Migration],
+    latest: i32,
     current: &mut i32,
 ) -> Result<()> {
     for m in migrations {
@@ -434,6 +446,13 @@ fn migrate_pending(
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if now > latest {
+            // Dropping `tx` rolls back; nothing was written.
+            return Err(StorageError::NewerSchema {
+                found: now,
+                supported: latest,
+            });
+        }
         if now >= m.version {
             // Another process applied it while we waited for the lock.
             tx.commit()?;
@@ -648,6 +667,42 @@ mod tests {
             matches!(err, StorageError::NewerSchema { found, .. } if found == SCHEMA_VERSION + 5),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_schema_that_becomes_newer_before_migration_is_refused() {
+        // The race: this build's identity check saw an older schema, then a
+        // newer build migrated the file before `migrate` ran.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        drop(open_writer_with(&path, SyncMode::Normal, &MIGRATIONS[..1]).unwrap());
+        let mut c = Connection::open(&path).unwrap();
+        c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let tables_before: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        // Fast path (nothing pending from this build's point of view)...
+        let err = migrate(&mut c, MIGRATIONS).unwrap_err();
+        assert!(
+            matches!(err, StorageError::NewerSchema { found, supported }
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION),
+            "{err:?}"
+        );
+        // ...and the re-read inside a pending migration's transaction.
+        let mut current = 1;
+        let err = migrate_pending(&mut c, MIGRATIONS, SCHEMA_VERSION, &mut current).unwrap_err();
+        assert!(matches!(err, StorageError::NewerSchema { .. }), "{err:?}");
+        let (v, tables_after): (i32, i64) = c
+            .query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version()), \
+                        (SELECT count(*) FROM sqlite_master)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "the newer version is left alone");
+        assert_eq!(tables_after, tables_before, "no migration was applied");
     }
 
     #[test]
