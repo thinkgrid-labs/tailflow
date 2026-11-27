@@ -46,8 +46,8 @@ Roadmap work should preserve four properties:
 
 ## Being validated before v0.4.0
 
-- A live Codex session against the hook integration (so far tested with
-  synthetic hook input only).
+- Live Codex sessions on Linux and Windows (a live session on macOS has
+  passed).
 - Real Claude Code and Codex sessions on Windows (so far CI with synthetic
   hook input).
 - A 24-hour endurance run on Linux.

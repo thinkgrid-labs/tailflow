@@ -10,10 +10,10 @@ boundaries prevents an agent or script from treating partial evidence as proof.
 v0.4.0 is not released. These checks have not been done yet, so the matching
 claims rest on synthetic tests only:
 
-- **Codex:** support is built from Codex's published hook schemas and tested
-  with synthetic hook input. It has not been run against a live Codex
-  session, so the real `apply_patch`, exit-code and token payloads, and hook
-  trust, are unconfirmed.
+- **Codex:** run against a live Codex 0.171 session on macOS (sessions,
+  resume, subagents, `apply_patch`, token counts, spool replay), with hook
+  trust granted for each run. The interactive `/hooks` trust review, and
+  live Codex on Linux and Windows, are unconfirmed.
 - **Windows agents:** hook installation, capture, file observation and
   shutdown pass CI on Windows with synthetic hook input. Real Claude Code and
   Codex sessions on Windows have not been run.
@@ -208,8 +208,9 @@ matrix. In short:
 - Git association reads `.git` metadata at session start and end. A HEAD that
   moved during a session is reported as inferred, low confidence, and never
   attributed to the agent.
-- Codex support is built from Codex's published hook schemas and synthetic
-  fixtures; it has not yet been exercised against a live Codex install.
+- Codex sends no exit code for shell commands (a live 0.171 session sent only
+  the command's output), so a failed Codex command is shown as `unknown`, the
+  same as a successful one.
 - Codex runs hooks through your login shell (`$SHELL -lc`). Anything your shell
   profile prints at startup becomes hook output, which Codex adds to the
   model's context on `SessionStart`. TailFlow cannot prevent that; keep the
